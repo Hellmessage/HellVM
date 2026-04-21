@@ -1,71 +1,128 @@
-// 主窗口 —— 左侧栏(VM 列表)+ 右侧详情
+// 主窗口 —— 左侧栏(VM 列表)+ 右侧详情,覆盖新建向导与确认弹窗
 import SwiftUI
 
 struct MainView: View {
-    var body: some View {
-        HStack(spacing: 0) {
-            SidebarView()
-                .frame(width: 240)
-            Rectangle()
-                .fill(Theme.divider)
-                .frame(width: 1)
-            DetailView()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .background(Theme.background)
+    @State private var store = VMListStore()
+    @State private var selectedID: UUID?
+    @State private var showingWizard: Bool = false
+    @State private var pendingDeleteItem: VMListItem?
+    @State private var logViewerItem: VMListItem?
+
+    var selectedItem: VMListItem? {
+        guard let id = selectedID else { return nil }
+        return store.items.first { $0.id == id }
     }
-}
 
-/// 左侧栏 —— VM 列表(P0 占位)
-struct SidebarView: View {
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("HellVM")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Theme.textPrimary)
-                Spacer()
-                Button {
-                    // TODO P3:打开新建向导
-                } label: {
-                    Image(systemName: "plus")
-                        .foregroundStyle(Theme.textSecondary)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-
-            Rectangle()
-                .fill(Theme.divider)
-                .frame(height: 1)
-
-            VStack {
-                Spacer()
-                Text("暂无虚拟机")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.textDisabled)
-                Spacer()
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .background(Theme.surface)
-    }
-}
-
-/// 右侧详情 —— P0 仅显示占位
-struct DetailView: View {
     var body: some View {
         ZStack {
-            Theme.background
-            VStack(spacing: 8) {
-                Text("HellVM")
-                    .font(.system(size: 48, weight: .thin))
-                    .foregroundStyle(Theme.textPrimary.opacity(0.25))
-                Text("选择左侧虚拟机,或点击 + 新建")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.textDisabled)
+            HStack(spacing: 0) {
+                SidebarView(
+                    store: store,
+                    selectedID: $selectedID,
+                    onNewVM: { showingWizard = true }
+                )
+                .frame(width: 260)
+                Rectangle().fill(Theme.divider).frame(width: 1)
+                VMDetailPane(
+                    store: store,
+                    item: selectedItem,
+                    onDelete: { pendingDeleteItem = $0 },
+                    onShowLog: { logViewerItem = $0 }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .background(Theme.background)
+            .onAppear { store.startPolling() }
+            .onDisappear { store.stopPolling() }
+
+            if showingWizard {
+                ModalOverlay {
+                    NewVMWizardView(
+                        onCancel: { showingWizard = false },
+                        onCreated: { name in
+                            showingWizard = false
+                            store.refresh()
+                            // 新创建的 VM 自动选中
+                            if let item = store.items.first(where: { $0.config.name == name }) {
+                                selectedID = item.id
+                            }
+                        }
+                    )
+                    .frame(width: 480, height: 460)
+                }
+            }
+
+            if let item = logViewerItem {
+                ModalOverlay {
+                    LogViewerModal(
+                        title: "\(item.config.name) 日志",
+                        sources: [
+                            LogSource(label: "QEMU 运行", fileURL: item.bundle.qemuLogURL),
+                            LogSource(label: "调试日志", fileURL: URL(fileURLWithPath: "/tmp/hellvm.log")),
+                        ],
+                        onClose: { logViewerItem = nil }
+                    )
+                    .frame(width: 760, height: 520)
+                }
+            }
+
+            if let item = pendingDeleteItem {
+                ModalOverlay {
+                    ConfirmDialog(
+                        title: "删除虚拟机",
+                        message: "将永久删除 \(item.config.name) 及其所有磁盘。此操作无法撤销。",
+                        confirmText: "删除",
+                        destructive: true,
+                        onCancel: { pendingDeleteItem = nil },
+                        onConfirm: {
+                            do { try VMController.remove(item) } catch {}
+                            pendingDeleteItem = nil
+                            store.refresh()
+                            if selectedID == item.id { selectedID = nil }
+                        }
+                    )
+                    .frame(width: 400)
+                }
+            }
+        }
+    }
+}
+
+/// 遮罩 + 居中内容 —— 遵守 CLAUDE.md:只能通过自身的 X / 取消按钮关闭,遮罩不响应点击
+struct ModalOverlay<Content: View>: View {
+    let content: () -> Content
+    @State private var appeared: Bool = false
+
+    init(@ViewBuilder content: @escaping () -> Content) {
+        self.content = content
+    }
+
+    var body: some View {
+        ZStack {
+            // 背景遮罩:深色 + 轻微 blur(macOS 12+)
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .environment(\.colorScheme, .dark)
+                .overlay(Color.black.opacity(0.45))
+                .ignoresSafeArea()
+                // 故意不加 onTapGesture,点遮罩无效
+            content()
+                .background(
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(Theme.surface)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.5), radius: 30, y: 10)
+                .scaleEffect(appeared ? 1.0 : 0.96)
+                .opacity(appeared ? 1 : 0)
+                .onAppear {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                        appeared = true
+                    }
+                }
         }
     }
 }

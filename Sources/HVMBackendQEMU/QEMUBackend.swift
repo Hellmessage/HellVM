@@ -50,8 +50,19 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         let proc = Process()
         proc.executableURL = qemuURL
         proc.arguments = args
-        // GUI 模式:不显式设置 stdin/stdout/stderr,让 Process 默认继承(后续 P4 会换成 IOSurface)
-        proc.terminationHandler = { [weak self] _ in
+
+        // GUI 模式:stdin 丢 /dev/null,stdout+stderr 写到 bundle/qemu.log,方便排障
+        // (P4 会接入 IOSurface,不再依赖 stdio)
+        proc.standardInput = FileHandle(forReadingAtPath: "/dev/null")
+        let logURL = bundle.qemuLogURL
+        try? "".write(to: logURL, atomically: true, encoding: .utf8)
+        if let logHandle = try? FileHandle(forWritingTo: logURL) {
+            logHandle.seekToEndOfFile()
+            proc.standardOutput = logHandle
+            proc.standardError = logHandle
+        }
+
+        proc.terminationHandler = { [weak self] p in
             self?.setState(.stopped)
         }
 

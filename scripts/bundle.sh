@@ -62,19 +62,19 @@ echo "==> 嵌入 QEMU 二进制与固件"
 cp "$VENDOR_QEMU/bin/"qemu-* "$RES_QEMU/bin/" 2>/dev/null || true
 cp -R "$VENDOR_QEMU/share/qemu" "$RES_QEMU/share/"
 
-# 修剪不支持架构的固件(节省 ~170MB)
-# 保留:aarch64(主力)、arm-vars(aarch64 也用它)、x86_64(未来扩展用,只 3.5MB)
+# 修剪不支持架构的"大"固件(节省 ~170MB)
+# 保留:aarch64(主力)、arm-vars(aarch64 也用它)、x86_64 edk2、
+#       以及所有设备 ROM(efi-*.rom / pxe-*.rom / vgabios-*.bin,都只有百KB但 virtio 等设备需要)
 echo "==> 修剪不需要的固件"
 SHARE="$RES_QEMU/share/qemu"
 rm -f "$SHARE"/edk2-arm-code.fd \
       "$SHARE"/edk2-riscv-code.fd "$SHARE"/edk2-riscv-vars.fd \
       "$SHARE"/edk2-loongarch64-code.fd "$SHARE"/edk2-loongarch64-vars.fd \
       "$SHARE"/openbios-* "$SHARE"/slof.bin "$SHARE"/skiboot.lid \
-      "$SHARE"/qemu_vga.ndrv "$SHARE"/pxe-* "$SHARE"/efi-* \
-      "$SHARE"/s390-* "$SHARE"/hppa-* "$SHARE"/u-boot* \
-      "$SHARE"/vgabios-cirrus.bin "$SHARE"/vgabios-qxl.bin \
-      "$SHARE"/vgabios-ramfb.bin "$SHARE"/vgabios-vmware.bin \
-      "$SHARE"/*.dtb 2>/dev/null || true
+      "$SHARE"/s390-* "$SHARE"/hppa-ser-* "$SHARE"/hppa-firmware* \
+      "$SHARE"/u-boot.e500 \
+      "$SHARE"/qemu_vga.ndrv \
+      2>/dev/null || true
 
 # 清除 xattr,避免后续签名报 "detritus not allowed"
 xattr -cr "$RES_QEMU"
