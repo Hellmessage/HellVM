@@ -4,9 +4,8 @@
 /.swiftpm/
 Package.resolved
 
-# 外部依赖编译产物
-/Vendor/qemu/build/
-/Vendor/qemu/src/
+# 外部依赖(自编译产物,每台机器独立生成)
+/Vendor/
 
 # 系统 / 编辑器
 .DS_Store

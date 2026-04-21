@@ -1,50 +1,207 @@
-// QEMU 后端 —— 通过子进程 + QMP(QEMU Machine Protocol)控制 VM
-// 显示方案:QEMU patched display backend 写入 IOSurface,Swift 侧 Metal 渲染
-// P4 阶段实现
+// QEMU 后端 —— 通过子进程启动 qemu-system-<arch>,以 HVF 加速
+// P1:串口引导、SIGTERM 停机;暂不接入 QMP(P2)
+// P4:接入共享内存 framebuffer 做图形显示
 import Foundation
 import HVMCore
 import HVMBundle
 
 /// 基于 QEMU 子进程的 VM 后端
-public final class QEMUBackend: VMBackend {
+public final class QEMUBackend: VMBackend, @unchecked Sendable {
     public let config: VMConfig
     public let bundle: VMBundle
-    public let qemuBinaryURL: URL
+    public let paths: QEMUPaths
+
+    private let stateLock = NSLock()
+    private var _state: VMState = .stopped
+    private var process: Process?
+
+    public var state: VMState {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _state
+    }
 
     private let stateContinuation: AsyncStream<VMState>.Continuation
     public let stateStream: AsyncStream<VMState>
 
-    private var _state: VMState = .stopped
-    public var state: VMState { _state }
-
-    /// - Parameters:
-    ///   - qemuBinaryURL: 指向 Vendor/qemu/bin/qemu-system-<arch>
-    public init(config: VMConfig, bundle: VMBundle, qemuBinaryURL: URL) throws {
+    public init(config: VMConfig, bundle: VMBundle, paths: QEMUPaths) throws {
         self.config = config
         self.bundle = bundle
-        self.qemuBinaryURL = qemuBinaryURL
+        self.paths = paths
         var cont: AsyncStream<VMState>.Continuation!
         self.stateStream = AsyncStream { cont = $0 }
         self.stateContinuation = cont
     }
 
+    // MARK: - 生命周期
+
     public func start() async throws {
-        throw VMError.notImplemented("QEMUBackend.start —— 待 P4")
+        try ensureState(.stopped, action: "start")
+        setState(.starting)
+
+        let efiVars = try prepareEFIVars()
+        let args = try buildArguments(efiVars: efiVars)
+
+        let qemuURL = paths.qemuSystem(config.architecture)
+        guard FileManager.default.isExecutableFile(atPath: qemuURL.path) else {
+            setState(.error)
+            throw VMError.startFailed("找不到 qemu 可执行文件:\(qemuURL.path)")
+        }
+
+        let proc = Process()
+        proc.executableURL = qemuURL
+        proc.arguments = args
+        // CLI 前台模式:不显式设置 stdin/stdout/stderr,Process 会直接继承父进程的 FD(包括 TTY 属性)
+        // 若显式赋 FileHandle.standard*,某些情况下会绕到 Swift 内部 FD,丢失 TTY 字符模式
+
+        proc.terminationHandler = { [weak self] _ in
+            self?.setState(.stopped)
+        }
+
+        do {
+            try proc.run()
+        } catch {
+            setState(.error)
+            throw VMError.startFailed("启动 qemu 失败:\(error.localizedDescription)")
+        }
+
+        stateLock.lock()
+        self.process = proc
+        stateLock.unlock()
+        setState(.running)
     }
 
     public func stop(force: Bool) async throws {
-        throw VMError.notImplemented("QEMUBackend.stop —— 待 P4")
+        stateLock.lock()
+        guard let proc = process, _state == .running || _state == .starting else {
+            stateLock.unlock()
+            return
+        }
+        _state = .stopping
+        stateLock.unlock()
+        stateContinuation.yield(.stopping)
+
+        if force {
+            kill(proc.processIdentifier, SIGKILL)
+        } else {
+            kill(proc.processIdentifier, SIGTERM)
+        }
     }
 
     public func pause() async throws {
-        throw VMError.notImplemented("QEMUBackend.pause —— 待 P4")
+        throw VMError.notImplemented("pause —— 待 P2 接入 QMP")
     }
 
     public func resume() async throws {
-        throw VMError.notImplemented("QEMUBackend.resume —— 待 P4")
+        throw VMError.notImplemented("resume —— 待 P2 接入 QMP")
     }
 
-    deinit {
-        stateContinuation.finish()
+    /// 阻塞等待 VM 进程退出(GUI 异步模式使用)
+    public func waitUntilExit() async {
+        stateLock.lock()
+        let proc = process
+        stateLock.unlock()
+        proc?.waitUntilExit()
+    }
+
+    /// CLI 前台模式:用 execv 替换当前进程为 qemu。
+    /// 成功时不返回(process image 被替换),失败时抛错。
+    /// 这样 qemu 直接继承用户终端的 TTY / controlling terminal / 所有 FD,
+    /// 绕开 Swift Foundation.Process + posix_spawn 在 TTY 继承上的行为差异。
+    public func execReplacing() throws {
+        let efiVars = try prepareEFIVars()
+        let args = try buildArguments(efiVars: efiVars)
+        let qemuURL = paths.qemuSystem(config.architecture)
+        guard FileManager.default.isExecutableFile(atPath: qemuURL.path) else {
+            throw VMError.startFailed("找不到 qemu 可执行文件:\(qemuURL.path)")
+        }
+
+        // 构造 argv:argv[0] 是程序名,不含路径
+        var cArgv: [UnsafeMutablePointer<CChar>?] = []
+        cArgv.append(strdup(qemuURL.lastPathComponent))
+        for a in args {
+            cArgv.append(strdup(a))
+        }
+        cArgv.append(nil)
+
+        cArgv.withUnsafeMutableBufferPointer { buf in
+            _ = execv(qemuURL.path, buf.baseAddress)
+        }
+
+        // execv 只在失败时返回
+        let errMsg = String(cString: strerror(errno))
+        for p in cArgv { if let p = p { free(p) } }
+        throw VMError.startFailed("execv 失败:\(errMsg)")
+    }
+
+    // MARK: - 内部
+
+    private func ensureState(_ expected: VMState, action: String) throws {
+        if state != expected {
+            throw VMError.startFailed("当前状态为 \(state),不能执行 \(action)")
+        }
+    }
+
+    private func setState(_ new: VMState) {
+        stateLock.lock()
+        _state = new
+        stateLock.unlock()
+        stateContinuation.yield(new)
+    }
+
+    /// 每个 VM 有自己的 EFI 变量存储(首次启动时从模板复制)
+    private func prepareEFIVars() throws -> URL {
+        let dst = bundle.efiDirURL.appendingPathComponent("vars.fd")
+        if !FileManager.default.fileExists(atPath: dst.path) {
+            try FileManager.default.createDirectory(
+                at: bundle.efiDirURL, withIntermediateDirectories: true
+            )
+            try FileManager.default.copyItem(at: paths.edk2ArmVars, to: dst)
+        }
+        return dst
+    }
+
+    /// 构造 qemu 命令行参数
+    private func buildArguments(efiVars: URL) throws -> [String] {
+        var args: [String] = []
+
+        // machine / 加速 / cpu / smp / 内存
+        args += ["-machine", "virt,accel=hvf"]
+        args += ["-cpu", "host"]
+        args += ["-smp", String(config.cpuCount)]
+        args += ["-m", "\(config.memoryMB)M"]
+
+        // EFI 固件(代码只读 + 每 VM 独立变量)
+        if config.boot.efi {
+            args += [
+                "-drive", "if=pflash,format=raw,readonly=on,file=\(paths.edk2AArch64Code.path)",
+                "-drive", "if=pflash,format=raw,file=\(efiVars.path)",
+            ]
+        }
+
+        // 主磁盘(virtio)
+        for disk in config.disks {
+            let path = bundle.resolve(disk.relativePath).path
+            var opts = "if=virtio,file=\(path),format=\(disk.format.rawValue)"
+            if disk.readOnly { opts += ",readonly=on" }
+            args += ["-drive", opts]
+        }
+
+        // 启动介质(ISO)
+        if let isoPath = config.boot.isoPath {
+            args += [
+                "-drive", "if=none,id=cdrom0,media=cdrom,file=\(isoPath),readonly=on",
+                "-device", "virtio-scsi-pci,id=scsi0",
+                "-device", "scsi-cd,drive=cdrom0,bootindex=1",
+            ]
+        }
+
+        // 用户态网络(NAT)
+        args += ["-netdev", "user,id=net0"]
+        args += ["-device", "virtio-net-pci,netdev=net0"]
+
+        // 串口 + 无图形(P1)
+        args += ["-nographic"]
+
+        return args
     }
 }

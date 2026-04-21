@@ -1,30 +1,93 @@
-// 磁盘管理 —— 封装 qemu-img(创建 / 查询 / 改大小)
-// P0 为占位实现,等待 P4 接入 Vendor/qemu 的 qemu-img
+// 磁盘管理 —— 封装 qemu-img
 import Foundation
 import HVMCore
 
 /// 封装 qemu-img 的磁盘操作
 public struct DiskManager: Sendable {
-    /// qemu-img 可执行文件路径(由 App 注入,通常指向 Vendor/qemu/bin/qemu-img)
     public let qemuImgPath: URL
 
     public init(qemuImgPath: URL) {
         self.qemuImgPath = qemuImgPath
     }
 
-    /// 创建磁盘镜像
+    /// 创建磁盘镜像 —— 调用 `qemu-img create -f <format> <path> <size>G`
     public func create(at url: URL, sizeGB: UInt64, format: DiskConfig.Format) async throws {
-        throw VMError.notImplemented("DiskManager.create —— 待 P4 接入 qemu-img")
+        try await run(arguments: [
+            "create",
+            "-f", format.rawValue,
+            url.path,
+            "\(sizeGB)G",
+        ])
     }
 
-    /// 查询磁盘信息
+    /// 查询磁盘信息 —— `qemu-img info --output=json <path>`
     public func info(at url: URL) async throws -> DiskInfo {
-        throw VMError.notImplemented("DiskManager.info —— 待 P4 接入 qemu-img")
+        let json = try await runCapturingOutput(arguments: [
+            "info", "--output=json", url.path,
+        ])
+        struct Raw: Decodable {
+            let format: String
+            let virtualSize: UInt64
+            let actualSize: UInt64
+            enum CodingKeys: String, CodingKey {
+                case format
+                case virtualSize = "virtual-size"
+                case actualSize  = "actual-size"
+            }
+        }
+        let raw = try JSONDecoder().decode(Raw.self, from: Data(json.utf8))
+        guard let fmt = DiskConfig.Format(rawValue: raw.format) else {
+            throw VMError.diskOperationFailed("未知磁盘格式:\(raw.format)")
+        }
+        return DiskInfo(
+            format: fmt,
+            virtualSizeBytes: raw.virtualSize,
+            actualSizeBytes: raw.actualSize
+        )
     }
 
-    /// 改变磁盘大小
+    /// 改变磁盘大小 —— `qemu-img resize <path> <size>G`
     public func resize(at url: URL, newSizeGB: UInt64) async throws {
-        throw VMError.notImplemented("DiskManager.resize —— 待 P4 接入 qemu-img")
+        try await run(arguments: [
+            "resize", url.path, "\(newSizeGB)G",
+        ])
+    }
+
+    // MARK: - 内部
+
+    private func run(arguments: [String]) async throws {
+        _ = try await runCapturingOutput(arguments: arguments)
+    }
+
+    /// 运行 qemu-img 并返回 stdout;失败时抛 VMError.diskOperationFailed
+    private func runCapturingOutput(arguments: [String]) async throws -> String {
+        let process = Process()
+        process.executableURL = qemuImgPath
+        process.arguments = arguments
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        return try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { proc in
+                let out = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+                let err = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+                if proc.terminationStatus == 0 {
+                    continuation.resume(returning: String(data: out, encoding: .utf8) ?? "")
+                } else {
+                    let msg = String(data: err, encoding: .utf8) ?? "未知错误"
+                    continuation.resume(throwing: VMError.diskOperationFailed(
+                        "qemu-img \(arguments.first ?? "") 失败 (exit=\(proc.terminationStatus)):\(msg.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    ))
+                }
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: VMError.diskOperationFailed("启动 qemu-img 失败:\(error.localizedDescription)"))
+            }
+        }
     }
 }
 

@@ -29,7 +29,13 @@ test:
 		exit 1; \
 	}
 
-# 清理
+# 清理(只删构建产物,保留 build/ 下的其他用户文件,比如 ISO)
 clean:
-	@rm -rf build .build
-	@echo "==> 已清理 build/ 和 .build/"
+	@rm -rf build/HellVM.app build/hellvm
+	@rm -rf .build
+	@echo "==> 已清理 build/HellVM.app build/hellvm .build/"
+
+# 深度清理(含 Vendor/qemu,下次 make build 要重编 QEMU)
+distclean: clean
+	@rm -rf Vendor
+	@echo "==> 已清理 Vendor/ (下次 make build 会重新编译 QEMU)"

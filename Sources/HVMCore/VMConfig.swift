@@ -105,11 +105,11 @@ public struct DisplayConfig: Codable, Sendable {
 
 /// 启动配置
 public struct BootConfig: Codable, Sendable {
-    public var isoPath: String?         // 相对 bundle
+    public var isoPath: String?         // 绝对路径(ISO 通常不复制进 bundle,节省空间)
     public var kernelPath: String?
     public var initrdPath: String?
     public var kernelCmdline: String?
-    public var efi: Bool                // 是否使用 EFI 启动(VZ macOS/Linux)
+    public var efi: Bool                // 是否使用 EFI 启动
 
     public init(
         isoPath: String? = nil,

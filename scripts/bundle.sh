@@ -1,92 +1,122 @@
 #!/usr/bin/env bash
-# 将 swift build 的产物包装成 HellVM.app 并签名
-#
-# 签名身份优先级:
-#   1. 环境变量 SIGN_IDENTITY(例如 SIGN_IDENTITY="Apple Development: xxx")
-#   2. Keychain 中的 "Hell Dev" 自签证书(推荐:TCC 授权持久化)
-#   3. ad-hoc 签名("-")   # 每次 rebuild 会重弹权限
-#
-# P4 接入 QEMU 时,会在此脚本中对 Vendor/qemu 二进制同样调用 sign_item,
-# 顺序为:嵌入二进制 → 主 App(自下而上,Apple 官方推荐)
+# 一键构建完整 HellVM.app,流水线:
+#   1. install-deps.sh  —— 检查 + 补装 Homebrew 依赖
+#   2. build-qemu.sh    —— 若 Vendor/qemu 缺失则自编译
+#   3. swift build      —— Swift 主 App 二进制
+#   4. 组装 .app 目录    —— HellVM 主二进制 + QEMU + 固件
+#   5. collect-dylibs   —— 递归拷贝 brew dylib + 重写 rpath
+#   6. codesign         —— 自下而上:dylib → QEMU → 主 App
+#   7. 验证
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
 APP_DIR="$BUILD_DIR/HellVM.app"
+CONTENTS="$APP_DIR/Contents"
+FRAMEWORKS="$CONTENTS/Frameworks"
+RES_QEMU="$CONTENTS/Resources/qemu"
 CONFIG="${CONFIG:-release}"
 ENTITLEMENTS="$ROOT/Resources/HellVM.entitlements"
+QEMU_ENTITLEMENTS="$ROOT/Resources/qemu.entitlements"
+VENDOR_QEMU="$ROOT/Vendor/qemu"
 
 cd "$ROOT"
 
-# ---------- 选择签名身份 ----------
+# ---------- 签名身份 ----------
 resolve_sign_identity() {
-    if [ -n "${SIGN_IDENTITY:-}" ]; then
-        echo "$SIGN_IDENTITY"
-        return
-    fi
+    if [ -n "${SIGN_IDENTITY:-}" ]; then echo "$SIGN_IDENTITY"; return; fi
     if security find-identity -v -p codesigning 2>/dev/null | grep -q '"Hell Dev"'; then
-        echo "Hell Dev"
-        return
+        echo "Hell Dev"; return
     fi
     echo "-"
 }
 
-SIGN_ID="$(resolve_sign_identity)"
+# ---------- 1. 依赖 ----------
+bash scripts/install-deps.sh
 
-# ---------- 签名单个条目 ----------
-sign_item() {
-    local item="$1"
-    local use_entitlements="${2:-no}"
-    if [ "$use_entitlements" = "yes" ]; then
-        codesign --force --sign "$SIGN_ID" \
-            --entitlements "$ENTITLEMENTS" \
-            --options runtime \
-            "$item" 2>&1 | sed 's/^/    /'
-    else
-        codesign --force --sign "$SIGN_ID" \
-            --options runtime \
-            "$item" 2>&1 | sed 's/^/    /'
-    fi
-}
-
-# ---------- 构建 ----------
-echo "==> swift build ($CONFIG)"
-swift build -c "$CONFIG" --product HellVM
-
-BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
-
-echo "==> 构建 .app 目录"
-rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS"
-mkdir -p "$APP_DIR/Contents/Resources"
-
-cp "$BIN_DIR/HellVM" "$APP_DIR/Contents/MacOS/HellVM"
-cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
-
-# SPM 生成的资源 bundle(如果有)
-for b in "$BIN_DIR"/*.bundle; do
-    [ -e "$b" ] || continue
-    cp -R "$b" "$APP_DIR/Contents/Resources/"
-done
-
-# ---------- 签名 (自下而上) ----------
-if [ "$SIGN_ID" = "-" ]; then
-    echo "==> 签名 (ad-hoc 兜底,未发现 Hell Dev 证书)"
-else
-    echo "==> 签名 (身份: $SIGN_ID)"
+# ---------- 2. QEMU ----------
+if [ ! -x "$VENDOR_QEMU/bin/qemu-system-aarch64" ]; then
+    echo "==> 首次构建 QEMU(耗时约 20-40 分钟)"
+    bash scripts/build-qemu.sh
 fi
 
-# P4 预留:签名嵌入的 QEMU 二进制
-# for bin in "$APP_DIR"/Contents/Resources/qemu-*; do
-#     [ -e "$bin" ] || continue
-#     sign_item "$bin" no
-# done
+# ---------- 3. Swift ----------
+echo "==> swift build ($CONFIG)"
+swift build -c "$CONFIG" --product HellVM
+BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 
-# 主 App(最后签,携带 entitlements)
-sign_item "$APP_DIR" yes
+# ---------- 4. .app 骨架 ----------
+echo "==> 组装 .app 目录"
+rm -rf "$APP_DIR"
+mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$FRAMEWORKS" \
+         "$RES_QEMU/bin" "$RES_QEMU/share"
+cp "$BIN_DIR/HellVM" "$CONTENTS/MacOS/HellVM"
+cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
+for b in "$BIN_DIR"/*.bundle; do
+    [ -e "$b" ] || continue
+    cp -R "$b" "$CONTENTS/Resources/"
+done
 
-# ---------- 验证 ----------
-echo "==> 验证签名"
-codesign -dv "$APP_DIR" 2>&1 | grep -E "Signature|Authority|Identifier" | sed 's/^/    /' || true
+# ---------- 5. QEMU + 固件嵌入 ----------
+echo "==> 嵌入 QEMU 二进制与固件"
+cp "$VENDOR_QEMU/bin/"qemu-* "$RES_QEMU/bin/" 2>/dev/null || true
+cp -R "$VENDOR_QEMU/share/qemu" "$RES_QEMU/share/"
 
-echo "==> 完成: $APP_DIR"
+# 修剪不支持架构的固件(节省 ~170MB)
+# 保留:aarch64(主力)、arm-vars(aarch64 也用它)、x86_64(未来扩展用,只 3.5MB)
+echo "==> 修剪不需要的固件"
+SHARE="$RES_QEMU/share/qemu"
+rm -f "$SHARE"/edk2-arm-code.fd \
+      "$SHARE"/edk2-riscv-code.fd "$SHARE"/edk2-riscv-vars.fd \
+      "$SHARE"/edk2-loongarch64-code.fd "$SHARE"/edk2-loongarch64-vars.fd \
+      "$SHARE"/openbios-* "$SHARE"/slof.bin "$SHARE"/skiboot.lid \
+      "$SHARE"/qemu_vga.ndrv "$SHARE"/pxe-* "$SHARE"/efi-* \
+      "$SHARE"/s390-* "$SHARE"/hppa-* "$SHARE"/u-boot* \
+      "$SHARE"/vgabios-cirrus.bin "$SHARE"/vgabios-qxl.bin \
+      "$SHARE"/vgabios-ramfb.bin "$SHARE"/vgabios-vmware.bin \
+      "$SHARE"/*.dtb 2>/dev/null || true
+
+# 清除 xattr,避免后续签名报 "detritus not allowed"
+xattr -cr "$RES_QEMU"
+
+# ---------- 6. dylib 收集 ----------
+echo "==> 收集 brew dylib 到 Contents/Frameworks/"
+for b in "$RES_QEMU/bin/"qemu-*; do
+    [ -f "$b" ] || continue
+    bash scripts/collect-dylibs.sh "$b" "$FRAMEWORKS"
+done
+DYLIB_COUNT=$(find "$FRAMEWORKS" -maxdepth 1 -name "*.dylib" 2>/dev/null | wc -l | tr -d ' ')
+echo "    共收集 $DYLIB_COUNT 个 dylib"
+
+# ---------- 7. 签名(自下而上) ----------
+SIGN_ID="$(resolve_sign_identity)"
+echo "==> 签名 (身份: $SIGN_ID)"
+
+# 7a. dylib
+for d in "$FRAMEWORKS"/*.dylib; do
+    [ -f "$d" ] || continue
+    codesign --force --sign "$SIGN_ID" --options runtime "$d" 2>&1 | sed 's/^/    /'
+done
+
+# 7b. QEMU 二进制(带 hypervisor + JIT entitlements)
+for b in "$RES_QEMU/bin/"qemu-*; do
+    [ -f "$b" ] || continue
+    codesign --force --sign "$SIGN_ID" \
+        --entitlements "$QEMU_ENTITLEMENTS" \
+        --options runtime \
+        "$b" 2>&1 | sed 's/^/    /'
+done
+
+# 7c. 主 App(最后)
+codesign --force --sign "$SIGN_ID" \
+    --entitlements "$ENTITLEMENTS" \
+    --options runtime \
+    "$APP_DIR" 2>&1 | sed 's/^/    /'
+
+# ---------- 8. 验证 ----------
+echo "==> 验证"
+codesign --verify --deep --strict "$APP_DIR" 2>&1 | sed 's/^/    /' || echo "    (verify 警告可忽略)"
+codesign -dv "$APP_DIR" 2>&1 | grep -E "Authority|Identifier|Signature" | sed 's/^/    /'
+
+APP_SIZE=$(du -sh "$APP_DIR" | awk '{print $1}')
+echo "==> 完成: $APP_DIR ($APP_SIZE)"
