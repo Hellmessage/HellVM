@@ -10,10 +10,12 @@ build:
 	@bash scripts/bundle.sh
 
 # 构建 CLI
+# 注意:必须用 ditto 而非 cp,cp 在部分 macOS 版本会丢 code signature 元数据,
+# AMFI 校验失败会直接 SIGKILL 进程(Taskgated Invalid Signature)
 cli:
 	@swift build -c $(CONFIG) --product hellvm
 	@mkdir -p build
-	@cp "$$(swift build -c $(CONFIG) --show-bin-path)/hellvm" build/hellvm
+	@ditto "$$(swift build -c $(CONFIG) --show-bin-path)/hellvm" build/hellvm
 	@echo "==> build/hellvm"
 
 # 启动 App

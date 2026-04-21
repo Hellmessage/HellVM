@@ -12,7 +12,7 @@ struct HellVM: AsyncParsableCommand {
         commandName: "hellvm",
         abstract: "HellVM 虚拟机命令行",
         version: "0.1.0",
-        subcommands: [List.self, Info.self, Create.self, Start.self, Stop.self, Remove.self]
+        subcommands: [List.self, Info.self, Create.self, Start.self, Stop.self, Pause.self, Resume.self, Remove.self]
     )
 }
 
@@ -31,15 +31,27 @@ struct List: AsyncParsableCommand {
             print("默认库位置:\(VMBundle.defaultLibraryURL.path)")
             return
         }
-        print(String(format: "%-20s %-10s %-6s %-10s", "NAME", "ARCH", "CPU", "MEMORY"))
+        print(pad("NAME", 20) + pad("ARCH", 10) + pad("CPU", 6) + pad("MEMORY", 10) + pad("STATE", 8))
         for b in bundles {
             if let cfg = try? b.loadConfig() {
-                print(String(format: "%-20s %-10s %-6d %-10s",
-                    cfg.name, cfg.architecture.rawValue, cfg.cpuCount, "\(cfg.memoryMB) MB"))
+                let state = b.isRunning() ? "RUNNING" : "STOPPED"
+                print(
+                    pad(cfg.name, 20) +
+                    pad(cfg.architecture.rawValue, 10) +
+                    pad(String(cfg.cpuCount), 6) +
+                    pad("\(cfg.memoryMB) MB", 10) +
+                    pad(state, 8)
+                )
             } else {
                 print("<损坏> \(b.url.lastPathComponent)")
             }
         }
+    }
+
+    /// 按字符数左对齐填充(避免 %s 在 Swift String 下的 vararg 崩溃)
+    private func pad(_ s: String, _ width: Int) -> String {
+        if s.count >= width { return s + " " }
+        return s + String(repeating: " ", count: width - s.count)
     }
 }
 
@@ -191,14 +203,105 @@ struct Start: AsyncParsableCommand {
 struct Stop: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "stop",
-        abstract: "停止 VM"
+        abstract: "停止 VM(默认 ACPI 软关机,--force 断电)"
     )
 
     @Argument(help: "VM 名称") var name: String
-    @Flag(name: .shortAndLong, help: "强制停止(等同断电)") var force: Bool = false
+    @Flag(name: .shortAndLong, help: "强制停止(SIGKILL,等同拔电源)") var force: Bool = false
+    @Option(help: "等待 VM 退出的秒数,超时回退到 --force") var timeout: Int = 30
 
     func run() async throws {
-        throw VMError.notImplemented("stop —— 待 P1c")
+        let bundle = try findBundle(name: name)
+        guard bundle.isRunning() else {
+            print("\(name) 未在运行")
+            return
+        }
+
+        if force {
+            try killPID(bundle: bundle, signal: SIGKILL)
+            print("✓ 已强制停止 \(name)")
+            return
+        }
+
+        // 软关机:通过 QMP 发送 system_powerdown
+        let qmp = QMPClient()
+        do {
+            try await qmp.connect(socketPath: bundle.qmpSocketURL.path)
+            _ = try await qmp.execute("system_powerdown")
+            await qmp.close()
+            print("==> 已发送 ACPI 关机信号,等待 VM 响应(最多 \(timeout) 秒)...")
+        } catch {
+            print("QMP 连接失败,退回 SIGTERM:\(error)")
+            try killPID(bundle: bundle, signal: SIGTERM)
+        }
+
+        // 等待进程退出
+        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+        while Date() < deadline && bundle.isRunning() {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        if bundle.isRunning() {
+            print("⚠️  VM 未响应关机信号,强制 SIGKILL")
+            try killPID(bundle: bundle, signal: SIGKILL)
+        }
+        print("✓ \(name) 已停止")
+    }
+
+    private func killPID(bundle: VMBundle, signal: Int32) throws {
+        guard let pid = bundle.readPID() else {
+            throw VMError.backendUnavailable("找不到 PID 文件")
+        }
+        if kill(pid, signal) != 0 && errno != ESRCH {
+            throw VMError.stopFailed("kill(\(pid), \(signal)) 失败:\(String(cString: strerror(errno)))")
+        }
+    }
+}
+
+// MARK: - hellvm pause <name>
+
+struct Pause: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "pause",
+        abstract: "暂停 VM(QMP stop)"
+    )
+
+    @Argument(help: "VM 名称") var name: String
+
+    func run() async throws {
+        let bundle = try findBundle(name: name)
+        guard bundle.isRunning() else {
+            print("\(name) 未在运行")
+            return
+        }
+        let qmp = QMPClient()
+        try await qmp.connect(socketPath: bundle.qmpSocketURL.path)
+        _ = try await qmp.execute("stop")
+        await qmp.close()
+        print("✓ \(name) 已暂停")
+    }
+}
+
+// MARK: - hellvm resume <name>
+
+struct Resume: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "resume",
+        abstract: "恢复 VM(QMP cont)"
+    )
+
+    @Argument(help: "VM 名称") var name: String
+
+    func run() async throws {
+        let bundle = try findBundle(name: name)
+        guard bundle.isRunning() else {
+            print("\(name) 未在运行")
+            return
+        }
+        let qmp = QMPClient()
+        try await qmp.connect(socketPath: bundle.qmpSocketURL.path)
+        _ = try await qmp.execute("cont")
+        await qmp.close()
+        print("✓ \(name) 已恢复")
     }
 }
 

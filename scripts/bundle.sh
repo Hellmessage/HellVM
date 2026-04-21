@@ -50,7 +50,7 @@ echo "==> 组装 .app 目录"
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$FRAMEWORKS" \
          "$RES_QEMU/bin" "$RES_QEMU/share"
-cp "$BIN_DIR/HellVM" "$CONTENTS/MacOS/HellVM"
+ditto "$BIN_DIR/HellVM" "$CONTENTS/MacOS/HellVM"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
 for b in "$BIN_DIR"/*.bundle; do
     [ -e "$b" ] || continue

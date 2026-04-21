@@ -1,5 +1,6 @@
 // QEMU 后端 —— 通过子进程启动 qemu-system-<arch>,以 HVF 加速
-// P1:串口引导、SIGTERM 停机;暂不接入 QMP(P2)
+// P1:串口引导 + execv CLI 前台模式
+// P2:QMP 控制通道(stop/pause/resume 通过 system_powerdown / stop / cont 实现)+ PID 文件
 // P4:接入共享内存 framebuffer 做图形显示
 import Foundation
 import HVMCore
@@ -16,8 +17,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     private var process: Process?
 
     public var state: VMState {
-        stateLock.lock(); defer { stateLock.unlock() }
-        return _state
+        withStateLock { _state }
     }
 
     private let stateContinuation: AsyncStream<VMState>.Continuation
@@ -32,7 +32,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         self.stateContinuation = cont
     }
 
-    // MARK: - 生命周期
+    // MARK: - 生命周期(GUI 异步模式用)
 
     public func start() async throws {
         try ensureState(.stopped, action: "start")
@@ -50,9 +50,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         let proc = Process()
         proc.executableURL = qemuURL
         proc.arguments = args
-        // CLI 前台模式:不显式设置 stdin/stdout/stderr,Process 会直接继承父进程的 FD(包括 TTY 属性)
-        // 若显式赋 FileHandle.standard*,某些情况下会绕到 Swift 内部 FD,丢失 TTY 字符模式
-
+        // GUI 模式:不显式设置 stdin/stdout/stderr,让 Process 默认继承(后续 P4 会换成 IOSurface)
         proc.terminationHandler = { [weak self] _ in
             self?.setState(.stopped)
         }
@@ -64,43 +62,70 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             throw VMError.startFailed("启动 qemu 失败:\(error.localizedDescription)")
         }
 
-        stateLock.lock()
-        self.process = proc
-        stateLock.unlock()
+        withStateLock { self.process = proc }
         setState(.running)
     }
 
     public func stop(force: Bool) async throws {
-        stateLock.lock()
-        guard let proc = process, _state == .running || _state == .starting else {
-            stateLock.unlock()
-            return
+        let proc: Process? = withStateLock {
+            guard let p = self.process, self._state == .running || self._state == .starting else {
+                return nil
+            }
+            self._state = .stopping
+            return p
         }
-        _state = .stopping
-        stateLock.unlock()
+        guard let proc else { return }
         stateContinuation.yield(.stopping)
 
         if force {
             kill(proc.processIdentifier, SIGKILL)
         } else {
-            kill(proc.processIdentifier, SIGTERM)
+            // 优先走 QMP system_powerdown,失败再退回 SIGTERM
+            if !(await gracefulPowerdown()) {
+                kill(proc.processIdentifier, SIGTERM)
+            }
         }
     }
 
     public func pause() async throws {
-        throw VMError.notImplemented("pause —— 待 P2 接入 QMP")
+        try await qmpCommand("stop")
     }
 
     public func resume() async throws {
-        throw VMError.notImplemented("resume —— 待 P2 接入 QMP")
+        try await qmpCommand("cont")
     }
 
     /// 阻塞等待 VM 进程退出(GUI 异步模式使用)
     public func waitUntilExit() async {
-        stateLock.lock()
-        let proc = process
-        stateLock.unlock()
+        let proc = withStateLock { self.process }
         proc?.waitUntilExit()
+    }
+
+    // MARK: - QMP 便捷方法
+
+    private func gracefulPowerdown() async -> Bool {
+        do {
+            try await qmpCommand("system_powerdown")
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func qmpCommand(_ command: String) async throws {
+        let qmp = QMPClient()
+        try await qmp.connect(socketPath: bundle.qmpSocketURL.path)
+        _ = try await qmp.execute(command)
+        await qmp.close()
+    }
+
+    // MARK: - 同步状态锁辅助
+
+    @inline(__always)
+    private func withStateLock<T>(_ body: () -> T) -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return body()
     }
 
     /// CLI 前台模式:用 execv 替换当前进程为 qemu。
@@ -142,9 +167,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     }
 
     private func setState(_ new: VMState) {
-        stateLock.lock()
-        _state = new
-        stateLock.unlock()
+        withStateLock { _state = new }
         stateContinuation.yield(new)
     }
 
@@ -163,6 +186,12 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     /// 构造 qemu 命令行参数
     private func buildArguments(efiVars: URL) throws -> [String] {
         var args: [String] = []
+
+        // 运行时控制通道:PID 文件 + QMP unix socket
+        // 先清理陈旧的文件(qemu 不会覆盖已存在的 socket)
+        bundle.cleanupRuntimeFiles()
+        args += ["-pidfile", bundle.pidFileURL.path]
+        args += ["-qmp", "unix:\(bundle.qmpSocketURL.path),server=on,wait=off"]
 
         // machine / 加速 / cpu / smp / 内存
         args += ["-machine", "virt,accel=hvf"]

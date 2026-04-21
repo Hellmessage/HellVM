@@ -21,6 +21,37 @@ public struct VMBundle: Sendable {
     public var disksDirURL: URL { url.appendingPathComponent("disks") }
     public var efiDirURL: URL { url.appendingPathComponent("efi") }
 
+    /// 运行时 QEMU PID 文件
+    public var pidFileURL: URL { url.appendingPathComponent("qemu.pid") }
+
+    /// 运行时 QMP unix socket
+    public var qmpSocketURL: URL { url.appendingPathComponent("qmp.sock") }
+
+    /// 读取 PID 文件,返回 qemu 进程 PID(若存在且能解析)
+    public func readPID() -> Int32? {
+        guard let data = try? Data(contentsOf: pidFileURL),
+              let str = String(data: data, encoding: .utf8),
+              let pid = Int32(str.trimmingCharacters(in: .whitespacesAndNewlines))
+        else {
+            return nil
+        }
+        return pid
+    }
+
+    /// 检查 VM 是否正在运行(PID 文件存在 + 进程存活)
+    public func isRunning() -> Bool {
+        guard let pid = readPID() else { return false }
+        // signal 0 检查进程是否存在,不实际发信号
+        return kill(pid, 0) == 0
+    }
+
+    /// 清理陈旧的运行时文件(PID + socket),确保下次启动干净
+    public func cleanupRuntimeFiles() {
+        let fm = FileManager.default
+        try? fm.removeItem(at: pidFileURL)
+        try? fm.removeItem(at: qmpSocketURL)
+    }
+
     /// bundle 内相对路径 → 绝对 URL
     public func resolve(_ relativePath: String) -> URL {
         url.appendingPathComponent(relativePath)
