@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug HellVM (App)",
+            "program": "${workspaceFolder}/build/HellVM.app/Contents/MacOS/HellVM",
+            "preLaunchTask": "build-debug",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug hellvm (CLI list)",
+            "program": "${workspaceFolder}/build/hellvm",
+            "args": ["list"],
+            "preLaunchTask": "build-cli",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

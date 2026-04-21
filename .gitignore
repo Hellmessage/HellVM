@@ -1,0 +1,15 @@
+# 构建产物
+/build/
+/.build/
+/.swiftpm/
+Package.resolved
+
+# 外部依赖编译产物
+/Vendor/qemu/build/
+/Vendor/qemu/src/
+
+# 系统 / 编辑器
+.DS_Store
+*.swp
+/.vscode/*.log
+/.cursor/

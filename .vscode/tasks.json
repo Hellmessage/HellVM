@@ -1,0 +1,36 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "make build",
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$swiftc"]
+        },
+        {
+            "label": "build-debug",
+            "type": "shell",
+            "command": "CONFIG=debug make build",
+            "problemMatcher": ["$swiftc"]
+        },
+        {
+            "label": "build-cli",
+            "type": "shell",
+            "command": "make cli",
+            "problemMatcher": ["$swiftc"]
+        },
+        {
+            "label": "test",
+            "type": "shell",
+            "command": "make test",
+            "group": "test",
+            "problemMatcher": ["$swiftc"]
+        },
+        {
+            "label": "clean",
+            "type": "shell",
+            "command": "make clean"
+        }
+    ]
+}

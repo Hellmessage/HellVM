@@ -1,0 +1,8 @@
+{
+    "swift.sourcekit-lsp.serverPath": "/usr/bin/sourcekit-lsp",
+    "files.associations": {
+        "*.entitlements": "xml",
+        "Package.swift": "swift"
+    },
+    "lldb.launch.expressions": "native"
+}

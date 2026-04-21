@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 不启用 App Sandbox,方便访问任意位置 ISO / 磁盘 -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+
+    <!-- 文件访问 -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!--
+      以下为虚拟化相关受限 entitlement,在 macOS 上需要 Apple Developer
+      配置文件才能随 ad-hoc 签名的 App 一起使用,否则 AMFI 会在启动时
+      SIGKILL 进程。P1 实际接入 VZ / QEMU 时再启用,并配套解决签名方案。
+
+      <key>com.apple.security.virtualization</key><true/>
+      <key>com.apple.security.hypervisor</key><true/>
+      <key>com.apple.vm.networking</key><true/>
+      <key>com.apple.vm.device-access</key><true/>
+      <key>com.apple.security.cs.allow-jit</key><true/>
+      <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+    -->
+</dict>
+</plist>
