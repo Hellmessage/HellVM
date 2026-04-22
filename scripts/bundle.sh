@@ -52,6 +52,11 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$FRAMEWORKS" \
          "$RES_QEMU/bin" "$RES_QEMU/share"
 ditto "$BIN_DIR/HellVM" "$CONTENTS/MacOS/HellVM"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
+
+# App 图标
+if [ -f "$ROOT/Resources/logo.png" ]; then
+    bash "$ROOT/scripts/make-icon.sh" "$ROOT/Resources/logo.png" "$CONTENTS/Resources/AppIcon.icns"
+fi
 for b in "$BIN_DIR"/*.bundle; do
     [ -e "$b" ] || continue
     cp -R "$b" "$CONTENTS/Resources/"
