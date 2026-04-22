@@ -3,36 +3,48 @@
 ## 当前进度
 
 - ✅ **P0** 项目骨架(Swift Package,`make build`,Hell Dev 自签)
-- ✅ **P1** QEMU v10.2.0 自编译 + HVF 加速 + 一键打包(`.app` 222MB,含 22 个 dylib)
+- ✅ **P1** QEMU v10.2.0 自编译 + HVF 加速 + 一键打包(`.app` 223MB,含 22 个 dylib)
 - ✅ **P2** QMP 控制通道:start / stop(ACPI 软关机+超时 SIGKILL) / pause / resume / list 状态
-- ✅ **P3** SwiftUI GUI:侧栏 + 详情 + 新建向导 + 日志查看(QEMU / 调试双源,可复制)
+- ✅ **P3** SwiftUI GUI:侧栏 + 详情 + 新建向导 + 日志查看
+- ✅ **P4** 图形显示 + 键鼠输入 + 独立 Console 窗口(详见下方)
 
 ---
 
-## P4 · 图形显示(核心)
+## P4 · 图形显示(核心) ✅
 
-目标:把 VM 的 framebuffer 显示到 App 窗口,取代当前的 `-nographic` 串口文本。
+目标:把 VM 的 framebuffer 显示到 App 窗口,取代 `-nographic` 串口文本。
 
-- [ ] **QEMU 自定义 display backend**
-  - Fork QEMU 源码加补丁,display backend 把 framebuffer 写入 `IOSurface`
-  - 维护 `patches/qemu-iosurface.patch`,`build-qemu.sh` 编译前 apply
-  - 上游版本升级时跟进(QEMU 每 4 个月一个大版本)
-- [ ] **Swift 侧 Metal 渲染**
-  - `MTKView` + `CAMetalLayer`,从 IOSurface 采样
-  - 鼠标光标合成 / 指针加速
-  - 动态分辨率适配(guest 侧 virtio-gpu 驱动发送 resize 事件)
-- [ ] **键鼠输入注入**
-  - `NSView` 捕获键盘/鼠标事件
-  - 通过 QMP `input-send-event` 或 virtio-input 通道注入
-  - 快捷键冲突处理(如 `cmd+q` 防误关 App)
-- [ ] **剪贴板同步(可选)**
-  - SPICE vdagent 或自实现 virtio-port
-- [ ] **VM 详情页改版**
-  - 增加 `Console` / `Settings` 标签切换
-  - Console 里显示 framebuffer(占满剩余空间)
-  - 全屏模式(`cmd+shift+F`)
+- [x] **QEMU 自定义 display backend** (`ui/iosurface.m`, patches/0001)
+  - POSIX shm + `SCM_RIGHTS` 传 fd (放弃原 IOSurface+mach port 方案, 见 design doc)
+  - DCL 完整实现 + 16B stride 对齐 + 对 USB HID LED 双向同步
+  - 协议: HELLO / SURFACE / UPDATE_HINT / CURSOR / MOUSE_SET / LED_STATE / RESIZE_REQ
+- [x] **Swift 侧 Metal 渲染** (`HVMDisplay` target)
+  - `MTLBuffer(bytesNoCopy:)` + `makeTexture` 零拷贝 + `addCompletedHandler` 生命周期管理
+  - 全屏 + cursor 两个 pipeline, alpha-blend 硬件光标合成
+  - `SharedFramebuffer` 从 SCM_RIGHTS 收的 shm fd 做 mmap
+- [x] **键鼠输入注入** (QMP `input-send-event` 专用 socket 长连接)
+  - USB HID (`usb-kbd` / `usb-tablet` / `qemu-xhci`), 兼容 UEFI
+  - Caps Lock LED 双向同步 (host 开/关 ↔ guest 开/关 通过 HID output report)
+  - `cmd+Q` 退出确认 ("关机所有 VM 再退出"), `cmd+opt+esc` 释放键盘
+- [x] **非图形模式 fallback** (`VMConfig.boot.graphical`)
+  - 新建向导可选「串口」模式 → `-nographic` + `-serial file:serial.log`
+  - 详情页 Console tab 串口模式下显示 serial 日志 tail
+- [x] **Guest 动态分辨率** (MSG_RESIZE_REQ → `dpy_set_ui_info`)
+  - 窗口拉伸 200ms debounce → QEMU → virtio-gpu EDID 更新 → guest 自适应
+- [x] **VM 详情页改版**
+  - Console / Settings 标签切换, 切 VM 时自动切换 tab
+  - 「打开 Console」独立 `NSWindow` (单画面策略, 打开时内嵌让位)
+  - 底部可折叠 Logger tail (`@AppStorage` 持久化)
+- [ ] ~~剪贴板同步~~ (延后, 需 SPICE vdagent)
 
-预估:**2-3 周**(补丁 + Metal 渲染 + 输入注入 + 联调)
+### 过程中的关键踩坑记录
+
+1. **IOSurface 跨进程 lookup 失败** → 改走 POSIX shm + `SCM_RIGHTS` (mach port 要 XPC/launchd, `fileport_makefd` 只认 `IOT_FILEPORT`)
+2. **SIGPIPE 杀 App** → VM 关机对端 socket 关闭, `write` 收 SIGPIPE; `signal(SIGPIPE, SIG_IGN)` 全局忽略
+3. **macOS Automatic Termination** → `Info.plist` + `ProcessInfo.disableAutomaticTermination` 双保险
+4. **Metal stride validation abort** → BIOS 选 2326x1932 等非对齐分辨率时 `bytesPerRow % 16 != 0` 触发 `_mtlValidateStrideTextureParameters` → `SIGABRT`; QEMU 侧对齐 256B + Swift 侧 guard 兜底
+5. **双 FramebufferView race** → 打开独立 Console 时内嵌 + 独立同连单客户端 socket 互踢; `detachedIDs.insert` 后 `DispatchQueue.main.async` 延后 buildWindow, 保证 SwiftUI 先 teardown 内嵌
+6. **Caps Lock 双轨不同步** → Host Caps LED 状态通过 guest HID LED output report 回传 (MSG_LED_STATE), `syncCapsLockIfNeeded` 不一致时补 toggle 脉冲
 
 ---
 
