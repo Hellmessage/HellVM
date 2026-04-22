@@ -1,5 +1,6 @@
 // VM 详情面板 —— 大字号 Hero + Pill 横排 + Console/Settings 分段
 import SwiftUI
+import AppKit
 import HVMCore
 import HVMDisplay
 
@@ -19,6 +20,7 @@ struct VMDetailPane: View {
     @State private var selectedTab: DetailTab = .settings
     @State private var showingLogSettings: Bool = false
     @AppStorage("hellvm.detail.showInlineLog") private var showInlineLog: Bool = false
+    @ObservedObject private var consoleMgr = ConsoleWindowManager.shared
 
     var body: some View {
         ZStack {
@@ -138,14 +140,16 @@ struct VMDetailPane: View {
 
     @ViewBuilder
     private func consoleTab(for item: VMListItem) -> some View {
-        if item.isRunning {
+        if !item.isRunning {
+            consolePlaceholder
+        } else if consoleMgr.isDetached(item.id) {
+            detachedPlaceholder(for: item)
+        } else {
             FramebufferView(
                 displaySocketPath: item.bundle.iosurfaceSocketURL.path,
                 inputSocketPath:   item.bundle.qmpInputSocketURL.path
             )
             .background(Color.black)
-        } else {
-            consolePlaceholder
         }
     }
 
@@ -160,6 +164,26 @@ struct VMDetailPane: View {
             Text("点击上方「启动」按钮后再切回 Console")
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.textTertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.background)
+    }
+
+    private func detachedPlaceholder(for item: VMListItem) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: "rectangle.on.rectangle.slash")
+                .font(.system(size: 44, weight: .thin))
+                .foregroundStyle(Theme.textTertiary)
+            Text("Console 已在独立窗口中")
+                .font(Font2.body)
+                .foregroundStyle(Theme.textSecondary)
+            Text("关闭独立窗口或点下方按钮,可让画面回到此处")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.textTertiary)
+            SecondaryButton(title: "收回到内嵌 Console", systemImage: "rectangle.compress.vertical") {
+                consoleMgr.close(for: item.id)
+            }
+            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.background)
@@ -269,6 +293,11 @@ struct VMDetailPane: View {
                 }
             }
             Spacer()
+            SecondaryButton(title: "打开 Console",
+                            systemImage: "macwindow.on.rectangle",
+                            disabled: !item.isRunning) {
+                ConsoleWindowManager.shared.open(for: item)
+            }
             SecondaryButton(title: "日志", systemImage: "doc.text") {
                 onShowLog(item)
             }
