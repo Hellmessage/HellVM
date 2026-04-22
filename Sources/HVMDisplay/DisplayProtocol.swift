@@ -96,7 +96,7 @@ public final class SharedFramebuffer: @unchecked Sendable {
     public var byteCount: Int { size }
 
     public func dispose() {
-        log.info(.display, "SharedFramebuffer dispose fd=\(shmFD) size=\(size)")
+        log.debug(.display, "SharedFramebuffer dispose fd=\(shmFD) size=\(size)")
         munmap(pointer, size)
         close(shmFD)
     }

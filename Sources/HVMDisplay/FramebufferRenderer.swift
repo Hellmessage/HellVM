@@ -138,17 +138,24 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
     }
 
     deinit {
-        log.info(.display, "FramebufferRenderer deinit")
+        log.debug(.display, "FramebufferRenderer deinit")
     }
 
     // MARK: - framebuffer 绑定
 
     public func bind(framebuffer: SharedFramebuffer) {
-        log.info(.display, "bind fb \(framebuffer.width)x\(framebuffer.height) size=\(framebuffer.byteCount)")
-        // 把 SharedFramebuffer 强引用捕获到 MTLBuffer.deallocator: Metal 保证
-        // GPU 处理完所有 in-flight command buffer 后才调用 deallocator, 那时释放
-        // SharedFramebuffer(munmap) 才安全。否则 VM 关机 → unbind() 立即释放会
-        // 让 GPU 访问已 munmap 的地址 → Metal crash → App 异常退出。
+        log.debug(.display, "bind fb \(framebuffer.width)x\(framebuffer.height) size=\(framebuffer.byteCount) stride=\(framebuffer.stride)")
+
+        // Metal 要求 MTLBuffer.makeTexture 的 bytesPerRow 至少 16 字节对齐
+        // (Apple Silicon 实测 _mtlValidateStrideTextureParameters 会 abort)。
+        // QEMU 侧已对齐到 256, 这里做 safety net: 不对齐则拒绝绑定, App 不崩。
+        guard framebuffer.stride % 16 == 0 else {
+            log.error(.display,
+                "rejected framebuffer: unaligned stride=\(framebuffer.stride) (需 16B 对齐)")
+            currentFB = nil; currentBuffer = nil; currentTexture = nil
+            return
+        }
+
         let keep = framebuffer
         let buf = device.makeBuffer(
             bytesNoCopy: framebuffer.pointer,
@@ -181,7 +188,7 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
     }
 
     public func unbind() {
-        log.info(.display, "unbind")
+        log.debug(.display, "unbind")
         // 此处只断 renderer 的引用, SharedFramebuffer 实际 munmap 由 MTLBuffer
         // deallocator 在 GPU 完成后触发。
         currentFB = nil

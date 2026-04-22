@@ -91,7 +91,7 @@ public struct FramebufferView: NSViewRepresentable {
         var currentInputPath: String?
 
         func start(displayPath: String, inputPath: String, retryInterval: TimeInterval) {
-            log.info(.display, "Coordinator start \(ObjectIdentifier(self).hashValue)")
+            log.debug(.display, "Coordinator start \(ObjectIdentifier(self).hashValue)")
             currentDisplayPath = displayPath
             currentInputPath   = inputPath
 
@@ -104,7 +104,7 @@ public struct FramebufferView: NSViewRepresentable {
         }
 
         func stop() {
-            log.info(.display, "Coordinator stop \(ObjectIdentifier(self).hashValue)")
+            log.debug(.display, "Coordinator stop \(ObjectIdentifier(self).hashValue)")
             displayTask?.cancel()
             inputTask?.cancel()
             displayChannel?.close()
@@ -119,7 +119,7 @@ public struct FramebufferView: NSViewRepresentable {
         }
 
         deinit {
-            log.info(.display, "Coordinator deinit")
+            log.debug(.display, "Coordinator deinit")
         }
 
         // MARK: - display 循环(连 iosurface socket)
