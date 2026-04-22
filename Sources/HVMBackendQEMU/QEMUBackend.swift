@@ -198,11 +198,14 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     private func buildArguments(efiVars: URL) throws -> [String] {
         var args: [String] = []
 
-        // 运行时控制通道:PID 文件 + QMP unix socket
+        // 运行时控制通道:PID 文件 + 两个 QMP socket
+        //   qmp.sock       控制(start/stop/pause/resume, VMController)
+        //   qmp-input.sock 键鼠注入(InputForwarder 长连接, 与控制互不干扰)
         // 先清理陈旧的文件(qemu 不会覆盖已存在的 socket)
         bundle.cleanupRuntimeFiles()
         args += ["-pidfile", bundle.pidFileURL.path]
         args += ["-qmp", "unix:\(bundle.qmpSocketURL.path),server=on,wait=off"]
+        args += ["-qmp", "unix:\(bundle.qmpInputSocketURL.path),server=on,wait=off"]
 
         // machine / 加速 / cpu / smp / 内存
         args += ["-machine", "virt,accel=hvf"]
@@ -241,6 +244,12 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
 
         // virtio-gpu 作为主显卡(P4)
         args += ["-device", "virtio-gpu-pci"]
+
+        // USB HID 键鼠: UEFI 固件(EDK2) 只内置 USB 驱动, 不识别 virtio-kbd/tablet,
+        // 用 USB HID 才能在启动早期就可输入; Linux 也能正常用。
+        args += ["-device", "qemu-xhci,id=usbbus"]
+        args += ["-device", "usb-kbd,bus=usbbus.0"]
+        args += ["-device", "usb-tablet,bus=usbbus.0"]
 
         // guest 串口先丢弃(QEMU 自身日志走 Process stdout/stderr -> qemu.log)
         args += ["-serial", "null"]

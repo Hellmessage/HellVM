@@ -24,8 +24,11 @@ public struct VMBundle: Sendable {
     /// 运行时 QEMU PID 文件
     public var pidFileURL: URL { url.appendingPathComponent("qemu.pid") }
 
-    /// 运行时 QMP unix socket
+    /// 运行时 QMP unix socket(控制通道: start/stop/pause/resume)
     public var qmpSocketURL: URL { url.appendingPathComponent("qmp.sock") }
+
+    /// 运行时 QMP 输入专用 socket(键鼠注入独立通道, 避免与控制通道争抢)
+    public var qmpInputSocketURL: URL { url.appendingPathComponent("qmp-input.sock") }
 
     /// 运行时 iosurface display backend 的 unix socket(Swift 侧作为客户端连入)
     public var iosurfaceSocketURL: URL { url.appendingPathComponent("iosurface.sock") }
@@ -56,6 +59,7 @@ public struct VMBundle: Sendable {
         let fm = FileManager.default
         try? fm.removeItem(at: pidFileURL)
         try? fm.removeItem(at: qmpSocketURL)
+        try? fm.removeItem(at: qmpInputSocketURL)
         try? fm.removeItem(at: iosurfaceSocketURL)
     }
 

@@ -44,9 +44,10 @@ let package = Package(
         ),
 
         // P4: iosurface display backend 客户端(socket 协议 + Metal 渲染)
+        //     输入通道复用 HVMBackendQEMU 的 QMPClient
         .target(
             name: "HVMDisplay",
-            dependencies: ["HVMBundle", "HVMDisplayC"]
+            dependencies: ["HVMBundle", "HVMDisplayC", "HVMBackendQEMU"]
         ),
 
         // 主 App(SwiftUI)

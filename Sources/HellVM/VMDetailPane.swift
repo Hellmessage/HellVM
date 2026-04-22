@@ -80,6 +80,10 @@ struct VMDetailPane: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Rectangle().fill(Theme.divider).frame(height: 1)
+            InlineLogPane(title: "INPUT DIAG", path: "/tmp/hellvm-input.log")
+                .frame(height: 180)
         }
         .onChange(of: item.id) { _, _ in
             // 切 VM 时按当前运行态选默认 tab
@@ -118,8 +122,11 @@ struct VMDetailPane: View {
     @ViewBuilder
     private func consoleTab(for item: VMListItem) -> some View {
         if item.isRunning {
-            FramebufferView(socketPath: item.bundle.iosurfaceSocketURL.path)
-                .background(Color.black)
+            FramebufferView(
+                displaySocketPath: item.bundle.iosurfaceSocketURL.path,
+                inputSocketPath:   item.bundle.qmpInputSocketURL.path
+            )
+            .background(Color.black)
         } else {
             consolePlaceholder
         }

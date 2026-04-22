@@ -1,31 +1,34 @@
-// FramebufferView —— SwiftUI 包装 MTKView + DisplayChannel 生命周期
+// FramebufferView —— SwiftUI 包装 MTKView(自定义 FramebufferHostView) + Display/Input 通道
 //
 // 用法:
-//   FramebufferView(socketPath: bundle.iosurfaceSocketURL.path)
+//   FramebufferView(displaySocketPath: bundle.iosurfaceSocketURL.path,
+//                   inputSocketPath:   bundle.qmpInputSocketURL.path)
 //
-// 生命周期: onAppear 连接 socket, onDisappear 关闭。连接失败会周期性重试,
-//          直到成功或 View 销毁。
+// 生命周期: onAppear 连接两个 socket, onDisappear 关闭; 连接失败周期重试。
 
 import SwiftUI
 import MetalKit
 
 public struct FramebufferView: NSViewRepresentable {
-    public let socketPath: String
+    public let displaySocketPath: String
+    public let inputSocketPath: String
 
-    /// 连接重试间隔(秒); VM 启动后会先 delay 一小段, socket 才会被 QEMU 建出
     public var retryInterval: TimeInterval = 0.3
 
-    public init(socketPath: String, retryInterval: TimeInterval = 0.3) {
-        self.socketPath = socketPath
-        self.retryInterval = retryInterval
+    public init(displaySocketPath: String,
+                inputSocketPath: String,
+                retryInterval: TimeInterval = 0.3) {
+        self.displaySocketPath = displaySocketPath
+        self.inputSocketPath   = inputSocketPath
+        self.retryInterval     = retryInterval
     }
 
     public func makeNSView(context: Context) -> MTKView {
-        let view = MTKView()
         guard let device = MTLCreateSystemDefaultDevice() else {
-            return view
+            // 设备不可用, 退回一个空 host view(用户最终会看到黑屏)
+            return FramebufferHostView(frame: .zero, device: nil)
         }
-        view.device = device
+        let view = FramebufferHostView(frame: .zero, device: device)
         view.colorPixelFormat = .bgra8Unorm
         view.framebufferOnly = true
         view.clearColor = MTLClearColorMake(0, 0, 0, 1)
@@ -38,7 +41,13 @@ public struct FramebufferView: NSViewRepresentable {
             let renderer = try FramebufferRenderer(device: device)
             view.delegate = renderer
             context.coordinator.renderer = renderer
-            context.coordinator.start(socketPath: socketPath,
+
+            let forwarder = InputForwarder()
+            view.inputForwarder = forwarder
+            context.coordinator.forwarder = forwarder
+
+            context.coordinator.start(displayPath: displaySocketPath,
+                                      inputPath: inputSocketPath,
                                       retryInterval: retryInterval)
         } catch {
             NSLog("FramebufferView: renderer init failed: \(error)")
@@ -48,10 +57,11 @@ public struct FramebufferView: NSViewRepresentable {
     }
 
     public func updateNSView(_ nsView: MTKView, context: Context) {
-        // socketPath 若变了, 重启连接
-        if context.coordinator.currentPath != socketPath {
+        if context.coordinator.currentDisplayPath != displaySocketPath
+            || context.coordinator.currentInputPath != inputSocketPath {
             context.coordinator.stop()
-            context.coordinator.start(socketPath: socketPath,
+            context.coordinator.start(displayPath: displaySocketPath,
+                                      inputPath: inputSocketPath,
                                       retryInterval: retryInterval)
         }
     }
@@ -64,39 +74,56 @@ public struct FramebufferView: NSViewRepresentable {
 
     public final class Coordinator {
         var renderer: FramebufferRenderer?
-        var channel: DisplayChannel?
-        var eventTask: Task<Void, Never>?
-        var reconnectTask: Task<Void, Never>?
-        var currentPath: String?
+        var forwarder: InputForwarder?
+        var displayChannel: DisplayChannel?
 
-        func start(socketPath: String, retryInterval: TimeInterval) {
-            currentPath = socketPath
-            reconnectTask = Task { [weak self] in
-                guard let self else { return }
-                while !Task.isCancelled {
-                    let ch = DisplayChannel()
-                    do {
-                        try ch.connect(socketPath: socketPath)
-                    } catch {
-                        try? await Task.sleep(nanoseconds: UInt64(retryInterval * 1_000_000_000))
-                        continue
-                    }
-                    self.channel = ch
-                    await self.consumeEvents(from: ch)
-                    // 断开后重试
-                    self.channel = nil
-                    try? await Task.sleep(nanoseconds: UInt64(retryInterval * 1_000_000_000))
-                }
+        var displayTask: Task<Void, Never>?
+        var inputTask: Task<Void, Never>?
+        var currentDisplayPath: String?
+        var currentInputPath: String?
+
+        func start(displayPath: String, inputPath: String, retryInterval: TimeInterval) {
+            currentDisplayPath = displayPath
+            currentInputPath   = inputPath
+
+            displayTask = Task { [weak self] in
+                await self?.runDisplayLoop(path: displayPath, retry: retryInterval)
+            }
+            inputTask = Task { [weak self] in
+                await self?.runInputLoop(path: inputPath, retry: retryInterval)
             }
         }
 
         func stop() {
-            reconnectTask?.cancel()
-            eventTask?.cancel()
-            channel?.close()
-            channel = nil
+            displayTask?.cancel()
+            inputTask?.cancel()
+            displayChannel?.close()
+            displayChannel = nil
+
+            let fwd = forwarder
+            Task { await fwd?.close() }
+
             Task { @MainActor [weak self] in
                 self?.renderer?.unbind()
+            }
+        }
+
+        // MARK: - display 循环(连 iosurface socket)
+
+        private func runDisplayLoop(path: String, retry: TimeInterval) async {
+            let sleepNanos = UInt64(retry * 1_000_000_000)
+            while !Task.isCancelled {
+                let ch = DisplayChannel()
+                do {
+                    try ch.connect(socketPath: path)
+                } catch {
+                    try? await Task.sleep(nanoseconds: sleepNanos)
+                    continue
+                }
+                self.displayChannel = ch
+                await self.consumeEvents(from: ch)
+                self.displayChannel = nil
+                try? await Task.sleep(nanoseconds: sleepNanos)
             }
         }
 
@@ -106,15 +133,31 @@ public struct FramebufferView: NSViewRepresentable {
                 switch event {
                 case .surface(let fb):
                     renderer?.bind(framebuffer: fb)
-                case .updateHint:
-                    // MTKView 60Hz 自刷, 暂不用 hint
-                    break
-                case .cursor, .mouseSet:
-                    // Sprint 5 处理
+                case .updateHint, .cursor, .mouseSet:
                     break
                 case .disconnected:
                     renderer?.unbind()
                     return
+                }
+            }
+        }
+
+        // MARK: - input 循环(连 qmp-input socket)
+
+        private func runInputLoop(path: String, retry: TimeInterval) async {
+            let sleepNanos = UInt64(retry * 1_000_000_000)
+            while !Task.isCancelled {
+                guard let fwd = forwarder else {
+                    try? await Task.sleep(nanoseconds: sleepNanos)
+                    continue
+                }
+                do {
+                    try await fwd.connect(socketPath: path)
+                    // 连上了就不主动断, 等待 VM 停止 EOF 会 throw 到下一次 send
+                    return
+                } catch {
+                    try? await Task.sleep(nanoseconds: sleepNanos)
+                    continue
                 }
             }
         }
