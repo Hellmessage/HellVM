@@ -27,6 +27,9 @@ public struct VMBundle: Sendable {
     /// 运行时 QMP unix socket
     public var qmpSocketURL: URL { url.appendingPathComponent("qmp.sock") }
 
+    /// 运行时 iosurface display backend 的 unix socket(Swift 侧作为客户端连入)
+    public var iosurfaceSocketURL: URL { url.appendingPathComponent("iosurface.sock") }
+
     /// QEMU 子进程的 stdout/stderr 日志(GUI 模式下捕获崩溃信息)
     public var qemuLogURL: URL { url.appendingPathComponent("qemu.log") }
 
@@ -53,6 +56,7 @@ public struct VMBundle: Sendable {
         let fm = FileManager.default
         try? fm.removeItem(at: pidFileURL)
         try? fm.removeItem(at: qmpSocketURL)
+        try? fm.removeItem(at: iosurfaceSocketURL)
     }
 
     /// bundle 内相对路径 → 绝对 URL

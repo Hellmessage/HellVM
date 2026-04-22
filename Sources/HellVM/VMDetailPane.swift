@@ -1,6 +1,13 @@
-// VM 详情面板 —— 大字号 Hero + Pill 横排 + flat 分段
+// VM 详情面板 —— 大字号 Hero + Pill 横排 + Console/Settings 分段
 import SwiftUI
 import HVMCore
+import HVMDisplay
+
+private enum DetailTab: String, CaseIterable, Identifiable {
+    case console  = "Console"
+    case settings = "Settings"
+    var id: String { rawValue }
+}
 
 struct VMDetailPane: View {
     let store: VMListStore
@@ -9,6 +16,7 @@ struct VMDetailPane: View {
     let onShowLog: (VMListItem) -> Void
 
     @State private var lastError: String?
+    @State private var selectedTab: DetailTab = .settings
 
     var body: some View {
         ZStack {
@@ -47,22 +55,95 @@ struct VMDetailPane: View {
     // MARK: - 详情
 
     private func content(for item: VMListItem) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            hero(for: item)
+                .padding(.horizontal, 32)
+                .padding(.top, 32)
+                .padding(.bottom, 20)
+
+            if let err = lastError {
+                errorBanner(err)
+                    .padding(.horizontal, 32)
+                    .padding(.bottom, 12)
+            }
+
+            tabBar()
+                .padding(.horizontal, 32)
+                .padding(.bottom, 16)
+
+            Rectangle().fill(Theme.divider).frame(height: 1)
+
+            Group {
+                switch selectedTab {
+                case .console:  consoleTab(for: item)
+                case .settings: settingsTab(for: item)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onChange(of: item.id) { _, _ in
+            // 切 VM 时按当前运行态选默认 tab
+            selectedTab = item.isRunning ? .console : .settings
+        }
+        .onChange(of: item.isRunning) { _, running in
+            // 同一个 VM 启动 → Console, 停止 → Settings
+            selectedTab = running ? .console : .settings
+        }
+        .onAppear {
+            selectedTab = item.isRunning ? .console : .settings
+        }
+    }
+
+    private func tabBar() -> some View {
+        HStack(spacing: 6) {
+            ForEach(DetailTab.allCases) { t in
+                Button(action: { selectedTab = t }) {
+                    Text(t.rawValue)
+                        .font(.system(size: 11, weight: .semibold))
+                        .tracking(0.4)
+                        .foregroundStyle(selectedTab == t ? Theme.textPrimary : Theme.textTertiary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(selectedTab == t ? Theme.surface : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private func consoleTab(for item: VMListItem) -> some View {
+        if item.isRunning {
+            FramebufferView(socketPath: item.bundle.iosurfaceSocketURL.path)
+                .background(Color.black)
+        } else {
+            consolePlaceholder
+        }
+    }
+
+    private var consolePlaceholder: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "display.trianglebadge.exclamationmark")
+                .font(.system(size: 44, weight: .thin))
+                .foregroundStyle(Theme.textTertiary)
+            Text("VM 未运行")
+                .font(Font2.body)
+                .foregroundStyle(Theme.textSecondary)
+            Text("点击上方「启动」按钮后再切回 Console")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.textTertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.background)
+    }
+
+    private func settingsTab(for item: VMListItem) -> some View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 0) {
-                hero(for: item)
-                    .padding(.horizontal, 32)
-                    .padding(.top, 32)
-                    .padding(.bottom, 24)
-
-                if let err = lastError {
-                    errorBanner(err)
-                        .padding(.horizontal, 32)
-                        .padding(.bottom, 16)
-                }
-
-                Rectangle().fill(Theme.divider).frame(height: 1)
-                    .padding(.horizontal, 32)
-
                 section(title: "基本信息") {
                     keyValue("架构", value: item.config.architecture.rawValue)
                     keyValue("CPU 核心", value: "\(item.config.cpuCount)")

@@ -239,8 +239,17 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         args += ["-netdev", "user,id=net0"]
         args += ["-device", "virtio-net-pci,netdev=net0"]
 
-        // 串口 + 无图形(P1)
-        args += ["-nographic"]
+        // virtio-gpu 作为主显卡(P4)
+        args += ["-device", "virtio-gpu-pci"]
+
+        // guest 串口先丢弃(QEMU 自身日志走 Process stdout/stderr -> qemu.log)
+        args += ["-serial", "null"]
+
+        // 禁用默认 PCI VGA, 避免和 virtio-gpu 冲突
+        args += ["-vga", "none"]
+
+        // IOSurface 显示后端(P4): 每 VM 独占一个 unix socket
+        args += ["-display", "iosurface,socket=\(bundle.iosurfaceSocketURL.path)"]
 
         return args
     }

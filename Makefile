@@ -1,5 +1,5 @@
 # HellVM —— 所有构建产物输出到 build/
-.PHONY: all build run cli test clean
+.PHONY: all build run cli test clean probe
 
 CONFIG ?= release
 
@@ -8,6 +8,12 @@ all: build
 # 构建主 App(.app bundle + ad-hoc 签名)
 build:
 	@bash scripts/bundle.sh
+
+# P4 Sprint 2 端到端验证工具:连 iosurface socket, dump 一帧 PPM
+probe:
+	@mkdir -p build
+	@clang -O2 -Wall -o build/iosurface-probe tools/iosurface-probe.c
+	@echo "==> build/iosurface-probe"
 
 # 构建 CLI
 # 注意:必须用 ditto 而非 cp,cp 在部分 macOS 版本会丢 code signature 元数据,

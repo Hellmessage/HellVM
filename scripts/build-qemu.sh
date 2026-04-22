@@ -15,6 +15,7 @@ SRC="$VENDOR/qemu-src"
 BUILD="$VENDOR/qemu-build"
 PREFIX="$VENDOR/qemu"
 ENTITLEMENTS="$ROOT/Resources/qemu.entitlements"
+PATCHES_DIR="$ROOT/patches"
 
 QEMU_VERSION="${QEMU_VERSION:-v10.2.0}"
 QEMU_GIT_URL="${QEMU_GIT_URL:-https://github.com/qemu/qemu.git}"
@@ -70,10 +71,23 @@ mkdir -p "$VENDOR"
 
 if [ -d "$SRC/.git" ]; then
     echo "==> 源码已存在,检出 $QEMU_VERSION"
-    (cd "$SRC" && git fetch --depth 1 origin "$QEMU_VERSION" && git checkout FETCH_HEAD)
+    # 先重置到 tag, 清掉上次 apply 的 patch 和任何本地改动
+    # (不 clean untracked: 保留 subprojects/ 里已下载的 wrap 依赖, 省重新下载时间)
+    (cd "$SRC" && git fetch --depth 1 origin "$QEMU_VERSION" && git checkout FETCH_HEAD && git reset --hard FETCH_HEAD)
 else
     echo "==> 克隆 QEMU $QEMU_VERSION ($QEMU_GIT_URL)"
     git clone --depth 1 --branch "$QEMU_VERSION" "$QEMU_GIT_URL" "$SRC"
+fi
+
+# ---------- 应用 HellVM 补丁 ----------
+if [ -d "$PATCHES_DIR" ] && ls "$PATCHES_DIR"/*.patch >/dev/null 2>&1; then
+    echo "==> 应用 HellVM 补丁 ($PATCHES_DIR)"
+    # git am 需要 user.name/email, 这里用仓库级配置避免污染全局
+    (cd "$SRC" \
+        && git config user.name  "HellVM Build" \
+        && git config user.email "build@hellvm.local" \
+        && git am --keep-cr "$PATCHES_DIR"/*.patch) \
+        || { echo "补丁应用失败, 终止构建"; exit 1; }
 fi
 
 # QEMU 的 pc-bios/ 携带预编译 UEFI/BIOS 固件,不需要 EDK2 源码。
@@ -119,6 +133,9 @@ make install
 # ---------- 签名 ----------
 if [ -z "${SKIP_SIGN:-}" ]; then
     echo "==> 签名 QEMU 二进制 (身份: $SIGN_ID)"
+    # QEMU 10.2 的 make install 会通过 entitlement.sh 给 qemu-system-* 做一次 ad-hoc 签名,
+    # 留下 resource fork / xattr, 再次 codesign 会报 "detritus not allowed", 先清掉
+    xattr -cr "$PREFIX"/bin
     for bin in "$PREFIX"/bin/qemu-*; do
         [ -f "$bin" ] || continue
         codesign --force --sign "$SIGN_ID" \

@@ -19,6 +19,7 @@ let package = Package(
         .library(name: "HVMBundle", targets: ["HVMBundle"]),
         .library(name: "HVMStorage", targets: ["HVMStorage"]),
         .library(name: "HVMBackendQEMU", targets: ["HVMBackendQEMU"]),
+        .library(name: "HVMDisplay", targets: ["HVMDisplay"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
@@ -36,11 +37,24 @@ let package = Package(
         // QEMU 进程后端(QMP 控制 + 共享内存 framebuffer + HVF 加速)
         .target(name: "HVMBackendQEMU", dependencies: ["HVMCore", "HVMBundle"]),
 
+        // P4: iosurface display backend 协议对端 C 辅助(recvmsg + SCM_RIGHTS)
+        .target(
+            name: "HVMDisplayC",
+            publicHeadersPath: "include"
+        ),
+
+        // P4: iosurface display backend 客户端(socket 协议 + Metal 渲染)
+        .target(
+            name: "HVMDisplay",
+            dependencies: ["HVMBundle", "HVMDisplayC"]
+        ),
+
         // 主 App(SwiftUI)
         .executableTarget(
             name: "HellVM",
             dependencies: [
                 "HVMCore", "HVMBundle", "HVMStorage", "HVMBackendQEMU",
+                "HVMDisplay",
             ]
         ),
 
