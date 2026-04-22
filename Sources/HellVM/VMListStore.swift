@@ -29,6 +29,10 @@ final class VMListStore {
     // MARK: - 刷新 / 轮询
 
     func refresh() {
+        // 保留上一轮的运行状态, diff 出 running → stopped 的 VM, 关掉它们的
+        // 独立 Console 窗口(guest poweroff 后自动关窗)。
+        let previouslyRunning = Set(items.filter { $0.isRunning }.map { $0.id })
+
         do {
             let bundles = try VMBundle.listAll()
             var out: [VMListItem] = []
@@ -42,6 +46,12 @@ final class VMListStore {
             self.error = "\(error)"
         }
         lastRefresh = Date()
+
+        let currentlyRunning = Set(items.filter { $0.isRunning }.map { $0.id })
+        let stopped = previouslyRunning.subtracting(currentlyRunning)
+        for id in stopped {
+            ConsoleWindowManager.shared.close(for: id)
+        }
     }
 
     func startPolling(interval: TimeInterval = 2.0) {

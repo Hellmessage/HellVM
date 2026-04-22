@@ -1,4 +1,4 @@
-From 696f5670bdcc261259d46588358a200e7c3c84a9 Mon Sep 17 00:00:00 2001
+From 42daebf67937bc61eef7908d68c2326a22e68f9a Mon Sep 17 00:00:00 2001
 From: HellVM <hellvm@local>
 Date: Wed, 22 Apr 2026 16:42:56 +0800
 Subject: [PATCH] ui: add iosurface display backend (HellVM)
@@ -17,9 +17,9 @@ Sprint 1 骨架, 真正的 DCL + socket 协议在 Sprint 2 填充。
 ---
  meson.build    |  10 +
  qapi/ui.json   |  23 +-
- ui/iosurface.m | 559 +++++++++++++++++++++++++++++++++++++++++++++++++
+ ui/iosurface.m | 644 +++++++++++++++++++++++++++++++++++++++++++++++++
  ui/meson.build |   1 +
- 4 files changed, 591 insertions(+), 2 deletions(-)
+ 4 files changed, 676 insertions(+), 2 deletions(-)
  create mode 100644 ui/iosurface.m
 
 diff --git a/meson.build b/meson.build
@@ -114,10 +114,10 @@ index e3da776..a178517 100644
  
 diff --git a/ui/iosurface.m b/ui/iosurface.m
 new file mode 100644
-index 0000000..75e94e9
+index 0000000..b55cef3
 --- /dev/null
 +++ b/ui/iosurface.m
-@@ -0,0 +1,559 @@
+@@ -0,0 +1,644 @@
 +/*
 + * QEMU "iosurface" display backend (HellVM project)
 + *
@@ -139,6 +139,7 @@ index 0000000..75e94e9
 +
 +#include "qemu/osdep.h"
 +#include "qemu/error-report.h"
++#include "qemu/main-loop.h"
 +#include "qemu/module.h"
 +#include "qapi/error.h"
 +#include "ui/console.h"
@@ -165,6 +166,7 @@ index 0000000..75e94e9
 +    MSG_CURSOR       = 0x04,
 +    MSG_MOUSE_SET    = 0x05,
 +    MSG_LED_STATE    = 0x06,
++    MSG_RESIZE_REQ   = 0x07, /* C->S: 请求 guest 改分辨率 */
 +};
 +
 +typedef struct __attribute__((packed)) {
@@ -200,6 +202,11 @@ index 0000000..75e94e9
 +    uint32_t ledstate;
 +} LedStatePayload;
 +
++typedef struct __attribute__((packed)) {
++    uint32_t width;
++    uint32_t height;
++} ResizeReqPayload;
++
 +/* ---------- 全局状态 ---------- */
 +
 +static char *sock_path;
@@ -231,7 +238,9 @@ index 0000000..75e94e9
 +    }
 +}
 +
-+/* 发送整帧消息; 客户端断开时回收 client_fd。EAGAIN 视为丢包(允许)。 */
++/* 发送整帧消息; 客户端断开时回收 client_fd。EAGAIN 视为丢包(允许)。
++ * 用 MSG_DONTWAIT 让 BQL 回调线程不阻塞, 不再设 O_NONBLOCK 便于 listener
++ * 线程在同一 fd 做阻塞 read。 */
 +static int send_msg(int fd, uint32_t type, const void *payload, uint32_t len)
 +{
 +    if (fd < 0) {
@@ -246,7 +255,7 @@ index 0000000..75e94e9
 +        .msg_iov = iov,
 +        .msg_iovlen = len ? 2 : 1,
 +    };
-+    ssize_t n = sendmsg(fd, &msg, 0);
++    ssize_t n = sendmsg(fd, &msg, MSG_DONTWAIT);
 +    if (n < 0) {
 +        if (errno == EPIPE || errno == ECONNRESET || errno == EBADF) {
 +            int old = atomic_exchange(&client_fd, -1);
@@ -307,6 +316,10 @@ index 0000000..75e94e9
 +
 +/* ---------- listener pthread ---------- */
 +
++static void client_read_loop(int fd);
++static void handle_client_msg(uint32_t type, const uint8_t *buf, uint32_t len);
++static void handle_resize_req(uint32_t width, uint32_t height);
++
 +static void *listener_main(void *arg)
 +{
 +    for (;;) {
@@ -335,8 +348,6 @@ index 0000000..75e94e9
 +            close(old);
 +        }
 +
-+        set_nonblock(new_fd);
-+
 +        pthread_mutex_lock(&state_mtx);
 +        send_current_surface_to(new_fd);
 +        pthread_mutex_unlock(&state_mtx);
@@ -346,8 +357,82 @@ index 0000000..75e94e9
 +        send_msg(new_fd, MSG_LED_STATE, &led, sizeof(led));
 +
 +        atomic_store(&client_fd, new_fd);
++
++        /* 进入客户端读循环处理 MSG_RESIZE_REQ 等 (阻塞 read 直到 EOF) */
++        client_read_loop(new_fd);
++
++        /* 客户端断开, 回到 accept */
++        atomic_compare_exchange_strong(&client_fd, &new_fd, -1);
++        close(new_fd);
 +    }
 +    return NULL;
++}
++
++/* 从客户端读消息, 分发到对应 handler; 客户端断开时返回 */
++static void client_read_loop(int fd)
++{
++    for (;;) {
++        MsgHeader hdr;
++        ssize_t n = read(fd, &hdr, sizeof(hdr));
++        if (n == 0) return;               /* EOF */
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return;
++        }
++        if (n != (ssize_t)sizeof(hdr)) return;  /* short, 协议异常 */
++        if (hdr.payload_len > 65536) return;    /* 上限保护 */
++
++        uint8_t buf[65536];
++        uint32_t remaining = hdr.payload_len;
++        uint8_t *p = buf;
++        while (remaining > 0) {
++            ssize_t r = read(fd, p, remaining);
++            if (r <= 0) {
++                if (r < 0 && errno == EINTR) continue;
++                return;
++            }
++            p += r;
++            remaining -= (uint32_t)r;
++        }
++        handle_client_msg(hdr.type, buf, hdr.payload_len);
++    }
++}
++
++static void handle_resize_req(uint32_t width, uint32_t height);
++
++static void handle_client_msg(uint32_t type, const uint8_t *buf, uint32_t len)
++{
++    switch (type) {
++    case MSG_RESIZE_REQ:
++        if (len != sizeof(ResizeReqPayload)) break;
++        {
++            ResizeReqPayload p;
++            memcpy(&p, buf, sizeof(p));
++            handle_resize_req(p.width, p.height);
++        }
++        break;
++    default:
++        /* 未知消息忽略 */
++        break;
++    }
++}
++
++/* 在 BQL 下调 dpy_set_ui_info 让 guest virtio-gpu 驱动触发 resize */
++static void handle_resize_req(uint32_t width, uint32_t height)
++{
++    if (width < 64 || height < 64 || width > 8192 || height > 8192) {
++        return;
++    }
++    bql_lock();
++    QemuConsole *con = qemu_console_lookup_default();
++    if (con && dpy_ui_info_supported(con)) {
++        QemuUIInfo info = {
++            .width  = width,
++            .height = height,
++        };
++        dpy_set_ui_info(con, &info, false);
++    }
++    bql_unlock();
 +}
 +
 +static int start_listener(const char *path, Error **errp)

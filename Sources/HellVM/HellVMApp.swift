@@ -23,20 +23,22 @@ struct HellVMApp: App {
 
 final class HellVMAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // 忽略 SIGPIPE: VM 关机时 qmp / iosurface socket 对端会关, 我们仍可能
+        // write/sendmsg, 内核默认发 SIGPIPE kill 整个进程。显式 SIG_IGN 让
+        // write 改返回 EPIPE, 调用方 try? 吞掉即可, App 不再被炸。
+        signal(SIGPIPE, SIG_IGN)
+
         // 捕获 ObjC 层 uncaught 异常(Metal / AppKit / KVO 等触发), Swift 没法 try-catch。
-        // 写入 Logger 便于 crash 后诊断。
         NSSetUncaughtExceptionHandler { exc in
             let stack = exc.callStackSymbols.joined(separator: "\n")
             log.error(.general,
                 "UNCAUGHT ObjC \(exc.name.rawValue): \(exc.reason ?? "")\nstack:\n\(stack)")
         }
         // POSIX signal (SIGABRT / SIGSEGV / SIGBUS) 记录后原样 abort
-        for sig in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGPIPE] {
+        for sig: Int32 in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE] {
             signal(sig) { sig in
-                // signal handler 里只能 async-signal-safe; 用 write 到 stderr
                 let msg = "HellVM SIGNAL \(sig)\n"
                 msg.withCString { p in _ = write(STDERR_FILENO, p, strlen(p)) }
-                // 恢复默认处理, core dump
                 signal(sig, SIG_DFL)
                 raise(sig)
             }

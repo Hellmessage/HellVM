@@ -10,6 +10,7 @@ enum MessageType: UInt32 {
     case cursor     = 0x04
     case mouseSet   = 0x05
     case ledState   = 0x06
+    case resizeReq  = 0x07   // Swift → QEMU: 请求 guest 改分辨率
 }
 
 /// QEMU 键盘 LED 位 (QEMU_*_LED 宏)
@@ -62,6 +63,11 @@ struct MouseSetPayload {
 
 struct LedStatePayload {
     var ledstate: UInt32
+}
+
+struct ResizeReqPayload {
+    var width: UInt32
+    var height: UInt32
 }
 
 // ---------- Swift 侧事件 ----------

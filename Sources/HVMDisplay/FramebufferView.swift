@@ -48,6 +48,12 @@ public struct FramebufferView: NSViewRepresentable {
             view.inputForwarder = forwarder
             context.coordinator.forwarder = forwarder
 
+            view.onResize = { [weak coordinator = context.coordinator] w, h in
+                Task { @MainActor in
+                    coordinator?.requestGuestResize(width: w, height: h)
+                }
+            }
+
             context.coordinator.start(displayPath: displaySocketPath,
                                       inputPath: inputSocketPath,
                                       retryInterval: retryInterval)
@@ -157,6 +163,25 @@ public struct FramebufferView: NSViewRepresentable {
                     renderer?.unbind()
                     return
                 }
+            }
+        }
+
+        /// FramebufferHostView 在 layout 变化时调; 200ms debounce 再发 resize,
+        /// 避免拖拽过程中每帧都打扰 guest。
+        private var resizeDebounce: Task<Void, Never>?
+        private var lastRequestedSize: (UInt32, UInt32) = (0, 0)
+
+        @MainActor
+        func requestGuestResize(width: UInt32, height: UInt32) {
+            guard width >= 64, height >= 64 else { return }
+            if (width, height) == lastRequestedSize { return }
+            resizeDebounce?.cancel()
+            resizeDebounce = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                if Task.isCancelled { return }
+                guard let self, let ch = self.displayChannel else { return }
+                self.lastRequestedSize = (width, height)
+                ch.requestResize(width: width, height: height)
             }
         }
 

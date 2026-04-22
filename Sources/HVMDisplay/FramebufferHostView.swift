@@ -10,6 +10,8 @@ import HVMCore
 
 final class FramebufferHostView: MTKView {
     weak var inputForwarder: InputForwarder?
+    /// view 布局尺寸变化时调; 目前接到 Coordinator.requestGuestResize
+    var onResize: ((UInt32, UInt32) -> Void)?
 
     private var trackingArea: NSTrackingArea?
 
@@ -91,10 +93,11 @@ final class FramebufferHostView: MTKView {
 
     override func layout() {
         super.layout()
-        inputForwarder?.updateViewSize(
-            width: Int(bounds.width),
-            height: Int(bounds.height)
-        )
+        let scale = window?.backingScaleFactor ?? 1.0
+        let pxWidth  = Int(bounds.width  * scale)
+        let pxHeight = Int(bounds.height * scale)
+        inputForwarder?.updateViewSize(width: pxWidth, height: pxHeight)
+        onResize?(UInt32(max(pxWidth, 64)), UInt32(max(pxHeight, 64)))
     }
 
     // MARK: - 键盘

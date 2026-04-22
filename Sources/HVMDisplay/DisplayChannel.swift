@@ -86,6 +86,26 @@ public final class DisplayChannel: @unchecked Sendable {
 
     // MARK: - 发送
 
+    /// 请求 guest 改分辨率。通过 QEMU 的 dpy_set_ui_info 推给 virtio-gpu 驱动,
+    /// guest 内核响应后会重新分配 framebuffer, 触发新的 SURFACE 消息回传。
+    public func requestResize(width: UInt32, height: UInt32) {
+        guard sockFD >= 0 else { return }
+        var header = MsgHeader(type: MessageType.resizeReq.rawValue,
+                               payloadLen: UInt32(MemoryLayout<ResizeReqPayload>.size))
+        var payload = ResizeReqPayload(width: width, height: height)
+
+        let total = MemoryLayout<MsgHeader>.size + MemoryLayout<ResizeReqPayload>.size
+        var buf = [UInt8](repeating: 0, count: total)
+        buf.withUnsafeMutableBufferPointer { b in
+            memcpy(b.baseAddress!, &header, MemoryLayout<MsgHeader>.size)
+            memcpy(b.baseAddress! + MemoryLayout<MsgHeader>.size,
+                   &payload, MemoryLayout<ResizeReqPayload>.size)
+        }
+        _ = buf.withUnsafeBufferPointer { p in
+            Darwin.send(sockFD, p.baseAddress, p.count, 0)
+        }
+    }
+
     private func sendHello() throws {
         var header = MsgHeader(type: MessageType.hello.rawValue,
                                payloadLen: UInt32(MemoryLayout<HelloPayload>.size))
