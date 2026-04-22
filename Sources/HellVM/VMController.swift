@@ -10,15 +10,15 @@ struct VMController {
     /// 启动 VM —— Process spawn,store 保活 backend 防 ARC 回收
     @MainActor
     static func start(_ item: VMListItem, store: VMListStore) async throws {
-        dbg("start enter name=\(item.config.name) isRunning=\(item.isRunning)")
+        log.info(.backend, "start enter name=\(item.config.name) isRunning=\(item.isRunning)")
         let paths = try QEMUPaths.discover()
-        dbg("QEMUPaths.discover OK prefix=\(paths.prefix.path)")
+        log.debug(.backend, "QEMUPaths.discover OK prefix=\(paths.prefix.path)")
         let backend = try QEMUBackend(config: item.config, bundle: item.bundle, paths: paths)
-        dbg("backend init OK")
+        log.debug(.backend, "backend init OK")
         try await backend.start()
-        dbg("backend.start returned")
+        log.debug(.backend, "backend.start returned")
         store.retainBackend(backend, for: item.id)
-        dbg("start exit")
+        log.info(.backend, "start exit name=\(item.config.name)")
     }
 
     /// 停止 VM —— QMP system_powerdown → 超时 SIGKILL
@@ -142,17 +142,3 @@ struct VMController {
     }
 }
 
-/// 简易文件日志(附加到 /tmp/hellvm.log),方便 GUI 调试
-func dbg(_ msg: String, file: String = #file, line: Int = #line) {
-    let ts = ISO8601DateFormatter().string(from: Date())
-    let f = (file as NSString).lastPathComponent
-    let line = "\(ts) [\(f):\(line)] \(msg)\n"
-    let url = URL(fileURLWithPath: "/tmp/hellvm.log")
-    if let handle = try? FileHandle(forWritingTo: url) {
-        handle.seekToEndOfFile()
-        handle.write(Data(line.utf8))
-        try? handle.close()
-    } else {
-        try? line.write(to: url, atomically: true, encoding: .utf8)
-    }
-}

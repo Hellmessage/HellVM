@@ -30,6 +30,8 @@ struct LogViewerModal: View {
     @State private var copied: Bool = false
     @State private var autoRefresh: Bool = true
     @State private var refreshTimer: Timer?
+    @State private var showingLogSettings: Bool = false
+    @AppStorage("hellvm.detail.showInlineLog") private var showInlineLog: Bool = false
 
     private var currentURL: URL { sources[selectedIndex].fileURL }
 
@@ -68,6 +70,9 @@ struct LogViewerModal: View {
         }
         .onDisappear { stopAutoRefresh() }
         .onChange(of: selectedIndex) { _, _ in refresh() }
+        .sheet(isPresented: $showingLogSettings) {
+            LogSettingsView(isPresented: $showingLogSettings)
+        }
     }
 
     private var header: some View {
@@ -137,6 +142,13 @@ struct LogViewerModal: View {
 
             Spacer()
 
+            SecondaryButton(title: "日志设置", systemImage: "gearshape") {
+                showingLogSettings = true
+            }
+            SecondaryButton(title: "主页显示", systemImage: "rectangle.split.1x2.fill") {
+                showInlineLog = true
+                onClose()
+            }
             SecondaryButton(title: "刷新", systemImage: "arrow.clockwise", action: refresh)
             SecondaryButton(
                 title: copied ? "已复制" : "复制",

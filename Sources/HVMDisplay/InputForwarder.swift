@@ -1,17 +1,4 @@
 // InputForwarder —— 把 Cocoa 键鼠事件转成 QMP input-send-event 发给 guest
-
-/// 诊断日志 - 写 /tmp/hellvm-input.log; 生产时可移除
-fileprivate func dbgInput(_ msg: @autoclosure () -> String) {
-    let line = "[\(Date())] \(msg())\n"
-    if let data = line.data(using: .utf8),
-       let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/hellvm-input.log")) {
-        fh.seekToEndOfFile()
-        fh.write(data)
-        try? fh.close()
-    } else if let data = line.data(using: .utf8) {
-        try? data.write(to: URL(fileURLWithPath: "/tmp/hellvm-input.log"))
-    }
-}
 //
 // 通道: 专用 QMP socket(VMBundle.qmpInputSocketURL), 持久连接,
 //      与 VMController 的控制通道(qmp.sock)隔离, 避免 accept 争抢。
@@ -22,6 +9,7 @@ fileprivate func dbgInput(_ msg: @autoclosure () -> String) {
 
 import Foundation
 import Darwin
+import HVMCore
 import HVMBundle
 import HVMBackendQEMU
 
@@ -52,15 +40,15 @@ public final class InputForwarder: @unchecked Sendable {
 
     /// 连 QMP 输入 socket; 失败抛出, 调用方负责重试
     public func connect(socketPath: String) async throws {
-        dbgInput("connect attempt \(socketPath)")
+        log.debug(.input, "connect attempt \(socketPath)")
         do {
             try await qmp.connect(socketPath: socketPath)
         } catch {
-            dbgInput("connect FAIL: \(error)")
+            log.warn(.input, "connect FAIL: \(error)")
             throw error
         }
         connected = true
-        dbgInput("connect OK")
+        log.info(.input, "QMP input channel connected")
     }
 
     public func close() async {
@@ -140,10 +128,10 @@ public final class InputForwarder: @unchecked Sendable {
     private func enqueueBatch(_ events: [QMPInputEvent]) {
         guard !events.isEmpty else { return }
         guard connected else {
-            dbgInput("enqueue DROP (not connected) count=\(events.count)")
+            log.warn(.input, "enqueue DROP (not connected) count=\(events.count)")
             return
         }
-        dbgInput("enqueue count=\(events.count)")
+        log.trace(.input, "enqueue count=\(events.count)")
         queueLock.lock()
         pending.append(contentsOf: events)
         queueLock.unlock()
@@ -152,34 +140,30 @@ public final class InputForwarder: @unchecked Sendable {
 
     private func scheduleFlush() {
         if flushTask != nil { return }
-        dbgInput("scheduleFlush spawn")
         flushTask = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.flushLoop()
         }
     }
 
+    /// 长期活着, pending 空时短暂 sleep 再 drain。
+    /// 这样连续的鼠标移动不会反复 spawn 新 Task(Task 启动开销 ~ms 级)。
+    /// 只在: 连接失败 / Task 被 cancel 时退出。
     private func flushLoop() async {
-        dbgInput("flushLoop enter")
         while !Task.isCancelled {
             let events = drainPending()
             if events.isEmpty {
-                dbgInput("flushLoop drain empty, exit")
-                flushTask = nil
-                return
+                try? await Task.sleep(nanoseconds: 3_000_000) // 3ms 轮询
+                continue
             }
-
-            dbgInput("flush -> QMP execute count=\(events.count)")
             do {
                 try await qmp.execute("input-send-event",
                                       arguments: ["events": events])
-                dbgInput("flush OK")
             } catch {
-                dbgInput("flush FAIL: \(error)")
+                log.warn(.input, "flush FAIL: \(error)")
                 flushTask = nil
                 return
             }
         }
-        dbgInput("flushLoop exit (cancelled)")
     }
 
     private func drainPending() -> [QMPInputEvent] {

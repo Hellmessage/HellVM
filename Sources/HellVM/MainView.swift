@@ -56,10 +56,7 @@ struct MainView: View {
                 ModalOverlay {
                     LogViewerModal(
                         title: "\(item.config.name) 日志",
-                        sources: [
-                            LogSource(label: "QEMU 运行", fileURL: item.bundle.qemuLogURL),
-                            LogSource(label: "调试日志", fileURL: URL(fileURLWithPath: "/tmp/hellvm.log")),
-                        ],
+                        fileURL: item.bundle.hellvmLogURL,
                         onClose: { logViewerItem = nil }
                     )
                     .frame(width: 760, height: 520)

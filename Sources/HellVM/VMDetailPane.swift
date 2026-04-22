@@ -17,6 +17,8 @@ struct VMDetailPane: View {
 
     @State private var lastError: String?
     @State private var selectedTab: DetailTab = .settings
+    @State private var showingLogSettings: Bool = false
+    @AppStorage("hellvm.detail.showInlineLog") private var showInlineLog: Bool = false
 
     var body: some View {
         ZStack {
@@ -81,20 +83,34 @@ struct VMDetailPane: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            Rectangle().fill(Theme.divider).frame(height: 1)
-            InlineLogPane(title: "INPUT DIAG", path: "/tmp/hellvm-input.log")
-                .frame(height: 180)
+            if showInlineLog {
+                Rectangle().fill(Theme.divider).frame(height: 1)
+                InlineLogPane(
+                    title: "VM LOG",
+                    fileURL: item.bundle.hellvmLogURL,
+                    onOpenSettings: { showingLogSettings = true },
+                    onClose: { showInlineLog = false }
+                )
+                .frame(height: 200)
+            }
         }
         .onChange(of: item.id) { _, _ in
-            // 切 VM 时按当前运行态选默认 tab
             selectedTab = item.isRunning ? .console : .settings
+            Logger.shared.setActiveVM(bundleURL: item.bundle.url)
         }
         .onChange(of: item.isRunning) { _, running in
-            // 同一个 VM 启动 → Console, 停止 → Settings
             selectedTab = running ? .console : .settings
         }
         .onAppear {
             selectedTab = item.isRunning ? .console : .settings
+            Logger.shared.setActiveVM(bundleURL: item.bundle.url)
+        }
+        .onDisappear {
+            // 详情页消失时脱离 VM sink(切换到空 VM 列表时也触发)
+            // 注: 跨 VM 切换时 onChange 先于 onDisappear, 不会把新 VM 解绑
+        }
+        .sheet(isPresented: $showingLogSettings) {
+            LogSettingsView(isPresented: $showingLogSettings)
         }
     }
 
@@ -247,7 +263,7 @@ struct VMDetailPane: View {
                 }
             } else {
                 PrimaryButton(title: "启动", systemImage: "play.fill") {
-                    dbg("UI: start button clicked for \(item.config.name)")
+                    log.info(.ui, "start button clicked for \(item.config.name)")
                     Task { await runAction { try await VMController.start(item, store: store) } }
                 }
             }

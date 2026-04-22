@@ -6,18 +6,7 @@
 
 import AppKit
 import MetalKit
-
-fileprivate func dbgHost(_ msg: @autoclosure () -> String) {
-    let line = "[\(Date())] HOST \(msg())\n"
-    guard let data = line.data(using: .utf8) else { return }
-    if let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/hellvm-input.log")) {
-        fh.seekToEndOfFile()
-        fh.write(data)
-        try? fh.close()
-    } else {
-        try? data.write(to: URL(fileURLWithPath: "/tmp/hellvm-input.log"))
-    }
-}
+import HVMCore
 
 final class FramebufferHostView: MTKView {
     weak var inputForwarder: InputForwarder?
@@ -39,7 +28,7 @@ final class FramebufferHostView: MTKView {
         super.viewDidMoveToWindow()
         // 获得焦点才能收键盘事件
         let ok = window?.makeFirstResponder(self) ?? false
-        dbgHost("viewDidMoveToWindow, makeFirstResponder=\(ok) window=\(window != nil)")
+        log.trace(.input,"viewDidMoveToWindow, makeFirstResponder=\(ok) window=\(window != nil)")
     }
 
     override func updateTrackingAreas() {
@@ -69,12 +58,12 @@ final class FramebufferHostView: MTKView {
     // MARK: - 键盘
 
     override func keyDown(with event: NSEvent) {
-        dbgHost("keyDown \(event.keyCode)")
+        log.trace(.input,"keyDown \(event.keyCode)")
         inputForwarder?.keyDown(nsKeyCode: event.keyCode)
     }
 
     override func keyUp(with event: NSEvent) {
-        dbgHost("keyUp \(event.keyCode)")
+        log.trace(.input,"keyUp \(event.keyCode)")
         inputForwarder?.keyUp(nsKeyCode: event.keyCode)
     }
 

@@ -20,6 +20,10 @@ public struct VMBundle: Sendable {
     public var configURL: URL { url.appendingPathComponent("config.json") }
     public var disksDirURL: URL { url.appendingPathComponent("disks") }
     public var efiDirURL: URL { url.appendingPathComponent("efi") }
+    public var logsDirURL: URL { url.appendingPathComponent("logs") }
+
+    /// Logger 统一写入的 per-VM 日志文件 (10MB 滚动)
+    public var hellvmLogURL: URL { logsDirURL.appendingPathComponent("hellvm.log") }
 
     /// 运行时 QEMU PID 文件
     public var pidFileURL: URL { url.appendingPathComponent("qemu.pid") }

@@ -47,7 +47,7 @@ let package = Package(
         //     输入通道复用 HVMBackendQEMU 的 QMPClient
         .target(
             name: "HVMDisplay",
-            dependencies: ["HVMBundle", "HVMDisplayC", "HVMBackendQEMU"]
+            dependencies: ["HVMCore", "HVMBundle", "HVMDisplayC", "HVMBackendQEMU"]
         ),
 
         // 主 App(SwiftUI)

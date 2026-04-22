@@ -8,6 +8,7 @@
 
 import SwiftUI
 import MetalKit
+import HVMCore
 
 public struct FramebufferView: NSViewRepresentable {
     public let displaySocketPath: String
@@ -50,7 +51,7 @@ public struct FramebufferView: NSViewRepresentable {
                                       inputPath: inputSocketPath,
                                       retryInterval: retryInterval)
         } catch {
-            NSLog("FramebufferView: renderer init failed: \(error)")
+            log.error(.display, "renderer init failed: \(error)")
         }
 
         return view

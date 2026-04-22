@@ -51,18 +51,50 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         proc.executableURL = qemuURL
         proc.arguments = args
 
-        // GUI 模式:stdin 丢 /dev/null,stdout+stderr 写到 bundle/qemu.log,方便排障
-        // (P4 会接入 IOSurface,不再依赖 stdio)
+        // GUI 模式: stdin 丢 /dev/null; stdout/stderr 走 Pipe, tee 到:
+        //   1) Logger(.qemu) —— 汇入统一的 per-VM 日志
+        //   2) qemu.log 原始文件 —— 给 LogViewerModal 和 shell tail 看
         proc.standardInput = FileHandle(forReadingAtPath: "/dev/null")
         let logURL = bundle.qemuLogURL
         try? "".write(to: logURL, atomically: true, encoding: .utf8)
-        if let logHandle = try? FileHandle(forWritingTo: logURL) {
-            logHandle.seekToEndOfFile()
-            proc.standardOutput = logHandle
-            proc.standardError = logHandle
+        let rawHandle = (try? FileHandle(forWritingTo: logURL))
+        rawHandle?.seekToEndOfFile()
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        proc.standardOutput = stdoutPipe
+        proc.standardError  = stderrPipe
+
+        var outBuffer = Data()
+        stdoutPipe.fileHandleForReading.readabilityHandler = { h in
+            let data = h.availableData
+            if data.isEmpty {
+                h.readabilityHandler = nil
+                return
+            }
+            try? rawHandle?.write(contentsOf: data)
+            Self.drainLines(buffer: &outBuffer, chunk: data) { line in
+                log.info(.qemu, line)
+            }
+        }
+        var errBuffer = Data()
+        stderrPipe.fileHandleForReading.readabilityHandler = { h in
+            let data = h.availableData
+            if data.isEmpty {
+                h.readabilityHandler = nil
+                return
+            }
+            try? rawHandle?.write(contentsOf: data)
+            Self.drainLines(buffer: &errBuffer, chunk: data) { line in
+                log.warn(.qemu, line)
+            }
         }
 
         proc.terminationHandler = { [weak self] p in
+            // 关闭 pipe handler, 避免僵尸 readability callback
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            try? rawHandle?.close()
             self?.setState(.stopped)
         }
 
@@ -137,6 +169,26 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return body()
+    }
+
+    /// 流式切行: 把新 chunk 追加到 buffer, 每凑出一行(不含 \n)就回调
+    private static func drainLines(buffer: inout Data,
+                                   chunk: Data,
+                                   emit: (String) -> Void) {
+        buffer.append(chunk)
+        while let nlIdx = buffer.firstIndex(of: 0x0a) {
+            let lineData = buffer[buffer.startIndex..<nlIdx]
+            buffer.removeSubrange(buffer.startIndex...nlIdx)
+            var line = String(data: Data(lineData), encoding: .utf8) ?? ""
+            if line.hasSuffix("\r") { line.removeLast() }
+            if !line.isEmpty { emit(line) }
+        }
+        // 超长单行保护(无 \n), 避免 buffer 无限增长
+        if buffer.count > 64 * 1024 {
+            let line = String(data: buffer, encoding: .utf8) ?? ""
+            buffer.removeAll(keepingCapacity: true)
+            if !line.isEmpty { emit(line) }
+        }
     }
 
     /// CLI 前台模式:用 execv 替换当前进程为 qemu。
