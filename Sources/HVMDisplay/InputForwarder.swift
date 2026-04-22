@@ -27,6 +27,20 @@ public final class InputForwarder: @unchecked Sendable {
     private var lastAbsX: Int32 = -1
     private var lastAbsY: Int32 = -1
 
+    /// Guest 键盘 LED 状态(由 DisplayChannel 的 LED_STATE 消息回传刷新).
+    /// FramebufferHostView 在 keyDown 前对比 host CapsLock 与此值,
+    /// 不一致时先补发 caps_lock toggle, 再 forward 按键。
+    private let ledLock = NSLock()
+    private var _guestLED: GuestLEDState = GuestLEDState(raw: 0)
+
+    public var guestLED: GuestLEDState {
+        ledLock.lock(); defer { ledLock.unlock() }
+        return _guestLED
+    }
+    public func setGuestLED(_ state: GuestLEDState) {
+        ledLock.lock(); _guestLED = state; ledLock.unlock()
+    }
+
     /// 事件队列
     private let queueLock = NSLock()
     private var pending: [QMPInputEvent] = []

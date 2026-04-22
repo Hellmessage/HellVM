@@ -142,6 +142,8 @@ public struct FramebufferView: NSViewRepresentable {
                     )
                 case .mouseSet(let x, let y, let visible):
                     renderer?.updateCursorPosition(x: x, y: y, visible: visible)
+                case .ledState(let led):
+                    forwarder?.setGuestLED(led)
                 case .updateHint:
                     break
                 case .disconnected:

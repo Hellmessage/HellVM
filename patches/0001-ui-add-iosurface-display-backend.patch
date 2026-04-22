@@ -1,4 +1,4 @@
-From 3f96addece2eef3b2d13d013273f1841b6f934aa Mon Sep 17 00:00:00 2001
+From 696f5670bdcc261259d46588358a200e7c3c84a9 Mon Sep 17 00:00:00 2001
 From: HellVM <hellvm@local>
 Date: Wed, 22 Apr 2026 16:42:56 +0800
 Subject: [PATCH] ui: add iosurface display backend (HellVM)
@@ -16,10 +16,10 @@ Content-Transfer-Encoding: 8bit
 Sprint 1 骨架, 真正的 DCL + socket 协议在 Sprint 2 填充。
 ---
  meson.build    |  10 +
- qapi/ui.json   |  23 ++-
- ui/iosurface.m | 525 +++++++++++++++++++++++++++++++++++++++++++++++++
+ qapi/ui.json   |  23 +-
+ ui/iosurface.m | 559 +++++++++++++++++++++++++++++++++++++++++++++++++
  ui/meson.build |   1 +
- 4 files changed, 557 insertions(+), 2 deletions(-)
+ 4 files changed, 591 insertions(+), 2 deletions(-)
  create mode 100644 ui/iosurface.m
 
 diff --git a/meson.build b/meson.build
@@ -114,10 +114,10 @@ index e3da776..a178517 100644
  
 diff --git a/ui/iosurface.m b/ui/iosurface.m
 new file mode 100644
-index 0000000..47c3d74
+index 0000000..75e94e9
 --- /dev/null
 +++ b/ui/iosurface.m
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,559 @@
 +/*
 + * QEMU "iosurface" display backend (HellVM project)
 + *
@@ -164,6 +164,7 @@ index 0000000..47c3d74
 +    MSG_UPDATE_HINT  = 0x03,
 +    MSG_CURSOR       = 0x04,
 +    MSG_MOUSE_SET    = 0x05,
++    MSG_LED_STATE    = 0x06,
 +};
 +
 +typedef struct __attribute__((packed)) {
@@ -194,6 +195,11 @@ index 0000000..47c3d74
 +    uint8_t  visible;
 +} MouseSetPayload;
 +
++typedef struct __attribute__((packed)) {
++    /* bit0=scroll lock, bit1=num lock, bit2=caps lock (QEMU_*_LED 宏) */
++    uint32_t ledstate;
++} LedStatePayload;
++
 +/* ---------- 全局状态 ---------- */
 +
 +static char *sock_path;
@@ -210,6 +216,10 @@ index 0000000..47c3d74
 +static uint32_t current_w, current_h, current_stride;
 +
 +static _Atomic uint64_t update_seq;
++
++/* guest HID 键盘 LED 状态(由 qemu_add_led_event_handler 回调更新)
++ * bit0=scroll, bit1=num, bit2=caps */
++static _Atomic uint32_t last_led_state;
 +
 +/* ---------- socket 工具 ---------- */
 +
@@ -330,6 +340,10 @@ index 0000000..47c3d74
 +        pthread_mutex_lock(&state_mtx);
 +        send_current_surface_to(new_fd);
 +        pthread_mutex_unlock(&state_mtx);
++
++        /* 同步初始 LED 状态, 新客户端不用等第一次 guest 操作 */
++        LedStatePayload led = { .ledstate = atomic_load(&last_led_state) };
++        send_msg(new_fd, MSG_LED_STATE, &led, sizeof(led));
 +
 +        atomic_store(&client_fd, new_fd);
 +    }
@@ -611,6 +625,23 @@ index 0000000..47c3d74
 +    .ops = &dcl_ops,
 +};
 +
++/* ---------- LED 回调 (guest HID output report 触发) ---------- */
++
++static void iosurface_leds_updated(void *opaque, int ledstate)
++{
++    uint32_t state = (uint32_t)ledstate;
++    uint32_t prev = atomic_exchange(&last_led_state, state);
++    if (prev == state) {
++        /* 同值重发时也通知, 让新客户端握手后能看到当前状态;
++         * 但为了减少 socket 流量, 仅在变化时转发。 */
++        return;
++    }
++    int fd = atomic_load(&client_fd);
++    if (fd < 0) return;
++    LedStatePayload p = { .ledstate = state };
++    send_msg(fd, MSG_LED_STATE, &p, sizeof(p));
++}
++
 +/* ---------- init ---------- */
 +
 +static void iosurface_display_init(DisplayState *ds, DisplayOptions *opts)
@@ -630,6 +661,9 @@ index 0000000..47c3d74
 +
 +    dcl.con = qemu_console_lookup_default();
 +    register_displaychangelistener(&dcl);
++
++    /* 订阅键盘 LED 变化: guest HID output report 会走 kbd_put_ledstate */
++    qemu_add_led_event_handler(iosurface_leds_updated, NULL);
 +}
 +
 +static QemuDisplay qemu_display_iosurface = {

@@ -231,6 +231,13 @@ public final class DisplayChannel: @unchecked Sendable {
             }
             continuation.yield(.mouseSet(x: p.x, y: p.y, visible: p.visible != 0))
 
+        case .ledState where payload.count == MemoryLayout<LedStatePayload>.size:
+            var p = LedStatePayload(ledstate: 0)
+            _ = payload.withUnsafeBufferPointer { src in
+                memcpy(&p, src.baseAddress!, MemoryLayout<LedStatePayload>.size)
+            }
+            continuation.yield(.ledState(GuestLEDState(raw: p.ledstate)))
+
         default:
             // 未知消息 / size 不匹配, 丢弃(若附带 fd 记得关)
             if fd >= 0 { Darwin.close(fd) }

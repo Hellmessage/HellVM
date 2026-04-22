@@ -8,6 +8,21 @@ enum MessageType: UInt32 {
     case updateHint = 0x03
     case cursor     = 0x04
     case mouseSet   = 0x05
+    case ledState   = 0x06
+}
+
+/// QEMU 键盘 LED 位 (QEMU_*_LED 宏)
+public struct GuestLEDState: Sendable, Equatable {
+    public static let scrollLockBit: UInt32 = 1 << 0
+    public static let numLockBit:    UInt32 = 1 << 1
+    public static let capsLockBit:   UInt32 = 1 << 2
+
+    public let raw: UInt32
+    public var scrollLock: Bool { raw & Self.scrollLockBit != 0 }
+    public var numLock:    Bool { raw & Self.numLockBit    != 0 }
+    public var capsLock:   Bool { raw & Self.capsLockBit   != 0 }
+
+    public init(raw: UInt32) { self.raw = raw }
 }
 
 let protocolVersion: UInt32 = 1
@@ -42,6 +57,10 @@ struct MouseSetPayload {
     var x: Int32
     var y: Int32
     var visible: UInt8
+}
+
+struct LedStatePayload {
+    var ledstate: UInt32
 }
 
 // ---------- Swift 侧事件 ----------
@@ -90,5 +109,6 @@ public enum DisplayEvent: Sendable {
     case updateHint(x: Int, y: Int, w: Int, h: Int, seq: UInt64)
     case cursor(CursorFrame)
     case mouseSet(x: Int32, y: Int32, visible: Bool)
+    case ledState(GuestLEDState)
     case disconnected(String?)
 }
