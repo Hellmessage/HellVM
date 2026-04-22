@@ -122,12 +122,13 @@ struct VMDetailPane: View {
                         .font(.system(size: 11, weight: .semibold))
                         .tracking(0.4)
                         .foregroundStyle(selectedTab == t ? Theme.textPrimary : Theme.textTertiary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
                         .background(
                             RoundedRectangle(cornerRadius: 6)
                                 .fill(selectedTab == t ? Theme.surface : Color.clear)
                         )
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -321,8 +322,10 @@ struct VMDetailPane: View {
             Spacer()
             Button(action: { lastError = nil }) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(Theme.textTertiary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
         }

@@ -66,41 +66,31 @@ struct InlineLogPane: View {
             }
             Spacer()
             if let onOpenSettings {
-                Button(action: onOpenSettings) {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.textTertiary)
-                }
-                .buttonStyle(.plain)
-                .help("日志设置")
+                miniIconButton(system: "gearshape", help: "日志设置", action: onOpenSettings)
             }
-            Button(action: reveal) {
-                Image(systemName: "folder")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.textTertiary)
-            }
-            .buttonStyle(.plain)
-            .help("在 Finder 中显示")
-            Button(action: clear) {
-                Image(systemName: "trash")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.textTertiary)
-            }
-            .buttonStyle(.plain)
-            .help("清空日志")
+            miniIconButton(system: "folder", help: "在 Finder 中显示", action: reveal)
+            miniIconButton(system: "trash", help: "清空日志", action: clear)
             if let onClose {
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(Theme.textTertiary)
-                }
-                .buttonStyle(.plain)
-                .help("隐藏日志面板")
+                miniIconButton(system: "xmark", help: "隐藏日志面板", action: onClose)
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
         .background(Theme.surface)
+    }
+
+    private func miniIconButton(system: String,
+                                help: String,
+                                action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: system)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.textTertiary)
+                .frame(width: 26, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     private func startTimer() {

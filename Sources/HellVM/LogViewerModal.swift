@@ -109,12 +109,13 @@ struct LogViewerModal: View {
                     Text(src.label)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(idx == selectedIndex ? Theme.textPrimary : Theme.textSecondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
                         .background(
                             RoundedRectangle(cornerRadius: 6)
                                 .fill(idx == selectedIndex ? Theme.surfaceElevated : Color.clear)
                         )
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }

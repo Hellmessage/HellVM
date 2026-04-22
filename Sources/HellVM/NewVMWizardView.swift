@@ -237,9 +237,10 @@ private struct StepperCard: View {
         HStack(spacing: 0) {
             Button(action: decrement) {
                 Image(systemName: "minus")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(Theme.textSecondary)
-                    .frame(width: 32, height: 32)
+                    .frame(width: 44, height: 36)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(value <= range.lowerBound)
@@ -255,9 +256,10 @@ private struct StepperCard: View {
 
             Button(action: increment) {
                 Image(systemName: "plus")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(Theme.textSecondary)
-                    .frame(width: 32, height: 32)
+                    .frame(width: 44, height: 36)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(value >= range.upperBound)

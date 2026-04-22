@@ -187,8 +187,9 @@ struct IconButton: View {
             Image(systemName: systemImage)
                 .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(hovering ? Theme.textPrimary : tint)
-                .frame(width: 22, height: 22)
+                .frame(width: 28, height: 28)
                 .background(Circle().fill(hovering ? Theme.surfaceHover : Theme.surfaceElevated))
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
