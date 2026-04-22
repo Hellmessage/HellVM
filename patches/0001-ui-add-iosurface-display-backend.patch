@@ -1,4 +1,4 @@
-From 42daebf67937bc61eef7908d68c2326a22e68f9a Mon Sep 17 00:00:00 2001
+From d9189f9006587053ce9a8fc07f61ddd13081c99c Mon Sep 17 00:00:00 2001
 From: HellVM <hellvm@local>
 Date: Wed, 22 Apr 2026 16:42:56 +0800
 Subject: [PATCH] ui: add iosurface display backend (HellVM)
@@ -17,9 +17,9 @@ Sprint 1 骨架, 真正的 DCL + socket 协议在 Sprint 2 填充。
 ---
  meson.build    |  10 +
  qapi/ui.json   |  23 +-
- ui/iosurface.m | 644 +++++++++++++++++++++++++++++++++++++++++++++++++
+ ui/iosurface.m | 655 +++++++++++++++++++++++++++++++++++++++++++++++++
  ui/meson.build |   1 +
- 4 files changed, 676 insertions(+), 2 deletions(-)
+ 4 files changed, 687 insertions(+), 2 deletions(-)
  create mode 100644 ui/iosurface.m
 
 diff --git a/meson.build b/meson.build
@@ -114,10 +114,10 @@ index e3da776..a178517 100644
  
 diff --git a/ui/iosurface.m b/ui/iosurface.m
 new file mode 100644
-index 0000000..b55cef3
+index 0000000..c25284a
 --- /dev/null
 +++ b/ui/iosurface.m
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,655 @@
 +/*
 + * QEMU "iosurface" display backend (HellVM project)
 + *
@@ -494,13 +494,23 @@ index 0000000..b55cef3
 +    }
 +}
 +
-+/* 分配 w*h*4 大小的匿名共享内存(MAP_SHARED), 返回 fd + mmap 地址。
++/* 把 stride 对齐到 256 字节: Apple Silicon 的 MTLBuffer.makeTexture 要求
++ * bytesPerRow >= 16 字节对齐, 任意 width 的 2326x1932 这类会触发 Metal
++ * 校验失败直接 abort。对齐到 256 给驱动 / SIMD 充裕余量。 */
++#define IOSURFACE_STRIDE_ALIGN 256
++static inline uint32_t align_up_u32(uint32_t x, uint32_t a) {
++    return (x + a - 1u) & ~(a - 1u);
++}
++
++/* 分配 stride*h 大小的匿名共享内存(MAP_SHARED), 返回 fd + mmap 地址 + 真实 stride。
 + * macOS 下 shm_open 的 name 会占用全局 namespace 并留下残留, 用
 + * "memfd 风格": O_CREAT|O_EXCL 后立即 shm_unlink, fd 保留有效。 */
 +static int alloc_shm_framebuffer(uint32_t w, uint32_t h,
-+                                 int *out_fd, uint8_t **out_ptr, size_t *out_size)
++                                 int *out_fd, uint8_t **out_ptr,
++                                 size_t *out_size, uint32_t *out_stride)
 +{
-+    size_t size = (size_t)w * h * 4;
++    uint32_t stride = align_up_u32(w * 4u, IOSURFACE_STRIDE_ALIGN);
++    size_t size = (size_t)stride * h;
 +    char name[64];
 +    /* 加入 pid/时间保证 unique; 立即 unlink 掉 name */
 +    snprintf(name, sizeof(name), "/hellvm.%d.%llu", getpid(),
@@ -528,6 +538,7 @@ index 0000000..b55cef3
 +    *out_fd = fd;
 +    *out_ptr = (uint8_t *)ptr;
 +    *out_size = size;
++    *out_stride = stride;
 +    return 0;
 +}
 +
@@ -576,17 +587,17 @@ index 0000000..b55cef3
 +    int new_fd = -1;
 +    uint8_t *new_pixels = NULL;
 +    size_t new_size = 0;
-+    if (alloc_shm_framebuffer(w, h, &new_fd, &new_pixels, &new_size) < 0) {
++    uint32_t new_stride = 0;
++    if (alloc_shm_framebuffer(w, h, &new_fd, &new_pixels, &new_size, &new_stride) < 0) {
 +        return;
 +    }
 +
-+    /* 首帧整拷 */
++    /* 首帧整拷; dst stride 可能 > w*4 (对齐 padding), 每行拷 w*4 有效数据 */
 +    uint8_t *src_base   = (uint8_t *)surface_data(surface);
 +    int      src_stride = surface_stride(surface);
-+    size_t   dst_stride = (size_t)w * 4;
 +    size_t   row_bytes  = (size_t)w * 4;
 +    for (uint32_t row = 0; row < h; row++) {
-+        memcpy(new_pixels + row * dst_stride,
++        memcpy(new_pixels + (size_t)row * new_stride,
 +               src_base + row * (size_t)src_stride,
 +               row_bytes);
 +    }
@@ -598,7 +609,7 @@ index 0000000..b55cef3
 +    current_shm_size = new_size;
 +    current_w      = w;
 +    current_h      = h;
-+    current_stride = (uint32_t)dst_stride;
++    current_stride = new_stride;
 +
 +    int fd = atomic_load(&client_fd);
 +    if (fd >= 0) {
