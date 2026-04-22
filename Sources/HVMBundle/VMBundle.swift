@@ -40,9 +40,6 @@ public struct VMBundle: Sendable {
     /// 运行时 iosurface display backend 的 unix socket(Swift 侧作为客户端连入)
     public var iosurfaceSocketURL: URL { url.appendingPathComponent("iosurface.sock") }
 
-    /// QEMU 子进程的 stdout/stderr 日志(GUI 模式下捕获崩溃信息)
-    public var qemuLogURL: URL { url.appendingPathComponent("qemu.log") }
-
     /// 读取 PID 文件,返回 qemu 进程 PID(若存在且能解析)
     public func readPID() -> Int32? {
         guard let data = try? Data(contentsOf: pidFileURL),

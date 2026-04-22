@@ -137,9 +137,14 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
         super.init()
     }
 
+    deinit {
+        log.info(.display, "FramebufferRenderer deinit")
+    }
+
     // MARK: - framebuffer 绑定
 
     public func bind(framebuffer: SharedFramebuffer) {
+        log.info(.display, "bind fb \(framebuffer.width)x\(framebuffer.height) size=\(framebuffer.byteCount)")
         // 把 SharedFramebuffer 强引用捕获到 MTLBuffer.deallocator: Metal 保证
         // GPU 处理完所有 in-flight command buffer 后才调用 deallocator, 那时释放
         // SharedFramebuffer(munmap) 才安全。否则 VM 关机 → unbind() 立即释放会
@@ -176,6 +181,7 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
     }
 
     public func unbind() {
+        log.info(.display, "unbind")
         // 此处只断 renderer 的引用, SharedFramebuffer 实际 munmap 由 MTLBuffer
         // deallocator 在 GPU 完成后触发。
         currentFB = nil

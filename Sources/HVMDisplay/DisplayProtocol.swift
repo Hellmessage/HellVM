@@ -1,6 +1,7 @@
 // DisplayProtocol —— iosurface display backend 线协议常量/结构体
 // 必须与 Vendor/qemu-src/ui/iosurface.m 保持一致, 见 docs/p4-design.md §2.5
 import Foundation
+import HVMCore
 
 enum MessageType: UInt32 {
     case hello      = 0x01
@@ -89,6 +90,7 @@ public final class SharedFramebuffer: @unchecked Sendable {
     public var byteCount: Int { size }
 
     public func dispose() {
+        log.info(.display, "SharedFramebuffer dispose fd=\(shmFD) size=\(size)")
         munmap(pointer, size)
         close(shmFD)
     }

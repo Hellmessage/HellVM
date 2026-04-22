@@ -51,14 +51,10 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         proc.executableURL = qemuURL
         proc.arguments = args
 
-        // GUI 模式: stdin 丢 /dev/null; stdout/stderr 走 Pipe, tee 到:
-        //   1) Logger(.qemu) —— 汇入统一的 per-VM 日志
-        //   2) qemu.log 原始文件 —— 给 LogViewerModal 和 shell tail 看
+        // GUI 模式: stdin 丢 /dev/null; stdout/stderr 走 Pipe, 逐行送 Logger(.qemu)
+        // 日志统一落到 <bundle>/logs/hellvm.log(Logger 管理 + 10MB 滚动), 不再
+        // 单独维护 qemu.log。
         proc.standardInput = FileHandle(forReadingAtPath: "/dev/null")
-        let logURL = bundle.qemuLogURL
-        try? "".write(to: logURL, atomically: true, encoding: .utf8)
-        let rawHandle = (try? FileHandle(forWritingTo: logURL))
-        rawHandle?.seekToEndOfFile()
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -72,7 +68,6 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
                 h.readabilityHandler = nil
                 return
             }
-            try? rawHandle?.write(contentsOf: data)
             outBuffer.append(data)
             outBuffer.drainLines { line in log.info(.qemu, line) }
         }
@@ -83,7 +78,6 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
                 h.readabilityHandler = nil
                 return
             }
-            try? rawHandle?.write(contentsOf: data)
             errBuffer.append(data)
             errBuffer.drainLines { line in log.warn(.qemu, line) }
         }
@@ -92,7 +86,6 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             // 关闭 pipe handler, 避免僵尸 readability callback
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
-            try? rawHandle?.close()
             self?.setState(.stopped)
         }
 

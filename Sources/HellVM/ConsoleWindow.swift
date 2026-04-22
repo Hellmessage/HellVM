@@ -29,6 +29,25 @@ final class ConsoleWindowManager: NSObject, NSWindowDelegate, ObservableObject {
             return
         }
 
+        // 关键时序: 先标记 detached → 本轮 runloop 结束时 SwiftUI 重求
+        // VMDetailPane.consoleTab → 内嵌 FramebufferView 被 dismantle →
+        // 其 Coordinator.stop() 关掉 socket / Metal 资源。
+        // 延迟到下一个 main runloop tick 再建独立窗口, 避免两个 FramebufferView
+        // 同时连 QEMU 单客户端 socket 互相踢, 以及并发 Metal cleanup race。
+        detachedIDs.insert(item.id)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.buildWindow(for: item)
+        }
+    }
+
+    private func buildWindow(for item: VMListItem) {
+        // 用户可能快速多点; 避免重复建窗口
+        if windowsByVM[item.id] != nil {
+            windowsByVM[item.id]?.makeKeyAndOrderFront(nil)
+            return
+        }
+
         let content = FramebufferView(
             displaySocketPath: item.bundle.iosurfaceSocketURL.path,
             inputSocketPath: item.bundle.qmpInputSocketURL.path
@@ -53,7 +72,6 @@ final class ConsoleWindowManager: NSObject, NSWindowDelegate, ObservableObject {
         window.collectionBehavior.insert(.fullScreenPrimary)
         windowsByVM[item.id] = window
         vmByWindow[ObjectIdentifier(window)] = item.id
-        detachedIDs.insert(item.id)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 

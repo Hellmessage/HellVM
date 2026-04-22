@@ -9,6 +9,7 @@
 import SwiftUI
 import MetalKit
 import HVMCore
+import ObjectiveC
 
 public struct FramebufferView: NSViewRepresentable {
     public let displaySocketPath: String
@@ -84,6 +85,7 @@ public struct FramebufferView: NSViewRepresentable {
         var currentInputPath: String?
 
         func start(displayPath: String, inputPath: String, retryInterval: TimeInterval) {
+            log.info(.display, "Coordinator start \(ObjectIdentifier(self).hashValue)")
             currentDisplayPath = displayPath
             currentInputPath   = inputPath
 
@@ -96,6 +98,7 @@ public struct FramebufferView: NSViewRepresentable {
         }
 
         func stop() {
+            log.info(.display, "Coordinator stop \(ObjectIdentifier(self).hashValue)")
             displayTask?.cancel()
             inputTask?.cancel()
             displayChannel?.close()
@@ -107,6 +110,10 @@ public struct FramebufferView: NSViewRepresentable {
             Task { @MainActor [weak self] in
                 self?.renderer?.unbind()
             }
+        }
+
+        deinit {
+            log.info(.display, "Coordinator deinit")
         }
 
         // MARK: - display 循环(连 iosurface socket)
