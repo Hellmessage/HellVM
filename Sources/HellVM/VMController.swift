@@ -81,7 +81,8 @@ struct VMController {
         cpu: Int,
         memoryMB: UInt64,
         diskSizeGB: UInt64,
-        isoPath: String?
+        isoPath: String?,
+        graphical: Bool = true
     ) async throws -> VMBundle {
         // 名称校验
         guard !name.isEmpty, !name.contains("/"), !name.contains("\0") else {
@@ -115,7 +116,7 @@ struct VMController {
             cpuCount: cpu,
             memoryMB: memoryMB,
             disks: [disk],
-            boot: BootConfig(isoPath: isoAbs, efi: true)
+            boot: BootConfig(isoPath: isoAbs, efi: true, graphical: graphical)
         )
         let bundle = try VMBundle.create(at: bundleURL, config: config)
 

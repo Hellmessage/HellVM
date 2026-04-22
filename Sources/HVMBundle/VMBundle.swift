@@ -25,6 +25,9 @@ public struct VMBundle: Sendable {
     /// Logger 统一写入的 per-VM 日志文件 (10MB 滚动)
     public var hellvmLogURL: URL { logsDirURL.appendingPathComponent("hellvm.log") }
 
+    /// 非图形模式(-nographic)的 guest 串口输出文件
+    public var serialLogURL: URL { logsDirURL.appendingPathComponent("serial.log") }
+
     /// 运行时 QEMU PID 文件
     public var pidFileURL: URL { url.appendingPathComponent("qemu.pid") }
 

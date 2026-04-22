@@ -134,7 +134,15 @@ public struct FramebufferView: NSViewRepresentable {
                 switch event {
                 case .surface(let fb):
                     renderer?.bind(framebuffer: fb)
-                case .updateHint, .cursor, .mouseSet:
+                case .cursor(let c):
+                    renderer?.updateCursor(
+                        bgra: c.bgra,
+                        width: c.width, height: c.height,
+                        hotX: c.hotX, hotY: c.hotY
+                    )
+                case .mouseSet(let x, let y, let visible):
+                    renderer?.updateCursorPosition(x: x, y: y, visible: visible)
+                case .updateHint:
                     break
                 case .disconnected:
                     renderer?.unbind()

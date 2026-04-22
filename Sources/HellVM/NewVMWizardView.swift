@@ -13,6 +13,7 @@ struct NewVMWizardView: View {
     @State private var memoryMB: Int = 2048
     @State private var diskSizeGB: Int = 20
     @State private var isoPath: String = ""
+    @State private var graphical: Bool = true
 
     @State private var submitting: Bool = false
     @State private var errorText: String?
@@ -52,6 +53,9 @@ struct NewVMWizardView: View {
                         StyledTextField(placeholder: "启动光盘路径", text: $isoPath, monospaced: true)
                         SecondaryButton(title: "选择…", systemImage: "folder") { pickISO() }
                     }
+
+                    FieldLabel("显示模式")
+                    graphicalToggle
 
                     if let errorText {
                         HStack(alignment: .top, spacing: 8) {
@@ -154,6 +158,42 @@ struct NewVMWizardView: View {
         .buttonStyle(.plain)
     }
 
+    private var graphicalToggle: some View {
+        HStack(spacing: 10) {
+            ForEach([true, false], id: \.self) { g in
+                let selected = graphical == g
+                Button(action: { graphical = g }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: g ? "display" : "terminal")
+                            .font(.system(size: 14))
+                            .foregroundStyle(selected ? Theme.textPrimary : Theme.textTertiary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(g ? "图形" : "串口")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(selected ? Theme.textPrimary : Theme.textSecondary)
+                            Text(g ? "virtio-gpu + 键鼠" : "-nographic 无图形, 适合服务器镜像")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.textTertiary)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(selected ? Theme.surfaceElevated : Theme.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1)
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
     // MARK: - 提交
 
     private func submit() async {
@@ -167,7 +207,8 @@ struct NewVMWizardView: View {
                 cpu: cpuCount,
                 memoryMB: UInt64(memoryMB),
                 diskSizeGB: UInt64(diskSizeGB),
-                isoPath: isoPath.isEmpty ? nil : isoPath
+                isoPath: isoPath.isEmpty ? nil : isoPath,
+                graphical: graphical
             )
             onCreated(name)
         } catch {

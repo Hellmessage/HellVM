@@ -294,23 +294,25 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         args += ["-netdev", "user,id=net0"]
         args += ["-device", "virtio-net-pci,netdev=net0"]
 
-        // virtio-gpu 作为主显卡(P4)
-        args += ["-device", "virtio-gpu-pci"]
-
-        // USB HID 键鼠: UEFI 固件(EDK2) 只内置 USB 驱动, 不识别 virtio-kbd/tablet,
-        // 用 USB HID 才能在启动早期就可输入; Linux 也能正常用。
-        args += ["-device", "qemu-xhci,id=usbbus"]
-        args += ["-device", "usb-kbd,bus=usbbus.0"]
-        args += ["-device", "usb-tablet,bus=usbbus.0"]
-
-        // guest 串口先丢弃(QEMU 自身日志走 Process stdout/stderr -> qemu.log)
-        args += ["-serial", "null"]
-
-        // 禁用默认 PCI VGA, 避免和 virtio-gpu 冲突
-        args += ["-vga", "none"]
-
-        // IOSurface 显示后端(P4): 每 VM 独占一个 unix socket
-        args += ["-display", "iosurface,socket=\(bundle.iosurfaceSocketURL.path)"]
+        if config.boot.graphical {
+            // 图形模式: virtio-gpu + USB HID + iosurface backend
+            args += ["-device", "virtio-gpu-pci"]
+            // USB HID 键鼠: UEFI 只内置 USB 驱动, 不识别 virtio-kbd/tablet
+            args += ["-device", "qemu-xhci,id=usbbus"]
+            args += ["-device", "usb-kbd,bus=usbbus.0"]
+            args += ["-device", "usb-tablet,bus=usbbus.0"]
+            // guest 串口丢弃(QEMU 自身日志走 Process stdout/stderr -> Logger)
+            args += ["-serial", "null"]
+            args += ["-vga", "none"]
+            // IOSurface 后端: 每 VM 独占一个 unix socket
+            args += ["-display", "iosurface,socket=\(bundle.iosurfaceSocketURL.path)"]
+        } else {
+            // 非图形模式(-nographic): 适合无桌面服务器镜像/云 init
+            // guest 串口直接写入 serial.log, 详情页 Console tab tail 显示
+            args += ["-serial", "file:\(bundle.serialLogURL.path)"]
+            args += ["-nographic"]
+            // 不加 iosurface / virtio-gpu / USB HID
+        }
 
         return args
     }

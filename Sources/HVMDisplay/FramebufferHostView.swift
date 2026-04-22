@@ -39,12 +39,54 @@ final class FramebufferHostView: MTKView {
         let area = NSTrackingArea(
             rect: bounds,
             options: [.activeInKeyWindow, .mouseMoved,
-                      .mouseEnteredAndExited, .inVisibleRect],
+                      .mouseEnteredAndExited, .inVisibleRect,
+                      .cursorUpdate],
             owner: self,
             userInfo: nil
         )
         addTrackingArea(area)
         trackingArea = area
+    }
+
+    // MARK: - host 光标隐藏
+    //
+    // 鼠标 hover 在画面内时隐藏 macOS 光标, 让位给 guest 画的光标(软光标
+    // 直接写 framebuffer; 硬件光标通过 MSG_CURSOR 合成到 Metal overlay)。
+    // 离开视图或 window 失活时恢复。
+
+    private var cursorHidden = false
+
+    private func hideHostCursor() {
+        if !cursorHidden {
+            NSCursor.hide()
+            cursorHidden = true
+        }
+    }
+
+    private func showHostCursor() {
+        if cursorHidden {
+            NSCursor.unhide()
+            cursorHidden = false
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hideHostCursor()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        showHostCursor()
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        // AppKit 在 hover 区域会重设为标准 arrow; 我们再隐
+        hideHostCursor()
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        // 切离窗口时必须恢复, 否则全局光标都消失(NSCursor 计数平衡)
+        if newWindow == nil { showHostCursor() }
     }
 
     override func layout() {
@@ -58,23 +100,65 @@ final class FramebufferHostView: MTKView {
     // MARK: - 键盘
 
     override func keyDown(with event: NSEvent) {
-        log.trace(.input,"keyDown \(event.keyCode)")
+        // 本地快捷键: cmd+opt+Esc 释放键盘焦点 + 恢复 host 光标
+        if event.modifierFlags.contains([.command, .option]) && event.keyCode == 0x35 {
+            releaseKeyboard()
+            return
+        }
+        log.trace(.input, "keyDown \(event.keyCode)")
+        if shouldApplyVirtualShift(event) {
+            inputForwarder?.keyDown(nsKeyCode: 0x38)  // virtual shift ↓
+            inputForwarder?.keyDown(nsKeyCode: event.keyCode)
+            return
+        }
         inputForwarder?.keyDown(nsKeyCode: event.keyCode)
     }
 
     override func keyUp(with event: NSEvent) {
-        log.trace(.input,"keyUp \(event.keyCode)")
+        log.trace(.input, "keyUp \(event.keyCode)")
+        if shouldApplyVirtualShift(event) {
+            inputForwarder?.keyUp(nsKeyCode: event.keyCode)
+            inputForwarder?.keyUp(nsKeyCode: 0x38)    // virtual shift ↑
+            return
+        }
         inputForwarder?.keyUp(nsKeyCode: event.keyCode)
     }
 
+    /// host Caps Lock 开启 + 字母键 + 未同时按 shift → 需要给 guest 模拟 shift
+    /// 这样 host LED 亮即 guest 大写, 两边状态永远同步, 不再依赖 guest toggle。
+    private func shouldApplyVirtualShift(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.capsLock) else { return false }
+        if event.modifierFlags.contains(.shift) { return false }
+        return Self.letterKeyCodes.contains(event.keyCode)
+    }
+
+    /// kVK_ANSI_A..Z 的 NSEvent.keyCode 集合
+    private static let letterKeyCodes: Set<UInt16> = [
+        0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26,
+        0x28, 0x25, 0x2E, 0x2D, 0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11,
+        0x20, 0x09, 0x0D, 0x07, 0x10, 0x06,
+    ]
+
+    /// 让 framebuffer 脱离 firstResponder, 恢复 host 光标。
+    /// 用户再次点击画面即可重新捕获。
+    private func releaseKeyboard() {
+        window?.makeFirstResponder(nil)
+        showHostCursor()
+        log.info(.input, "keyboard released (cmd+opt+esc)")
+    }
+
     override func flagsChanged(with event: NSEvent) {
+        // Caps Lock 不再作为独立 modifier 转发 — host CapsLock 状态会在 keyDown/
+        // keyUp 里通过 "virtual shift" 映射成 shift+字母, 避免 host 与 guest 的
+        // CapsLock LED/状态双轨不同步。
+        if event.keyCode == 0x39 { return }
+
         let bit: NSEvent.ModifierFlags
         switch event.keyCode {
         case 0x37, 0x36: bit = .command
         case 0x38, 0x3C: bit = .shift
         case 0x3A, 0x3D: bit = .option
         case 0x3B, 0x3E: bit = .control
-        case 0x39:       bit = .capsLock
         default:
             return
         }

@@ -1,26 +1,39 @@
 // FramebufferRenderer —— 把跨进程 shm framebuffer 渲染到 MTKView
 //
+// 两个 pipeline:
+// - fullscreen: 覆盖整张 drawable, 采样 framebuffer texture
+// - cursor:     alpha-blend 的 quad, 覆盖在 framebuffer 上画硬件光标
+//
 // 零拷贝链路(Apple Silicon unified memory):
-//   shm_open(QEMU)
-//     → mmap(Swift)
-//     → device.makeBuffer(bytesNoCopy:)      (storageModeShared)
-//     → MTLBuffer.makeTexture(bytesPerRow:)  (BGRA texture 直接读 mmap)
-//     → 全屏 triangle strip + fragment sampler → drawable
+//   shm_open(QEMU) → mmap(Swift) → MTLBuffer(bytesNoCopy:) →
+//   MTLBuffer.makeTexture(bytesPerRow:) → fullscreen pipeline → drawable
 
 import Foundation
 import Metal
 import MetalKit
 import QuartzCore
+import HVMCore
 
 public final class FramebufferRenderer: NSObject, MTKViewDelegate {
     public let device: MTLDevice
     private let queue: MTLCommandQueue
-    private let pipeline: MTLRenderPipelineState
+    private let fullscreenPipeline: MTLRenderPipelineState
+    private let cursorPipeline: MTLRenderPipelineState
 
-    // 当前绑定的 framebuffer (主线程读写)
+    // 当前绑定的 framebuffer
     private var currentFB: SharedFramebuffer?
     private var currentBuffer: MTLBuffer?
     private var currentTexture: MTLTexture?
+
+    // 当前光标 state(主线程读写)
+    private var cursorTexture: MTLTexture?
+    private var cursorHotX: Int32 = 0
+    private var cursorHotY: Int32 = 0
+    private var cursorWidth: Int = 0
+    private var cursorHeight: Int = 0
+    private var cursorPosX: Int32 = 0
+    private var cursorPosY: Int32 = 0
+    private var cursorVisible: Bool = false
 
     public init(device: MTLDevice) throws {
         self.device = device
@@ -40,13 +53,12 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
             float2 uv;
         };
 
+        // ---- fullscreen: 4 顶点 triangle strip ----
         vertex VertexOut fullscreen_vs(uint vid [[vertex_id]]) {
-            // triangle strip: 4 顶点覆盖整个 clip space
             float2 positions[4] = {
                 float2(-1, -1), float2( 1, -1),
                 float2(-1,  1), float2( 1,  1)
             };
-            // UV 轴与 Metal NDC Y 相反, 翻 Y
             float2 uvs[4] = {
                 float2(0, 1), float2(1, 1),
                 float2(0, 0), float2(1, 0)
@@ -62,26 +74,71 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
             constexpr sampler s(mag_filter::linear, min_filter::linear);
             return tex.sample(s, in.uv);
         }
+
+        // ---- cursor: NDC 矩形, 使用 uniform 传递 ----
+        struct CursorUniforms {
+            float4 rectNDC;   // (x_left, y_top, x_right, y_bottom) in NDC
+        };
+
+        vertex VertexOut cursor_vs(uint vid [[vertex_id]],
+                                   constant CursorUniforms &u [[buffer(0)]]) {
+            float2 corners[4] = {
+                float2(0, 1), float2(1, 1),
+                float2(0, 0), float2(1, 0)
+            };
+            float2 c = corners[vid];
+            float x = mix(u.rectNDC.x, u.rectNDC.z, c.x);
+            float y = mix(u.rectNDC.y, u.rectNDC.w, c.y);
+            VertexOut out;
+            out.position = float4(x, y, 0.0, 1.0);
+            // cursor 的 BGRA 数据 Y 方向与 Metal NDC 反, uv.y 翻转
+            out.uv = float2(c.x, 1.0 - c.y);
+            return out;
+        }
+
+        fragment float4 cursor_fs(VertexOut in [[stage_in]],
+                                  texture2d<float> tex [[texture(0)]]) {
+            constexpr sampler s(mag_filter::nearest, min_filter::nearest);
+            float4 c = tex.sample(s, in.uv);
+            return c;
+        }
         """
         let library = try device.makeLibrary(source: source, options: nil)
-        guard let vs = library.makeFunction(name: "fullscreen_vs"),
-              let fs = library.makeFunction(name: "fullscreen_fs") else {
+        guard let fsVS = library.makeFunction(name: "fullscreen_vs"),
+              let fsFS = library.makeFunction(name: "fullscreen_fs"),
+              let curVS = library.makeFunction(name: "cursor_vs"),
+              let curFS = library.makeFunction(name: "cursor_fs") else {
             throw NSError(domain: "HVMDisplay", code: -2, userInfo: [
                 NSLocalizedDescriptionKey: "makeFunction 失败"
             ])
         }
 
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = vs
-        desc.fragmentFunction = fs
-        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        let fsDesc = MTLRenderPipelineDescriptor()
+        fsDesc.vertexFunction = fsVS
+        fsDesc.fragmentFunction = fsFS
+        fsDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        self.fullscreenPipeline = try device.makeRenderPipelineState(descriptor: fsDesc)
 
-        self.pipeline = try device.makeRenderPipelineState(descriptor: desc)
+        // cursor: alpha blending
+        let curDesc = MTLRenderPipelineDescriptor()
+        curDesc.vertexFunction = curVS
+        curDesc.fragmentFunction = curFS
+        let att = curDesc.colorAttachments[0]!
+        att.pixelFormat = .bgra8Unorm
+        att.isBlendingEnabled = true
+        att.rgbBlendOperation = .add
+        att.alphaBlendOperation = .add
+        att.sourceRGBBlendFactor = .sourceAlpha
+        att.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        att.sourceAlphaBlendFactor = .one
+        att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        self.cursorPipeline = try device.makeRenderPipelineState(descriptor: curDesc)
 
         super.init()
     }
 
-    /// 绑定新的 framebuffer (分辨率变化时调用)
+    // MARK: - framebuffer 绑定
+
     public func bind(framebuffer: SharedFramebuffer) {
         let buf = device.makeBuffer(
             bytesNoCopy: framebuffer.pointer,
@@ -90,12 +147,9 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
             deallocator: nil
         )
         guard let buf else {
-            currentFB = nil
-            currentBuffer = nil
-            currentTexture = nil
+            currentFB = nil; currentBuffer = nil; currentTexture = nil
             return
         }
-
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
             width: framebuffer.width,
@@ -105,21 +159,59 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
         texDesc.storageMode = .shared
         texDesc.usage = .shaderRead
 
-        let tex = buf.makeTexture(
-            descriptor: texDesc,
-            offset: 0,
+        currentTexture = buf.makeTexture(
+            descriptor: texDesc, offset: 0,
             bytesPerRow: framebuffer.stride
         )
-
         currentFB = framebuffer
         currentBuffer = buf
-        currentTexture = tex
     }
 
     public func unbind() {
         currentFB = nil
         currentBuffer = nil
         currentTexture = nil
+        cursorTexture = nil
+        cursorVisible = false
+    }
+
+    // MARK: - 光标
+
+    /// 更新硬件光标贴图(BGRA8 像素)
+    public func updateCursor(bgra: Data, width: Int, height: Int,
+                             hotX: Int32, hotY: Int32) {
+        guard width > 0, height > 0, bgra.count >= width * height * 4 else {
+            return
+        }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width, height: height, mipmapped: false
+        )
+        desc.storageMode = .shared
+        desc.usage = .shaderRead
+        guard let tex = device.makeTexture(descriptor: desc) else { return }
+        bgra.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            tex.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: base,
+                bytesPerRow: width * 4
+            )
+        }
+        cursorTexture = tex
+        cursorWidth = width
+        cursorHeight = height
+        cursorHotX = hotX
+        cursorHotY = hotY
+        cursorVisible = true
+    }
+
+    /// 更新光标位置(guest framebuffer 坐标系, 左上原点)
+    public func updateCursorPosition(x: Int32, y: Int32, visible: Bool) {
+        cursorPosX = x
+        cursorPosY = y
+        cursorVisible = visible && cursorTexture != nil
     }
 
     // MARK: - MTKViewDelegate
@@ -135,12 +227,34 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
         let cmd = queue.makeCommandBuffer()
         let enc = cmd?.makeRenderCommandEncoder(descriptor: passDesc)
 
+        // pass 1: fullscreen framebuffer
         if let tex = currentTexture {
-            enc?.setRenderPipelineState(pipeline)
+            enc?.setRenderPipelineState(fullscreenPipeline)
             enc?.setFragmentTexture(tex, index: 0)
             enc?.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
-        // 没绑 texture 时 pass 只做 clear (黑屏)
+
+        // pass 2: cursor overlay
+        if cursorVisible, let curTex = cursorTexture, let fb = currentFB,
+           fb.width > 0, fb.height > 0 {
+            let fx = Float(cursorPosX - cursorHotX) / Float(fb.width)
+            let fy = Float(cursorPosY - cursorHotY) / Float(fb.height)
+            let fw = Float(cursorWidth)  / Float(fb.width)
+            let fh = Float(cursorHeight) / Float(fb.height)
+            // NDC: x ∈ [-1,1] 映射 [0, fb.width]; y 轴翻转
+            let xl = fx * 2 - 1
+            let xr = (fx + fw) * 2 - 1
+            let yt = 1 - fy * 2
+            let yb = 1 - (fy + fh) * 2
+            var uniforms = SIMD4<Float>(xl, yt, xr, yb)
+
+            enc?.setRenderPipelineState(cursorPipeline)
+            enc?.setVertexBytes(&uniforms,
+                                length: MemoryLayout<SIMD4<Float>>.size,
+                                index: 0)
+            enc?.setFragmentTexture(curTex, index: 0)
+            enc?.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
 
         enc?.endEncoding()
         cmd?.present(drawable)

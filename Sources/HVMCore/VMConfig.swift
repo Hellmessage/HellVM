@@ -111,17 +111,38 @@ public struct BootConfig: Codable, Sendable {
     public var kernelCmdline: String?
     public var efi: Bool                // 是否使用 EFI 启动
 
+    /// 图形显示: true = virtio-gpu + iosurface backend + 键鼠; false = 纯串口(-nographic),
+    /// 适合无桌面的服务器镜像/云 init 等场景。默认 true。
+    public var graphical: Bool
+
     public init(
         isoPath: String? = nil,
         kernelPath: String? = nil,
         initrdPath: String? = nil,
         kernelCmdline: String? = nil,
-        efi: Bool = true
+        efi: Bool = true,
+        graphical: Bool = true
     ) {
         self.isoPath = isoPath
         self.kernelPath = kernelPath
         self.initrdPath = initrdPath
         self.kernelCmdline = kernelCmdline
         self.efi = efi
+        self.graphical = graphical
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.isoPath       = try c.decodeIfPresent(String.self, forKey: .isoPath)
+        self.kernelPath    = try c.decodeIfPresent(String.self, forKey: .kernelPath)
+        self.initrdPath    = try c.decodeIfPresent(String.self, forKey: .initrdPath)
+        self.kernelCmdline = try c.decodeIfPresent(String.self, forKey: .kernelCmdline)
+        self.efi           = try c.decodeIfPresent(Bool.self,   forKey: .efi)       ?? true
+        // 兼容旧 config(无 graphical 字段): 默认 true
+        self.graphical     = try c.decodeIfPresent(Bool.self,   forKey: .graphical) ?? true
     }
 }

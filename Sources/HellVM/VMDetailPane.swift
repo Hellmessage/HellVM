@@ -142,6 +142,11 @@ struct VMDetailPane: View {
     private func consoleTab(for item: VMListItem) -> some View {
         if !item.isRunning {
             consolePlaceholder
+        } else if !item.config.boot.graphical {
+            // 非图形模式: 显示 guest 串口 tail
+            InlineLogPane(title: "SERIAL",
+                          fileURL: item.bundle.serialLogURL)
+                .background(Color.black)
         } else if consoleMgr.isDetached(item.id) {
             detachedPlaceholder(for: item)
         } else {
@@ -217,6 +222,10 @@ struct VMDetailPane: View {
 
                 section(title: "启动") {
                     keyValue("UEFI", value: item.config.boot.efi ? "启用" : "关闭")
+                    keyValue("显示模式",
+                             value: item.config.boot.graphical
+                                ? "图形(virtio-gpu + 键鼠)"
+                                : "串口(-nographic)")
                     if let iso = item.config.boot.isoPath {
                         keyValue("ISO", value: iso, mono: true)
                     } else {
@@ -295,7 +304,7 @@ struct VMDetailPane: View {
             Spacer()
             SecondaryButton(title: "打开 Console",
                             systemImage: "macwindow.on.rectangle",
-                            disabled: !item.isRunning) {
+                            disabled: !item.isRunning || !item.config.boot.graphical) {
                 ConsoleWindowManager.shared.open(for: item)
             }
             SecondaryButton(title: "日志", systemImage: "doc.text") {

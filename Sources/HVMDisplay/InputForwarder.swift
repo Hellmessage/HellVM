@@ -146,15 +146,23 @@ public final class InputForwarder: @unchecked Sendable {
     }
 
     /// 长期活着, pending 空时短暂 sleep 再 drain。
-    /// 这样连续的鼠标移动不会反复 spawn 新 Task(Task 启动开销 ~ms 级)。
     /// 只在: 连接失败 / Task 被 cancel 时退出。
+    ///
+    /// 关键: drain 后再等 2ms 合并窗口, 把 flagsChanged(shift) + keyDown(a)
+    /// 这类紧挨的事件压到同一个 QMP input-send-event 里; 否则 usb-kbd 会发
+    /// 两次 HID report, guest 可能按 shift 没到的小写解析 a。
     private func flushLoop() async {
         while !Task.isCancelled {
-            let events = drainPending()
+            var events = drainPending()
             if events.isEmpty {
-                try? await Task.sleep(nanoseconds: 3_000_000) // 3ms 轮询
+                try? await Task.sleep(nanoseconds: 3_000_000)
                 continue
             }
+            // 合并窗口: 2ms 内紧邻的事件合并
+            try? await Task.sleep(nanoseconds: 2_000_000)
+            events.append(contentsOf: drainPending())
+
+            log.debug(.input, "flush \(Self.describe(events))")
             do {
                 try await qmp.execute("input-send-event",
                                       arguments: ["events": events])
@@ -164,6 +172,32 @@ public final class InputForwarder: @unchecked Sendable {
                 return
             }
         }
+    }
+
+    /// 把 QMP event 列表格式化成人类可读的短字符串, 用于日志
+    private static func describe(_ events: [QMPInputEvent]) -> String {
+        var parts: [String] = []
+        for e in events {
+            guard let type = e["type"] as? String,
+                  let data = e["data"] as? [String: Any] else { continue }
+            switch type {
+            case "key":
+                let down = (data["down"] as? Bool) ?? false
+                let qcode = (data["key"] as? [String: Any])?["data"] as? String ?? "?"
+                parts.append("\(qcode)\(down ? "↓" : "↑")")
+            case "btn":
+                let down = (data["down"] as? Bool) ?? false
+                let btn = (data["button"] as? String) ?? "?"
+                parts.append("\(btn)\(down ? "↓" : "↑")")
+            case "abs":
+                let axis = (data["axis"] as? String) ?? "?"
+                let v = (data["value"] as? Int) ?? 0
+                parts.append("\(axis)=\(v)")
+            default:
+                parts.append(type)
+            }
+        }
+        return "[\(parts.joined(separator: " "))]"
     }
 
     private func drainPending() -> [QMPInputEvent] {
