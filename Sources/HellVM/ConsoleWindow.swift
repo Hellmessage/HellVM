@@ -15,6 +15,7 @@ final class ConsoleWindowManager: NSObject, NSWindowDelegate, ObservableObject {
 
     @Published private(set) var detachedIDs: Set<UUID> = []
     private var windowsByVM: [UUID: NSWindow] = [:]
+    private var vmByWindow: [ObjectIdentifier: UUID] = [:]
 
     func isDetached(_ id: UUID) -> Bool {
         detachedIDs.contains(id)
@@ -50,9 +51,8 @@ final class ConsoleWindowManager: NSObject, NSWindowDelegate, ObservableObject {
         window.delegate = self
         window.tabbingMode = .disallowed
         window.collectionBehavior.insert(.fullScreenPrimary)
-        window.identifier = NSUserInterfaceItemIdentifier("hellvm.console.\(item.id.uuidString)")
-
         windowsByVM[item.id] = window
+        vmByWindow[ObjectIdentifier(window)] = item.id
         detachedIDs.insert(item.id)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -70,12 +70,11 @@ final class ConsoleWindowManager: NSObject, NSWindowDelegate, ObservableObject {
     // MARK: - NSWindowDelegate
 
     nonisolated func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow,
-              let ident = window.identifier?.rawValue,
-              ident.hasPrefix("hellvm.console."),
-              let uuid = UUID(uuidString: String(ident.dropFirst("hellvm.console.".count)))
-        else { return }
+        // ObjectIdentifier 只读指针地址, 线程安全; 不访问 @MainActor 属性
+        guard let window = notification.object as? NSWindow else { return }
+        let key = ObjectIdentifier(window)
         Task { @MainActor in
+            guard let uuid = self.vmByWindow.removeValue(forKey: key) else { return }
             self.windowsByVM.removeValue(forKey: uuid)
             self.detachedIDs.remove(uuid)
         }

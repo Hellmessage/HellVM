@@ -140,11 +140,19 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
     // MARK: - framebuffer 绑定
 
     public func bind(framebuffer: SharedFramebuffer) {
+        // 把 SharedFramebuffer 强引用捕获到 MTLBuffer.deallocator: Metal 保证
+        // GPU 处理完所有 in-flight command buffer 后才调用 deallocator, 那时释放
+        // SharedFramebuffer(munmap) 才安全。否则 VM 关机 → unbind() 立即释放会
+        // 让 GPU 访问已 munmap 的地址 → Metal crash → App 异常退出。
+        let keep = framebuffer
         let buf = device.makeBuffer(
             bytesNoCopy: framebuffer.pointer,
             length: framebuffer.byteCount,
             options: [.storageModeShared],
-            deallocator: nil
+            deallocator: { _, _ in
+                // closure 捕获 keep; 调用时 capture 释放 → SharedFramebuffer deinit
+                _ = keep
+            }
         )
         guard let buf else {
             currentFB = nil; currentBuffer = nil; currentTexture = nil
@@ -168,6 +176,8 @@ public final class FramebufferRenderer: NSObject, MTKViewDelegate {
     }
 
     public func unbind() {
+        // 此处只断 renderer 的引用, SharedFramebuffer 实际 munmap 由 MTLBuffer
+        // deallocator 在 GPU 完成后触发。
         currentFB = nil
         currentBuffer = nil
         currentTexture = nil

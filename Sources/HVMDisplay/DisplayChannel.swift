@@ -209,7 +209,7 @@ public final class DisplayChannel: @unchecked Sendable {
         case .cursor where payload.count >= 16:
             var hotX: Int32 = 0, hotY: Int32 = 0
             var w: UInt32 = 0, h: UInt32 = 0
-            _ = payload.withUnsafeBufferPointer { src in
+            payload.withUnsafeBufferPointer { src in
                 memcpy(&hotX, src.baseAddress!,      4)
                 memcpy(&hotY, src.baseAddress! + 4,  4)
                 memcpy(&w,    src.baseAddress! + 8,  4)

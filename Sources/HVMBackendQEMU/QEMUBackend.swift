@@ -65,7 +65,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         proc.standardOutput = stdoutPipe
         proc.standardError  = stderrPipe
 
-        var outBuffer = Data()
+        let outBuffer = LineBuffer()
         stdoutPipe.fileHandleForReading.readabilityHandler = { h in
             let data = h.availableData
             if data.isEmpty {
@@ -73,11 +73,10 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
                 return
             }
             try? rawHandle?.write(contentsOf: data)
-            Self.drainLines(buffer: &outBuffer, chunk: data) { line in
-                log.info(.qemu, line)
-            }
+            outBuffer.append(data)
+            outBuffer.drainLines { line in log.info(.qemu, line) }
         }
-        var errBuffer = Data()
+        let errBuffer = LineBuffer()
         stderrPipe.fileHandleForReading.readabilityHandler = { h in
             let data = h.availableData
             if data.isEmpty {
@@ -85,9 +84,8 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
                 return
             }
             try? rawHandle?.write(contentsOf: data)
-            Self.drainLines(buffer: &errBuffer, chunk: data) { line in
-                log.warn(.qemu, line)
-            }
+            errBuffer.append(data)
+            errBuffer.drainLines { line in log.warn(.qemu, line) }
         }
 
         proc.terminationHandler = { [weak self] p in
@@ -171,23 +169,27 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         return body()
     }
 
-    /// 流式切行: 把新 chunk 追加到 buffer, 每凑出一行(不含 \n)就回调
-    private static func drainLines(buffer: inout Data,
-                                   chunk: Data,
-                                   emit: (String) -> Void) {
-        buffer.append(chunk)
-        while let nlIdx = buffer.firstIndex(of: 0x0a) {
-            let lineData = buffer[buffer.startIndex..<nlIdx]
-            buffer.removeSubrange(buffer.startIndex...nlIdx)
-            var line = String(data: Data(lineData), encoding: .utf8) ?? ""
-            if line.hasSuffix("\r") { line.removeLast() }
-            if !line.isEmpty { emit(line) }
-        }
-        // 超长单行保护(无 \n), 避免 buffer 无限增长
-        if buffer.count > 64 * 1024 {
-            let line = String(data: buffer, encoding: .utf8) ?? ""
-            buffer.removeAll(keepingCapacity: true)
-            if !line.isEmpty { emit(line) }
+    /// 流式切行 buffer: 类而非 inout Data, 避免并发闭包里捕获 var 的警告
+    private final class LineBuffer: @unchecked Sendable {
+        private var data = Data()
+
+        func append(_ chunk: Data) { data.append(chunk) }
+
+        /// 每凑出一行(不含 \n)就回调
+        func drainLines(_ emit: (String) -> Void) {
+            while let nlIdx = data.firstIndex(of: 0x0a) {
+                let lineData = data[data.startIndex..<nlIdx]
+                data.removeSubrange(data.startIndex...nlIdx)
+                var line = String(data: Data(lineData), encoding: .utf8) ?? ""
+                if line.hasSuffix("\r") { line.removeLast() }
+                if !line.isEmpty { emit(line) }
+            }
+            // 超长单行保护(无 \n), 避免 buffer 无限增长
+            if data.count > 64 * 1024 {
+                let line = String(data: data, encoding: .utf8) ?? ""
+                data.removeAll(keepingCapacity: true)
+                if !line.isEmpty { emit(line) }
+            }
         }
     }
 
