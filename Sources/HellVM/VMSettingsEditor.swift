@@ -677,6 +677,26 @@ struct VMSettingsEditor: View {
                         }
                     }
                 }
+                // 安装完成后切换: 保留 isoPath 以便将来重装, 启动时不挂载光盘
+                if draft.boot.isoPath != nil {
+                    togglePair(label: "仅从硬盘启动",
+                               on:  ("已装机", "internaldrive.fill"),
+                               off: ("挂 ISO", "opticaldisc"),
+                               value: Binding(get: { draft.boot.bootFromDiskOnly },
+                                              set: { draft.boot.bootFromDiskOnly = $0 }))
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textTertiary)
+                        Text(draft.boot.bootFromDiskOnly
+                             ? "下次启动跳过 ISO 挂载, 直接从硬盘走 grub/bootmgr. 需重装时关回挂 ISO."
+                             : "启动时把 ISO 挂为 USB 光驱. 装完系统后打开上面的开关, 避免再次进安装器.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                        Spacer()
+                    }
+                    .padding(.top, -4)
+                }
                 // Windows 客户机: 自动装 virtio-win 驱动 toggle + iso 状态
                 if draft.osType == .windows && draft.boot.graphical {
                     togglePair(label: "自动装 virtio-win 驱动",

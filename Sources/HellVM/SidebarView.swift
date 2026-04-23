@@ -1,5 +1,6 @@
 // 左侧栏 —— VM 列表 + 运行状态 pill + 选中指示条 + hover
 import SwiftUI
+import AppKit
 
 struct SidebarView: View {
     let store: VMListStore
@@ -82,6 +83,34 @@ struct SidebarView: View {
                     VMRow(item: item, isSelected: selectedID == item.id)
                         .contentShape(Rectangle())
                         .onTapGesture { selectedID = item.id }
+                        .contextMenu {
+                            Button {
+                                revealInFinder(item.bundle.url)
+                            } label: {
+                                Label("在访达中打开", systemImage: "folder")
+                            }
+                            Button {
+                                copyToPasteboard(item.bundle.url.path)
+                            } label: {
+                                Label("拷贝 Bundle 路径", systemImage: "doc.on.clipboard")
+                            }
+                            Divider()
+                            Button {
+                                let logs = item.bundle.url.appendingPathComponent("logs")
+                                revealInFinder(logs)
+                            } label: {
+                                Label("查看日志目录", systemImage: "text.document")
+                            }
+                            if item.config.boot.isoPath != nil,
+                               let iso = item.config.boot.isoPath,
+                               FileManager.default.fileExists(atPath: iso) {
+                                Button {
+                                    revealInFinder(URL(fileURLWithPath: iso))
+                                } label: {
+                                    Label("访达中显示 ISO", systemImage: "opticaldisc")
+                                }
+                            }
+                        }
                 }
             }
             .padding(.horizontal, 8)
@@ -184,4 +213,28 @@ private struct VMRow: View {
         case .riscv64: return Color.purple.opacity(0.20)
         }
     }
+}
+
+// MARK: - 访达 / 剪贴板 辅助
+
+/// 在访达中打开并高亮指定 URL (文件或目录)
+/// - 目录: selectFileInFinder 展开 + 选中, 等价 "在访达中显示"
+/// - 不存在: 回退 open -R(访达打开上级选中)
+fileprivate func revealInFinder(_ url: URL) {
+    let fm = FileManager.default
+    if fm.fileExists(atPath: url.path) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    } else {
+        // 不存在就退一级
+        let parent = url.deletingLastPathComponent()
+        if fm.fileExists(atPath: parent.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([parent])
+        }
+    }
+}
+
+fileprivate func copyToPasteboard(_ s: String) {
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    pb.setString(s, forType: .string)
 }

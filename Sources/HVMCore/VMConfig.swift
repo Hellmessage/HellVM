@@ -305,6 +305,15 @@ public struct BootConfig: Codable, Sendable, Equatable {
     /// 默认 false, Windows 模板建议开。
     public var autoInstallVirtioWin: Bool
 
+    /// 安装完成后切换到"仅硬盘启动"模式: 启动时跳过 isoPath 的挂载, 不再暴露安装盘
+    /// 给 guest. EFI NVRAM 里的 grub/bootmgr Boot#### entry 已经由安装程序写好,
+    /// BDS 直接走硬盘。半自动安装完成流程的关键开关:
+    /// - 首次装机: 保持 false, QEMU 挂 ISO, guest 启动进安装器
+    /// - 安装完成后用户手动勾选 true → 下次启动仅硬盘
+    /// - 需要重装时关掉 → 回到 ISO 挂载路径
+    /// 默认 false, 不影响新建 VM 的正常装机流程。
+    public var bootFromDiskOnly: Bool
+
     public init(
         isoPath: String? = nil,
         kernelPath: String? = nil,
@@ -315,7 +324,8 @@ public struct BootConfig: Codable, Sendable, Equatable {
         tpm: Bool = false,
         serialDebug: Bool = false,
         bypassWin11Checks: Bool = false,
-        autoInstallVirtioWin: Bool = false
+        autoInstallVirtioWin: Bool = false,
+        bootFromDiskOnly: Bool = false
     ) {
         self.isoPath = isoPath
         self.kernelPath = kernelPath
@@ -327,11 +337,12 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.serialDebug = serialDebug
         self.bypassWin11Checks = bypassWin11Checks
         self.autoInstallVirtioWin = autoInstallVirtioWin
+        self.bootFromDiskOnly = bootFromDiskOnly
     }
 
     private enum CodingKeys: String, CodingKey {
         case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical, tpm, serialDebug
-        case bypassWin11Checks, autoInstallVirtioWin
+        case bypassWin11Checks, autoInstallVirtioWin, bootFromDiskOnly
     }
 
     public init(from decoder: Decoder) throws {
@@ -351,6 +362,8 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.bypassWin11Checks = try c.decodeIfPresent(Bool.self, forKey: .bypassWin11Checks) ?? false
         // 兼容旧 config(无 autoInstallVirtioWin 字段): 默认 false
         self.autoInstallVirtioWin = try c.decodeIfPresent(Bool.self, forKey: .autoInstallVirtioWin) ?? false
+        // 兼容旧 config(无 bootFromDiskOnly 字段): 默认 false
+        self.bootFromDiskOnly = try c.decodeIfPresent(Bool.self, forKey: .bootFromDiskOnly) ?? false
     }
 }
 

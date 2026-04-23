@@ -549,7 +549,11 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
 
         // 启动介质(ISO): 图形模式走 usb-storage(Win11 首选,对齐 UTM 经验证配置);
         // 非图形模式保留 virtio-scsi-cd
-        if let isoPath = config.boot.isoPath {
+        //
+        // bootFromDiskOnly=true 时跳过 ISO 挂载 —— 安装完成后的切换开关,
+        // 避免 guest 再次看到安装盘。EFI NVRAM 里的 grub/bootmgr Boot entry
+        // 已经写好, BDS 自动走硬盘。
+        if let isoPath = config.boot.isoPath, !config.boot.bootFromDiskOnly {
             if config.boot.graphical {
                 args += [
                     "-drive", "if=none,id=cdrom0,media=cdrom,file=\(isoPath),readonly=on",
@@ -562,6 +566,8 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
                     "-device", "scsi-cd,drive=cdrom0,bootindex=1",
                 ]
             }
+        } else if config.boot.bootFromDiskOnly && config.boot.isoPath != nil {
+            log.info(.qemu, "[bootFromDiskOnly] 跳过 ISO 挂载 (\(config.boot.isoPath ?? ""))")
         }
 
         // Win11 系统要求 bypass: 挂第二个小 CD, 只含 AutoUnattend.xml, Win Setup 自动识别
