@@ -51,6 +51,11 @@ if [ ! -x "$VENDOR_QEMU/bin/qemu-system-aarch64" ]; then
     bash scripts/build-qemu.sh
 fi
 
+# ---------- 2b. EDK2 firmware (patched for Win11 lowram 兼容) ----------
+# QEMU patch 0002/0004 的 VIRT_LOWRAM 需要配套 EDK2 (改 QemuVirtMemInfoPeiLib).
+# build-edk2.sh 幂等:.fd 已存在且 patch 已打就跳过, 首次 ~5-10 分钟.
+bash scripts/build-edk2.sh
+
 # ---------- 3. Swift ----------
 echo "==> swift build ($CONFIG)"
 swift build -c "$CONFIG" --product HellVM
