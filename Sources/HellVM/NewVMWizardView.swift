@@ -144,7 +144,7 @@ struct NewVMWizardView: View {
     private var osTypePicker: some View {
         HStack(spacing: 8) {
             osCard(.linux,   title: "Linux",   subtitle: "virtio-gpu 加速",  icon: "terminal.fill")
-            osCard(.windows, title: "Windows", subtitle: "关 gpu, TPM", icon: "square.stack.fill")
+            osCard(.windows, title: "Windows", subtitle: "virtio-ramfb + TPM", icon: "square.stack.fill")
             osCard(.macOS,   title: "macOS",   subtitle: "实验性",           icon: "apple.logo")
             osCard(.other,   title: "其他",    subtitle: "手动调",           icon: "questionmark.circle")
         }
@@ -185,7 +185,7 @@ struct NewVMWizardView: View {
                 Image(systemName: "info.circle")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.textTertiary)
-                Text("已关闭 virtio-gpu(防 bootmgr 挂死)、启用 TPM、自动绕过 Win11 硬件检查")
+                Text("用 virtio-ramfb 融合设备(bootmgr 不挂, 装 viogpudo 驱动后支持动态分辨率)、启用 TPM、自动绕过 Win11 硬件检查")
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.textTertiary)
                 Spacer()

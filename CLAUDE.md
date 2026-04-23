@@ -32,6 +32,18 @@
 
 - 开发完成后,编写`README.md`
 
+## 补丁约束 **必须遵守**
+
+- 所有对外部 vendored 源码(`Vendor/qemu-src/`、`Vendor/edk2-src/` 等)的修改,
+  **必须**导出为 `patches/` 下的 `.patch` 文件,不能只留在 vendored tree 里。
+- 原因: `scripts/build-qemu.sh` 在每次构建开头会 `git fetch + git reset --hard FETCH_HEAD`,
+  vendored tree 里的脏改动会被**无声清除**,只有 `patches/*.patch` 会被 `git am` 重新应用。
+- 制作流程:
+  1. 在 `Vendor/qemu-src/` 里 `git commit` 改动
+  2. `git format-patch -1 -o ../../patches/` 导出
+  3. 确认文件名有序号前缀(`0003-...`),保证 apply 顺序稳定
+  4. 重跑 `make build` 验证 patch 能干净 apply 且编译通过
+
 ## 诊断工具
 
 ### EDK2 / bootmgr / kernel 串口日志(排查启动失败用)

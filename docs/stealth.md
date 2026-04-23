@@ -201,6 +201,7 @@ Guest 侧读取路径:Linux `/sys/class/dmi/id/*`、Windows `WMI Win32_ComputerS
 - HVF 下 `-cpu host,-hypervisor` 是否真能关掉 CPUID hypervisor 位?需要实验验证(macOS 14 / 15 行为可能不同)
 - QEMU q35 + OVMF 组合下 ACPI 表的最小可控粒度,是否能完全运行时参数化而不必 patch
 - 磁盘/网卡换成非 virtio 后,P4 图形显示(virtio-gpu + IOSurface)是否需要同步考虑 GPU 伪装
+  → 详细设计见 [custom-gpu-driver.md](custom-gpu-driver.md):fork viogpudo + 改 VEN/DEV 的路线
 - 是否提供 "一键从物理机 dump 一套 SMBIOS/ACPI 作为模板" 的工具(tools/ 下)
 
 ---

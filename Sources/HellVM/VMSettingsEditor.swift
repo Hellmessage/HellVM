@@ -492,7 +492,8 @@ struct VMSettingsEditor: View {
                 if draft.boot.graphical {
                     // virtio-GPU 加速开关:
                     // - 开: virtio-gpu-pci + ramfb 双 console (Linux 建议, 能加速)
-                    // - 关: 仅 ramfb 单 console (Windows 必选, 防 bootmgr 挂死 / 多 console flicker)
+                    // - 关: virtio-ramfb 融合设备, 单 console (Windows 必选,
+                    //       bootmgr 不挂死, 装 viogpudo 驱动后支持动态分辨率)
                     togglePair(label: "virtio-GPU 加速",
                                on:  ("启用", "bolt.fill"),
                                off: ("关闭", "bolt.slash"),
@@ -503,7 +504,7 @@ struct VMSettingsEditor: View {
                             Image(systemName: "info.circle")
                                 .font(.system(size: 11))
                                 .foregroundStyle(Theme.textTertiary)
-                            Text("仅挂 ramfb —— Windows 客户机推荐, 避免多 console 画面闪烁")
+                            Text("改用 virtio-ramfb —— Windows 客户机推荐, 装 viogpudo 驱动后可动态适应窗口大小")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Theme.textTertiary)
                             Spacer()

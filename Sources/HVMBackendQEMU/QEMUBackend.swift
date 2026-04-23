@@ -550,14 +550,18 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
 
         if config.boot.graphical {
             // 图形模式: 根据 display.virtioGpu 决定显示设备组合
-            // - true (Linux/Asahi 等): virtio-gpu-pci + ramfb, 可加速, iosurface
-            //   backend 用 active_con 选择机制防止多 console 画面重影
-            // - false (Windows 安装盘): 只挂 ramfb, 避免 Win bootmgr 在 virtio-gpu
-            //   存在时挂死
+            // - true (Linux/Asahi 等): virtio-gpu-pci + ramfb, 两 console, virtio-gpu 加速
+            // - false (Windows): virtio-ramfb 融合设备(HellVM patch 0002+0003 port 自 UTM
+            //   并修复上游 update_display 的 g->enable bug 以及 driver 接管后 ramfb
+            //   旧数据回刷的问题)。单 PCI 设备单 console, bootmgr 走 ramfb facet 不挂死,
+            //   装完 viogpudo 驱动后 scanout->resource_id != 0 自动切 virtio-gpu facet
+            //   支持 dpy_set_ui_info 动态分辨率。
             if config.display.virtioGpu {
                 args += ["-device", "virtio-gpu-pci"]
+                args += ["-device", "ramfb"]
+            } else {
+                args += ["-device", "virtio-ramfb"]
             }
-            args += ["-device", "ramfb"]
             // USB HID 键鼠(挂到前面已定义的 usbbus 上)
             args += ["-device", "usb-kbd,bus=usbbus.0"]
             args += ["-device", "usb-tablet,bus=usbbus.0"]

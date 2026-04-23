@@ -1,0 +1,66 @@
+From 46270c68d123543d7f644f65bfc7e8c22cd6f4d9 Mon Sep 17 00:00:00 2001
+From: HellVM Build <build@hellvm.local>
+Date: Thu, 23 Apr 2026 16:27:07 +0800
+Subject: [PATCH] virtio-ramfb: skip ramfb update when guest driver bound
+ scanout
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+修复 patch 0002 的 hack 在 virtio-gpu 驱动加载后画面闪烁/撕裂的问题。
+用 scanout[0].resource_id 精准区分 firmware 阶段和 driver 接管阶段:
+- resource_id == 0: 固件/无驱动, ramfb 推送画面
+- resource_id != 0: 驱动已发 SET_SCANOUT, virtio-gpu 独占输出, ramfb 让路
+
+HellVM patch 0003.
+---
+ hw/display/virtio-ramfb.c | 31 +++++++++++++++++++++++--------
+ 1 file changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/virtio-ramfb.c b/hw/display/virtio-ramfb.c
+index 1899729..717c8aa 100644
+--- a/hw/display/virtio-ramfb.c
++++ b/hw/display/virtio-ramfb.c
+@@ -45,16 +45,31 @@ static void virtio_ramfb_update_display(void *opaque)
+     VirtIOGPUBase *g = vramfb->vgpu;
+ 
+     /*
+-     * HellVM 修复:原逻辑按 g->enable 分派。但 virtio_gpu_update_display() 其实
+-     * 是空函数(virtio-gpu 的实际渲染走 virtqueue 命令,会直接 dpy_gfx_update 到
+-     * console,不经这个 gfx_update hook)。原逻辑的真实效果是:guest 触碰
+-     * virtio-gpu 寄存器后 g->enable=true, ramfb 分支被跳过,bootmgr/firmware
+-     * 写入的 ramfb 永远不被展示 → 画面卡在 "Display output is not active"。
++     * HellVM 完整修复(上游 virtio-ramfb g->enable bug):
+      *
+-     * 修复后:永远尝试 ramfb 路径。如果 firmware 有写过 ramfb (width/height > 0),
+-     * ramfb_display_update 会把新 surface 推到 console; virtio-gpu 的 virtqueue
+-     * 命令独立运作,一旦 guest 发来真的绘图命令也会 dpy_gfx_update。
++     * 上游原逻辑:
++     *     if (g->enable) g->hw_ops->gfx_update(g); else ramfb_display_update();
++     * 问题: virtio_gpu_update_display() 是空函数(真实渲染走 virtqueue, 在命令
++     * 回调里直接 dpy_gfx_replace_surface), 而 g->enable 只要 guest 碰 virtio-gpu
++     * 寄存器就被置 true(EDK2 PCI 枚举一做就触发). 导致 bootmgr 写 ramfb 但
++     * gfx_update hook 走空分支, ramfb 永远不刷新 → 画面卡死。
++     *
++     * 第一版 hack (过):永远走 ramfb_display_update。 firmware/bootmgr 阶段没
++     * 问题, 但 Windows 装完 viogpudo 驱动后 virtio-gpu 通过 virtqueue 正常推
++     * 帧, 同时 ramfb 每次 refresh 又把 guest 旧 ramfb 内存 replace 上去,
++     * 两路互相覆盖 → 画面闪/撕裂。
++     *
++     * 本版修复:用 scanout[0].resource_id 精准判断 virtio-gpu 是否被驱动接管:
++     * - resource_id == 0 → 固件/无驱动阶段, ramfb 是唯一源, 必须推。
++     * - resource_id != 0 → guest 发过 VIRTIO_GPU_CMD_SET_SCANOUT 把 resource
++     *   绑到 scanout, virtio-gpu 正在通过 virtqueue 推真实画面, ramfb 让路。
++     *
++     * reset/reboot 时 parent_phases.hold 会清 virtio-gpu 状态, resource_id
++     * 回 0, 自动回到 ramfb 路径服务固件阶段, 无需额外处理。
+      */
++    if (g->scanout[0].resource_id != 0) {
++        return;
++    }
+     ramfb_display_update(g->scanout[0].con, vramfb->ramfb);
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
