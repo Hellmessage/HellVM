@@ -49,6 +49,9 @@ public struct VMBundle: Sendable {
     /// swtpm 控制 socket(QEMU 通过 chardev socket 连入)
     public var tpmSocketURL: URL { url.appendingPathComponent("swtpm.sock") }
 
+    /// Win11 bypass 自动应答 ISO(一次性生成后缓存,仅含 AutoUnattend.xml)
+    public var unattendIsoURL: URL { url.appendingPathComponent("autounattend.iso") }
+
     /// 读取 PID 文件,返回 qemu 进程 PID(若存在且能解析)
     public func readPID() -> Int32? {
         guard let data = try? Data(contentsOf: pidFileURL),

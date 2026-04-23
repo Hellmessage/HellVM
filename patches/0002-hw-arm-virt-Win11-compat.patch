@@ -1,29 +1,37 @@
-From 50940a2d3584145fef5d399769ee67247d6d33fe Mon Sep 17 00:00:00 2001
+From 0b4737bce986d35ebfb2ff9fc7c54a50a85a0af0 Mon Sep 17 00:00:00 2001
 From: HellVM Build <build@hellvm.local>
 Date: Thu, 23 Apr 2026 11:01:10 +0800
-Subject: [PATCH] hw/arm/virt: add low RAM hole at 0x10000000 for Win11 bootmgr
- compat
+Subject: [PATCH 2/2] hw/arm/virt: add low RAM hole at 0x10000000 for Win11
+ bootmgr compat
 
 ---
- hw/acpi/aml-build.c     |   7 +-
- hw/arm/Kconfig          |   1 +
- hw/arm/boot.c           |  11 ++
- hw/arm/virt.c           |  35 ++++-
- hw/core/sysbus-fdt.c    |   2 +
- hw/tpm/Kconfig          |   5 +
- hw/tpm/meson.build      |   5 +
- hw/tpm/tpm-sysbus.c     |  48 +++++++
- hw/tpm/tpm_crb.c        | 304 ++++++++++------------------------------
- hw/tpm/tpm_crb.h        |  79 +++++++++++
- hw/tpm/tpm_crb_common.c | 264 ++++++++++++++++++++++++++++++++++
- hw/tpm/tpm_crb_sysbus.c | 161 +++++++++++++++++++++
- hw/tpm/tpm_ppi.c        |   5 +-
- hw/tpm/tpm_ppi.h        |  10 +-
- include/hw/acpi/tpm.h   |   3 +
- include/hw/arm/boot.h   |   4 +
- include/hw/arm/virt.h   |   2 +
- include/system/tpm.h    |   3 +
- 18 files changed, 705 insertions(+), 244 deletions(-)
+ hw/acpi/aml-build.c          |   7 +-
+ hw/arm/Kconfig               |   1 +
+ hw/arm/boot.c                |  11 ++
+ hw/arm/virt.c                |  35 +++-
+ hw/core/sysbus-fdt.c         |   2 +
+ hw/display/meson.build       |  14 ++
+ hw/display/virtio-ramfb-gl.c |  50 ++++++
+ hw/display/virtio-ramfb.c    | 201 +++++++++++++++++++++++
+ hw/display/virtio-ramfb.h    |  28 ++++
+ hw/tpm/Kconfig               |   5 +
+ hw/tpm/meson.build           |   5 +
+ hw/tpm/tpm-sysbus.c          |  48 ++++++
+ hw/tpm/tpm_crb.c             | 304 +++++++++--------------------------
+ hw/tpm/tpm_crb.h             |  79 +++++++++
+ hw/tpm/tpm_crb_common.c      | 264 ++++++++++++++++++++++++++++++
+ hw/tpm/tpm_crb_sysbus.c      | 161 +++++++++++++++++++
+ hw/tpm/tpm_ppi.c             |   5 +-
+ hw/tpm/tpm_ppi.h             |  10 +-
+ include/hw/acpi/tpm.h        |   3 +
+ include/hw/arm/boot.h        |   4 +
+ include/hw/arm/virt.h        |   2 +
+ include/system/tpm.h         |   3 +
+ ui/iosurface.m               |  95 ++++++++++-
+ 23 files changed, 1086 insertions(+), 251 deletions(-)
+ create mode 100644 hw/display/virtio-ramfb-gl.c
+ create mode 100644 hw/display/virtio-ramfb.c
+ create mode 100644 hw/display/virtio-ramfb.h
  create mode 100644 hw/tpm/tpm-sysbus.c
  create mode 100644 hw/tpm/tpm_crb.h
  create mode 100644 hw/tpm/tpm_crb_common.c
@@ -175,6 +183,326 @@ index 59f1d17..f81429e 100644
  #endif
      /* No generic DT support for smmuv3 dev. Support added for arm virt only */
      TYPE_BINDING(TYPE_ARM_SMMUV3, no_fdt_node),
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 90e6c04..262c682 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -144,4 +144,18 @@ endif
+ 
+ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
+ 
++# HellVM (UTM port): virtio-ramfb — virtio-gpu-pci 的 wrapper, 内置 ramfb
++# 解决 Win ARM bootmgr 同时面对多个 GOP 设备画错帧缓冲的问题
++if config_all_devices.has_key('CONFIG_FW_CFG_DMA')
++  virtio_ramfb_ss = ss.source_set()
++  virtio_ramfb_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('virtio-ramfb.c'))
++  hw_display_modules += {'virtio-ramfb': virtio_ramfb_ss}
++  if virgl.found() and opengl.found()
++    virtio_ramfb_gl_ss = ss.source_set()
++    virtio_ramfb_gl_ss.add(when: ['CONFIG_FW_CFG_DMA', virgl, opengl],
++                           if_true: files('virtio-ramfb-gl.c'))
++    hw_display_modules += {'virtio-ramfb-gl': virtio_ramfb_gl_ss}
++  endif
++endif
++
+ modules += { 'hw-display': hw_display_modules }
+diff --git a/hw/display/virtio-ramfb-gl.c b/hw/display/virtio-ramfb-gl.c
+new file mode 100644
+index 0000000..19ddfd5
+--- /dev/null
++++ b/hw/display/virtio-ramfb-gl.c
+@@ -0,0 +1,50 @@
++#include "qemu/osdep.h"
++#include "hw/pci/pci.h"
++#include "hw/qdev-properties.h"
++#include "hw/virtio/virtio-gpu.h"
++#include "hw/display/vga.h"
++#include "qapi/error.h"
++#include "qemu/module.h"
++#include "virtio-ramfb.h"
++#include "qom/object.h"
++
++#define TYPE_VIRTIO_RAMFB_GL "virtio-ramfb-gl"
++
++typedef struct VirtIORAMFBGL VirtIORAMFBGL;
++DECLARE_INSTANCE_CHECKER(VirtIORAMFBGL, VIRTIO_RAMFB_GL,
++                         TYPE_VIRTIO_RAMFB_GL)
++
++struct VirtIORAMFBGL {
++    VirtIORAMFBBase parent_obj;
++
++    VirtIOGPUGL   vdev;
++};
++
++static void virtio_ramfb_gl_inst_initfn(Object *obj)
++{
++    VirtIORAMFBGL *dev = VIRTIO_RAMFB_GL(obj);
++    
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_GPU_GL);
++    VIRTIO_RAMFB_BASE(dev)->vgpu = VIRTIO_GPU_BASE(&dev->vdev);
++}
++
++
++static VirtioPCIDeviceTypeInfo virtio_ramfb_gl_info = {
++    .generic_name  = TYPE_VIRTIO_RAMFB_GL,
++    .parent        = TYPE_VIRTIO_RAMFB_BASE,
++    .instance_size = sizeof(VirtIORAMFBGL),
++    .instance_init = virtio_ramfb_gl_inst_initfn,
++};
++module_obj(TYPE_VIRTIO_RAMFB_GL);
++
++static void virtio_ramfb_register_types(void)
++{
++    if (have_vga) {
++        virtio_pci_types_register(&virtio_ramfb_gl_info);
++    }
++}
++
++type_init(virtio_ramfb_register_types)
++
++module_dep("hw-display-virtio-ramfb");
+diff --git a/hw/display/virtio-ramfb.c b/hw/display/virtio-ramfb.c
+new file mode 100644
+index 0000000..1899729
+--- /dev/null
++++ b/hw/display/virtio-ramfb.c
+@@ -0,0 +1,201 @@
++#include "qemu/osdep.h"
++#include "system/system.h"
++#include "hw/pci/pci.h"
++#include "ui/console.h"
++#include "hw/qdev-properties.h"
++#include "virtio-ramfb.h"
++#include "qapi/error.h"
++#include "qom/object.h"
++
++static int virtio_ramfb_get_flags(void *opaque)
++{
++    VirtIORAMFBBase *vramfb = opaque;
++    VirtIOGPUBase *g = vramfb->vgpu;
++
++    if (g->hw_ops->get_flags) {
++        return g->hw_ops->get_flags(g);
++    } else {
++        return 0;
++    }
++}
++
++static void virtio_ramfb_invalidate_display(void *opaque)
++{
++    VirtIORAMFBBase *vramfb = opaque;
++    VirtIOGPUBase *g = vramfb->vgpu;
++
++    if (g->enable) {
++        g->hw_ops->invalidate(g);
++    }
++}
++
++static void virtio_ramfb_text_update(void *opaque, console_ch_t *chardata)
++{
++    VirtIORAMFBBase *vramfb = opaque;
++    VirtIOGPUBase *g = vramfb->vgpu;
++
++    if (g->hw_ops->text_update) {
++        g->hw_ops->text_update(g, chardata);
++    }
++}
++
++static void virtio_ramfb_update_display(void *opaque)
++{
++    VirtIORAMFBBase *vramfb = opaque;
++    VirtIOGPUBase *g = vramfb->vgpu;
++
++    /*
++     * HellVM 修复:原逻辑按 g->enable 分派。但 virtio_gpu_update_display() 其实
++     * 是空函数(virtio-gpu 的实际渲染走 virtqueue 命令,会直接 dpy_gfx_update 到
++     * console,不经这个 gfx_update hook)。原逻辑的真实效果是:guest 触碰
++     * virtio-gpu 寄存器后 g->enable=true, ramfb 分支被跳过,bootmgr/firmware
++     * 写入的 ramfb 永远不被展示 → 画面卡在 "Display output is not active"。
++     *
++     * 修复后:永远尝试 ramfb 路径。如果 firmware 有写过 ramfb (width/height > 0),
++     * ramfb_display_update 会把新 surface 推到 console; virtio-gpu 的 virtqueue
++     * 命令独立运作,一旦 guest 发来真的绘图命令也会 dpy_gfx_update。
++     */
++    ramfb_display_update(g->scanout[0].con, vramfb->ramfb);
++}
++
++static void virtio_ramfb_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
++{
++    VirtIORAMFBBase *vramfb = opaque;
++    VirtIOGPUBase *g = vramfb->vgpu;
++
++    if (g->hw_ops->ui_info) {
++        g->hw_ops->ui_info(g, idx, info);
++    }
++}
++
++static void virtio_ramfb_gl_block(void *opaque, bool block)
++{
++    VirtIORAMFBBase *vramfb = opaque;
++    VirtIOGPUBase *g = vramfb->vgpu;
++
++    if (g->hw_ops->gl_block) {
++        g->hw_ops->gl_block(g, block);
++    }
++}
++
++static const GraphicHwOps virtio_ramfb_ops = {
++    .get_flags = virtio_ramfb_get_flags,
++    .invalidate = virtio_ramfb_invalidate_display,
++    .gfx_update = virtio_ramfb_update_display,
++    .text_update = virtio_ramfb_text_update,
++    .ui_info = virtio_ramfb_ui_info,
++    .gl_block = virtio_ramfb_gl_block,
++};
++
++static const VMStateDescription vmstate_virtio_ramfb = {
++    .name = "virtio-ramfb",
++    .version_id = 2,
++    .minimum_version_id = 2,
++    .fields = (VMStateField[]) {
++        /* no pci stuff here, saving the virtio device will handle that */
++        /* FIXME */
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++/* RAMFB device wrapper around PCI device around virtio GPU */
++static void virtio_ramfb_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
++{
++    VirtIORAMFBBase *vramfb = VIRTIO_RAMFB_BASE(vpci_dev);
++    VirtIOGPUBase *g = vramfb->vgpu;
++    int i;
++
++    /* init virtio bits */
++    virtio_pci_force_virtio_1(vpci_dev);
++    if (!qdev_realize(DEVICE(g), BUS(&vpci_dev->bus), errp)) {
++        return;
++    }
++
++    /* init ramfb (v10.2: ramfb_setup 多了 romfile 参数, 不需要 legacy x86 rom) */
++    vramfb->ramfb = ramfb_setup(false, errp);
++    graphic_console_set_hwops(g->scanout[0].con, &virtio_ramfb_ops, vramfb);
++
++    for (i = 0; i < g->conf.max_outputs; i++) {
++        object_property_set_link(OBJECT(g->scanout[i].con), "device",
++                                 OBJECT(vpci_dev), &error_abort);
++    }
++}
++
++static void virtio_ramfb_reset_hold(Object *obj, ResetType type)
++{
++    VirtIORAMFBBase *dev = VIRTIO_RAMFB_BASE(obj);
++    VirtIORAMFBBaseClass *klass = VIRTIO_RAMFB_BASE_GET_CLASS(dev);
++
++    /* reset virtio-gpu */
++    if (klass->parent_phases.hold) {
++        klass->parent_phases.hold(obj, type);
++    }
++}
++
++static const Property virtio_ramfb_base_properties[] = {
++    DEFINE_VIRTIO_GPU_PCI_PROPERTIES(VirtIOPCIProxy),
++};
++
++static void virtio_ramfb_base_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
++    VirtIORAMFBBaseClass *v = VIRTIO_RAMFB_BASE_CLASS(klass);
++    PCIDeviceClass *pcidev_k = PCI_DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
++    device_class_set_props(dc, virtio_ramfb_base_properties);
++    dc->vmsd = &vmstate_virtio_ramfb;
++    dc->hotpluggable = false;
++    resettable_class_set_parent_phases(rc, NULL, virtio_ramfb_reset_hold, NULL,
++                                       &v->parent_phases);
++
++    k->realize = virtio_ramfb_realize;
++    pcidev_k->class_id = PCI_CLASS_DISPLAY_OTHER;
++}
++
++static const TypeInfo virtio_ramfb_base_info = {
++    .name          = TYPE_VIRTIO_RAMFB_BASE,
++    .parent        = TYPE_VIRTIO_PCI,
++    .instance_size = sizeof(VirtIORAMFBBase),
++    .class_size    = sizeof(VirtIORAMFBBaseClass),
++    .class_init    = virtio_ramfb_base_class_init,
++    .abstract      = true,
++};
++
++#define TYPE_VIRTIO_RAMFB "virtio-ramfb"
++
++typedef struct VirtIORAMFB VirtIORAMFB;
++DECLARE_INSTANCE_CHECKER(VirtIORAMFB, VIRTIO_RAMFB,
++                         TYPE_VIRTIO_RAMFB)
++
++struct VirtIORAMFB {
++    VirtIORAMFBBase parent_obj;
++
++    VirtIOGPU     vdev;
++};
++
++static void virtio_ramfb_inst_initfn(Object *obj)
++{
++    VirtIORAMFB *dev = VIRTIO_RAMFB(obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_GPU);
++    VIRTIO_RAMFB_BASE(dev)->vgpu = VIRTIO_GPU_BASE(&dev->vdev);
++}
++
++static VirtioPCIDeviceTypeInfo virtio_ramfb_info = {
++    .generic_name  = TYPE_VIRTIO_RAMFB,
++    .parent        = TYPE_VIRTIO_RAMFB_BASE,
++    .instance_size = sizeof(VirtIORAMFB),
++    .instance_init = virtio_ramfb_inst_initfn,
++};
++
++static void virtio_ramfb_register_types(void)
++{
++    type_register_static(&virtio_ramfb_base_info);
++    virtio_pci_types_register(&virtio_ramfb_info);
++}
++
++type_init(virtio_ramfb_register_types)
+diff --git a/hw/display/virtio-ramfb.h b/hw/display/virtio-ramfb.h
+new file mode 100644
+index 0000000..ac72f73
+--- /dev/null
++++ b/hw/display/virtio-ramfb.h
+@@ -0,0 +1,28 @@
++#ifndef VIRTIO_RAMFB_H
++#define VIRTIO_RAMFB_H
++
++#include "hw/virtio/virtio-gpu-pci.h"
++#include "hw/display/ramfb.h"
++#include "qom/object.h"
++
++/*
++ * virtio-ramfb-base: This extends VirtioPCIProxy.
++ */
++#define TYPE_VIRTIO_RAMFB_BASE "virtio-ramfb-base"
++OBJECT_DECLARE_TYPE(VirtIORAMFBBase, VirtIORAMFBBaseClass,
++                    VIRTIO_RAMFB_BASE)
++
++struct VirtIORAMFBBase {
++    VirtIOPCIProxy parent_obj;
++
++    VirtIOGPUBase *vgpu;
++    RAMFBState    *ramfb;
++};
++
++struct VirtIORAMFBBaseClass {
++    VirtioPCIClass parent_class;
++
++    ResettablePhases parent_phases;
++};
++
++#endif /* VIRTIO_RAMFB_H */
 diff --git a/hw/tpm/Kconfig b/hw/tpm/Kconfig
 index a466632..28139c4 100644
 --- a/hw/tpm/Kconfig
@@ -1300,6 +1628,153 @@ index 1ee568b..6ecdfca 100644
  #define TPM_IS_SPAPR(chr)                           \
      object_dynamic_cast(OBJECT(chr), TYPE_TPM_SPAPR)
  #define TPM_IS_TIS_I2C(chr)                      \
+diff --git a/ui/iosurface.m b/ui/iosurface.m
+index c25284a..ee99862 100644
+--- a/ui/iosurface.m
++++ b/ui/iosurface.m
+@@ -102,6 +102,10 @@ typedef struct __attribute__((packed)) {
+ static size_t current_shm_size;
+ static uint32_t current_w, current_h, current_stride;
+ 
++/* HellVM 多 console: 只有 active_con 的 switch/update 推到客户端, 其它 console
++ * 的 update 被忽略, 避免多 console 内容混画产生重影 (see 文件尾 dcls[] 说明) */
++static QemuConsole *active_con;
++
+ static _Atomic uint64_t update_seq;
+ 
+ /* guest HID 键盘 LED 状态(由 qemu_add_led_event_handler 回调更新)
+@@ -297,14 +301,18 @@ static void handle_client_msg(uint32_t type, const uint8_t *buf, uint32_t len)
+     }
+ }
+ 
+-/* 在 BQL 下调 dpy_set_ui_info 让 guest virtio-gpu 驱动触发 resize */
++/* 在 BQL 下调 dpy_set_ui_info 让 guest 驱动触发 resize.
++ * HellVM 多 console 下: resize 只发给 active_con, 即用户当前实际在看的 console.
++ * - Linux virtio-gpu (active_con=console[0]): 能 resize, guest 驱动收到后重建 scanout
++ * - Windows / bootmgr ramfb (active_con=console[1]): ramfb 不支持 dpy_ui_info,
++ *   dpy_ui_info_supported() 返回 false, resize 自动变 no-op (ramfb 固定尺寸) */
+ static void handle_resize_req(uint32_t width, uint32_t height)
+ {
+     if (width < 64 || height < 64 || width > 8192 || height > 8192) {
+         return;
+     }
+     bql_lock();
+-    QemuConsole *con = qemu_console_lookup_default();
++    QemuConsole *con = active_con ? active_con : qemu_console_lookup_default();
+     if (con && dpy_ui_info_supported(con)) {
+         QemuUIInfo info = {
+             .width  = width,
+@@ -464,6 +472,31 @@ static void iosurface_switch(DisplayChangeListener *dcl,
+     uint32_t w = surface_width(surface);
+     uint32_t h = surface_height(surface);
+ 
++    /*
++     * HellVM 两者兼得关键:忽略 placeholder surface, 保留上一次真实显示。
++     * 场景:virtio-ramfb/多显示设备下, virtio-gpu 的 disable_scanout 会 replace
++     * 为 NULL → QEMU 生成带 "Display output is not active" 文字的 placeholder.
++     * 直接画它会覆盖 ramfb 已经展示的 bootmgr/WinPE 画面。忽略 placeholder
++     * 后, Swift 客户端继续显示上一次真实 surface 直到有新真实 surface 出现。
++     */
++    if (surface_is_placeholder(surface)) {
++        info_report("[iosurface] skip placeholder %ux%u (keep last real)", w, h);
++        return;
++    }
++
++    /* 多 console 支持:
++     * 只有 "active_con 自己的 surface 换了大小" 才进 alloc + switch 流程, 因为
++     * 这通常是用户主动 resize 造成的, guest 驱动会很快重绘。
++     * 其它 console 的 switch(通常是 guest 驱动重设 scanout, 新 surface 还没填像素)
++     * 不立即切 active_con, 否则会瞬间把用户正在看的 console 切到一块全黑 surface。
++     * active_con 的真正切换发生在 iosurface_update 里(有像素写入时)。 */
++    if (active_con != NULL && active_con != dcl->con) {
++        /* 另一个 console 的 switch: 不抢 active. 像素暂时不同步, 等它有 update 时再接管 */
++        return;
++    }
++
++    active_con = dcl->con;
++
+     int new_fd = -1;
+     uint8_t *new_pixels = NULL;
+     size_t new_size = 0;
+@@ -508,6 +541,25 @@ static void iosurface_update(DisplayChangeListener *dcl,
+     if (!surface) {
+         return;
+     }
++    /* 同样过滤 placeholder */
++    if (surface_is_placeholder(surface)) {
++        return;
++    }
++
++    /* 多 console 策略: 如果 active_con 还没定, 或这是第一个真正写像素的 console,
++     * 就让它接管 active. 但另一个 console 的 dangling switch (resize 后空 surface,
++     * 但没 update) 不会抢 active_con —— 避免拖动窗口被切到全黑 surface。 */
++    if (active_con == NULL) {
++        active_con = dcl->con;
++    } else if (dcl->con != active_con) {
++        /* 另一个 console 真的来 update 像素了, 认为用户想切显示源头 */
++        active_con = dcl->con;
++        /* 落入下方 switch 逻辑——需要 alloc 新 shmfb 匹配这个 console 的尺寸 */
++        DisplaySurface *s = qemu_console_surface(active_con);
++        if (s) {
++            iosurface_switch(dcl, s);
++        }
++    }
+ 
+     pthread_mutex_lock(&state_mtx);
+     copy_region_locked(surface, x, y, w, h);
+@@ -597,9 +649,18 @@ struct __attribute__((packed)) {
+     .dpy_cursor_define    = iosurface_cursor_define,
+ };
+ 
+-static DisplayChangeListener dcl = {
+-    .ops = &dcl_ops,
+-};
++/*
++ * HellVM 多 console 支持:
++ * 同一 VM 可能有多个 graphic console(例:virtio-gpu-pci 产生 console[0],
++ * ramfb standalone 产生 console[1]). EDK2 / bootmgr 会挑其中一个 GOP 来画.
++ * 策略:对每个 graphic console 注册 DCL, 谁最近一次 switch 到真实 surface
++ * 谁就成为 "active_con", 只有 active_con 的 update 会拷贝像素和推给客户端,
++ * 其它 console 的 update/placeholder 被忽略 —— 避免多 console 像素混画产生重影.
++ */
++#define MAX_DCLS 4
++static DisplayChangeListener dcls[MAX_DCLS];
++static int dcl_count = 0;
++/* active_con 声明在文件顶部, 见 state 全局变量块旁; 这里只是为了文字记录 */
+ 
+ /* ---------- LED 回调 (guest HID output report 触发) ---------- */
+ 
+@@ -635,8 +696,28 @@ static void iosurface_display_init(DisplayState *ds, DisplayOptions *opts)
+         exit(1);
+     }
+ 
+-    dcl.con = qemu_console_lookup_default();
+-    register_displaychangelistener(&dcl);
++    /* 枚举所有 graphic console, 为每一个注册一个 DCL.
++     * 所有 DCL 共享 current_* shmfb; placeholder filter 保证不同 console 之间
++     * 不会互相覆盖有效内容. */
++    for (unsigned i = 0; i < MAX_DCLS; i++) {
++        QemuConsole *c = qemu_console_lookup_by_index(i);
++        if (!c) break;
++        if (!qemu_console_is_graphic(c)) continue;
++        if (dcl_count >= MAX_DCLS) break;
++        dcls[dcl_count].ops = &dcl_ops;
++        dcls[dcl_count].con = c;
++        register_displaychangelistener(&dcls[dcl_count]);
++        info_report("[iosurface] attached DCL to console[%u]", i);
++        dcl_count++;
++    }
++    if (dcl_count == 0) {
++        /* 兜底: 没有 graphic console 也要注册一个, 否则无显示 */
++        dcls[0].ops = &dcl_ops;
++        dcls[0].con = qemu_console_lookup_default();
++        register_displaychangelistener(&dcls[0]);
++        dcl_count = 1;
++        info_report("[iosurface] no graphic console, fallback to default");
++    }
+ 
+     /* 订阅键盘 LED 变化: guest HID output report 会走 kbd_put_ledstate */
+     qemu_add_led_event_handler(iosurface_leds_updated, NULL);
 -- 
 2.50.1 (Apple Git-155)
 

@@ -150,12 +150,32 @@ public struct DisplayConfig: Codable, Sendable {
     public var height: Int
     public var enabled: Bool
 
-    public static let `default` = DisplayConfig(width: 1280, height: 800, enabled: true)
+    /// 启用 virtio-gpu-pci(在 ramfb 之外再挂一块 virtio-gpu):
+    /// - Linux/Asahi 等 guest: 能用 virtio-gpu 驱动加速, 支持高分辨率 ✓
+    /// - Windows ARM64 安装盘: **bootmgr 在 virtio-gpu 存在时会挂死**, 必须关
+    ///   默认 true (Linux 友好); 装 Windows 的 VM 显式设为 false
+    public var virtioGpu: Bool
 
-    public init(width: Int, height: Int, enabled: Bool) {
+    public static let `default` = DisplayConfig(width: 1280, height: 800, enabled: true, virtioGpu: true)
+
+    public init(width: Int, height: Int, enabled: Bool, virtioGpu: Bool = true) {
         self.width = width
         self.height = height
         self.enabled = enabled
+        self.virtioGpu = virtioGpu
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case width, height, enabled, virtioGpu
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.width     = try c.decode(Int.self, forKey: .width)
+        self.height    = try c.decode(Int.self, forKey: .height)
+        self.enabled   = try c.decode(Bool.self, forKey: .enabled)
+        /* 兼容旧 config(无 virtioGpu 字段): 默认 true */
+        self.virtioGpu = try c.decodeIfPresent(Bool.self, forKey: .virtioGpu) ?? true
     }
 }
 
@@ -180,6 +200,13 @@ public struct BootConfig: Codable, Sendable, Equatable {
     /// 排查启动问题时打开,日志来源:EDK2 PEI/DXE/BDS/bootmgr debug 文本。
     public var serialDebug: Bool
 
+    /// 自动绕过 Win11 系统要求检查(CPU 白名单/Secure Boot/TPM/RAM/存储):
+    /// 生成一个小 ISO 只放 `AutoUnattend.xml`, 挂为第二个 USB 存储. Win Setup
+    /// 会自动扫描并在 windowsPE 阶段跑里面的 `reg add HKLM\...\LabConfig` 写入
+    /// 5 个 Bypass*Check DWORD=1, 从而绕过所有硬件检查.
+    /// 用户的原版 ISO 完全不动, 关掉此开关时不挂. 默认 false, Win11 VM 建议开.
+    public var bypassWin11Checks: Bool
+
     public init(
         isoPath: String? = nil,
         kernelPath: String? = nil,
@@ -188,7 +215,8 @@ public struct BootConfig: Codable, Sendable, Equatable {
         efi: Bool = true,
         graphical: Bool = true,
         tpm: Bool = false,
-        serialDebug: Bool = false
+        serialDebug: Bool = false,
+        bypassWin11Checks: Bool = false
     ) {
         self.isoPath = isoPath
         self.kernelPath = kernelPath
@@ -198,10 +226,11 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.graphical = graphical
         self.tpm = tpm
         self.serialDebug = serialDebug
+        self.bypassWin11Checks = bypassWin11Checks
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical, tpm, serialDebug
+        case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical, tpm, serialDebug, bypassWin11Checks
     }
 
     public init(from decoder: Decoder) throws {
@@ -217,5 +246,7 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.tpm           = try c.decodeIfPresent(Bool.self,   forKey: .tpm)       ?? false
         // 兼容旧 config(无 serialDebug 字段): 默认 false
         self.serialDebug   = try c.decodeIfPresent(Bool.self,   forKey: .serialDebug) ?? false
+        // 兼容旧 config(无 bypassWin11Checks 字段): 默认 false
+        self.bypassWin11Checks = try c.decodeIfPresent(Bool.self, forKey: .bypassWin11Checks) ?? false
     }
 }

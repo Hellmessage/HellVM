@@ -35,6 +35,7 @@
 VMConfig 里 `boot.serialDebug: Bool` 开关控制是否把 guest 串口重定向到 `<bundle>/logs/edk2.log`。默认 false。
 
 使用流程:
+
 1. 编辑目标 VM 的 `config.json`, 在 `boot` 里加 `"serialDebug": true`
 2. 启动 VM, 复现启动失败场景
 3. 读 `<bundle>/logs/edk2.log`, 里面有:

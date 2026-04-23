@@ -93,10 +93,16 @@ final class FramebufferHostView: MTKView {
 
     override func layout() {
         super.layout()
+        // abs 坐标归一化用 points 单位, 与 event.locationInWindow 一致,
+        // 避免 Retina 下 point/pixel 比例错配导致 guest 光标只能到画面中点。
+        let ptWidth  = Int(bounds.width)
+        let ptHeight = Int(bounds.height)
+        inputForwarder?.updateViewSize(width: ptWidth, height: ptHeight)
+
+        // guest 物理分辨率必须是像素
         let scale = window?.backingScaleFactor ?? 1.0
         let pxWidth  = Int(bounds.width  * scale)
         let pxHeight = Int(bounds.height * scale)
-        inputForwarder?.updateViewSize(width: pxWidth, height: pxHeight)
         onResize?(UInt32(max(pxWidth, 64)), UInt32(max(pxHeight, 64)))
     }
 

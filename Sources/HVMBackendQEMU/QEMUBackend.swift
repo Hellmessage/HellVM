@@ -253,6 +253,114 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         stateContinuation.yield(new)
     }
 
+    /// 生成 AutoUnattend.xml + 打包成小 ISO, 给 Win11 Setup 自动消费以绕过系统要求检查.
+    /// 在 windowsPE pass 阶段预置 5 个 Bypass*Check DWORD=1, 安装器跑完它们再做硬件检查.
+    /// ISO 只在缺失或 XML 变化时重新生成, 避免每次启动重打 ISO 浪费时间.
+    private func prepareUnattendISO() throws {
+        let xml = Self.unattendXML
+        let stageDir = bundle.url.appendingPathComponent(".unattend-stage")
+        /* 文件名三份都写: 不同版本 Windows Setup 对大小写的要求不统一.
+         * - Autounattend.xml (A 大写, MS docs 官方)
+         * - autounattend.xml (全小写, Win11 24H2 观察到更可靠)
+         * - unattend.xml (兜底) */
+        let canonicalURL = stageDir.appendingPathComponent("Autounattend.xml")
+        let lowerURL = stageDir.appendingPathComponent("autounattend.xml")
+        let shortURL = stageDir.appendingPathComponent("unattend.xml")
+        let isoURL = bundle.unattendIsoURL
+
+        let fm = FileManager.default
+
+        // 如果 ISO 已存在且 XML 内容未变, 直接用
+        if fm.fileExists(atPath: isoURL.path),
+           fm.fileExists(atPath: canonicalURL.path),
+           let existing = try? String(contentsOf: canonicalURL, encoding: .utf8),
+           existing == xml {
+            return
+        }
+
+        // 重建 stage 目录
+        try? fm.removeItem(at: stageDir)
+        try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        try xml.write(to: canonicalURL, atomically: true, encoding: .utf8)
+        try xml.write(to: lowerURL, atomically: true, encoding: .utf8)
+        try xml.write(to: shortURL, atomically: true, encoding: .utf8)
+
+        // 用 macOS 自带的 hdiutil makehybrid 打 ISO9660+UDF 混合(Win 两层都能读)
+        try? fm.removeItem(at: isoURL)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        proc.arguments = [
+            "makehybrid",
+            "-udf", "-iso",
+            "-iso-volume-name", "HELLVM_UNATTEND",
+            "-udf-volume-name", "HELLVM_UNATTEND",
+            "-o", isoURL.path,
+            stageDir.path,
+        ]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 {
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                             encoding: .utf8) ?? ""
+            throw VMError.startFailed("hdiutil makehybrid 失败 (status=\(proc.terminationStatus)): \(out)")
+        }
+        log.info(.qemu, "[bypassWin11Checks] 已生成 \(isoURL.path)")
+    }
+
+    /// AutoUnattend.xml 内容
+    /// windowsPE pass 阶段跑 5 个 reg add, 写 HKLM\SYSTEM\Setup\LabConfig 下的
+    /// Bypass*Check DWORD=1。这些值会让 Setup 的硬件检查模块跳过 TPM/SB/RAM/CPU/存储。
+    /// 该 XML 和 Microsoft 官方 unattend schema 兼容,Setup 自动扫描移动介质根目录.
+    ///
+    /// 格式约定:
+    /// - 命令无引号, `/f` 放末尾(与 Microsoft docs 示例保持一致)
+    /// - DWORD 值用 `0x1` 十六进制(某些 Setup 版本对十进制不识别)
+    /// - 第一条先显式 create LabConfig 节, 避免并行 reg add 在 key 不存在时失败
+    private static let unattendXML: String = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <unattend xmlns="urn:schemas-microsoft-com:unattend">
+      <settings pass="windowsPE">
+        <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+          <RunSynchronous>
+            <RunSynchronousCommand wcm:action="add">
+              <Order>1</Order>
+              <Path>reg add HKLM\\System\\Setup\\LabConfig /f</Path>
+              <Description>create LabConfig</Description>
+            </RunSynchronousCommand>
+            <RunSynchronousCommand wcm:action="add">
+              <Order>2</Order>
+              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 0x1 /f</Path>
+            </RunSynchronousCommand>
+            <RunSynchronousCommand wcm:action="add">
+              <Order>3</Order>
+              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 0x1 /f</Path>
+            </RunSynchronousCommand>
+            <RunSynchronousCommand wcm:action="add">
+              <Order>4</Order>
+              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassRAMCheck /t REG_DWORD /d 0x1 /f</Path>
+            </RunSynchronousCommand>
+            <RunSynchronousCommand wcm:action="add">
+              <Order>5</Order>
+              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassCPUCheck /t REG_DWORD /d 0x1 /f</Path>
+            </RunSynchronousCommand>
+            <RunSynchronousCommand wcm:action="add">
+              <Order>6</Order>
+              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassStorageCheck /t REG_DWORD /d 0x1 /f</Path>
+            </RunSynchronousCommand>
+            <RunSynchronousCommand wcm:action="add">
+              <Order>7</Order>
+              <Path>reg add HKLM\\System\\Setup\\MoSetup /v AllowUpgradesWithUnsupportedTPMOrCPU /t REG_DWORD /d 0x1 /f</Path>
+              <Description>legacy upgrade-path bypass</Description>
+            </RunSynchronousCommand>
+          </RunSynchronous>
+        </component>
+      </settings>
+    </unattend>
+    """
+
     /// 每个 VM 有自己的 EFI 变量存储(首次启动时从模板复制)
     private func prepareEFIVars() throws -> URL {
         let dst = bundle.efiDirURL.appendingPathComponent("vars.fd")
@@ -411,6 +519,19 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             }
         }
 
+        // Win11 系统要求 bypass: 挂第二个小 CD, 只含 AutoUnattend.xml, Win Setup 自动识别
+        if config.boot.bypassWin11Checks && config.boot.graphical {
+            do {
+                try prepareUnattendISO()
+                args += [
+                    "-drive", "if=none,id=cdrom_unattend,media=cdrom,file=\(bundle.unattendIsoURL.path),readonly=on",
+                    "-device", "usb-storage,drive=cdrom_unattend,removable=true,bus=usbbus.0",
+                ]
+            } catch {
+                log.warn(.qemu, "[bypassWin11Checks] 生成 unattend ISO 失败: \(error)")
+            }
+        }
+
         // TPM 2.0(swtpm + tpm-crb-device): Windows 首选 CRB 接口
         // 我们已把 UTM 的 tpm_crb_sysbus 补丁 port 到 QEMU, 现在 aarch64 也支持 tpm-crb-device
         if let sockPath = tpmSocketPath {
@@ -428,8 +549,14 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         args += buildNetArgs(config.networks)
 
         if config.boot.graphical {
-            // 图形模式: 只留 ramfb, 去掉 virtio-gpu-pci, 避免 Win bootmgr 在两个 GOP 间犹豫
-            // 早期 bootloader(bootmgfw)和 Windows 内核安装阶段都能用 ramfb 完成显示
+            // 图形模式: 根据 display.virtioGpu 决定显示设备组合
+            // - true (Linux/Asahi 等): virtio-gpu-pci + ramfb, 可加速, iosurface
+            //   backend 用 active_con 选择机制防止多 console 画面重影
+            // - false (Windows 安装盘): 只挂 ramfb, 避免 Win bootmgr 在 virtio-gpu
+            //   存在时挂死
+            if config.display.virtioGpu {
+                args += ["-device", "virtio-gpu-pci"]
+            }
             args += ["-device", "ramfb"]
             // USB HID 键鼠(挂到前面已定义的 usbbus 上)
             args += ["-device", "usb-kbd,bus=usbbus.0"]
