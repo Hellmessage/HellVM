@@ -126,8 +126,17 @@ for f in target tools_def build_rule; do
 done
 export PATH="$EDK_TOOLS_PATH/Bin/${PY_ARCH:-Posix}:$EDK_TOOLS_PATH/BinWrappers/PosixLike:$PATH"
 
-echo "==> 编译 BaseTools (首次 ~2 分钟)"
-make -C "$EDK_TOOLS_PATH" -j"$(sysctl -n hw.ncpu)"
+# 增量跳过: 若 BaseTools 产物已存在, 且 C 源码自产物生成后没动过, 跳过 make.
+# GenFv 是 BaseTools 必产物, 作为 sentinel 判断是否已编译过.
+BASETOOLS_SENTINEL="$EDK_TOOLS_PATH/Source/C/bin/GenFv"
+if [ -x "$BASETOOLS_SENTINEL" ] \
+   && ! find "$EDK_TOOLS_PATH/Source" -type f \( -name '*.c' -o -name '*.h' -o -name 'Makefile*' \) \
+        -newer "$BASETOOLS_SENTINEL" -print -quit 2>/dev/null | grep -q .; then
+    echo "==> BaseTools 已是最新, 跳过重编 (删 $EDK_TOOLS_PATH/Source/C/bin 强制重编)"
+else
+    echo "==> 编译 BaseTools (首次 ~2 分钟)"
+    make -C "$EDK_TOOLS_PATH" -j"$(sysctl -n hw.ncpu)"
+fi
 
 # ---------- 5. 配置交叉工具链 ----------
 export GCC5_AARCH64_PREFIX="$TOOLCHAIN_PREFIX"

@@ -227,6 +227,19 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         stateContinuation.yield(new)
     }
 
+    /// 清理可能存在的路径(文件或目录,幂等)
+    /// 不存在直接跳过, 存在但删除失败写 warn 日志, 不抛错(清理路径是 best-effort).
+    /// - Parameter label: 用于日志里识别清理对象的人类可读描述
+    private func removeIfExists(_ url: URL, label: String) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return }
+        do {
+            try fm.removeItem(at: url)
+        } catch {
+            log.warn(.qemu, "清理 \(label) 失败 (\(url.path)): \(error.localizedDescription)")
+        }
+    }
+
     /// 生成 AutoUnattend.xml + 打包成小 ISO, 给 Win11 Setup 自动消费以绕过系统要求检查.
     /// 在 windowsPE pass 阶段预置 5 个 Bypass*Check DWORD=1, 安装器跑完它们再做硬件检查.
     /// ISO 只在缺失或 XML 变化时重新生成, 避免每次启动重打 ISO 浪费时间.
@@ -253,14 +266,14 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         }
 
         // 重建 stage 目录
-        try? fm.removeItem(at: stageDir)
+        removeIfExists(stageDir, label: "unattend stage 目录")
         try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
         try xml.write(to: canonicalURL, atomically: true, encoding: .utf8)
         try xml.write(to: lowerURL, atomically: true, encoding: .utf8)
         try xml.write(to: shortURL, atomically: true, encoding: .utf8)
 
         // 用 macOS 自带的 hdiutil makehybrid 打 ISO9660+UDF 混合(Win 两层都能读)
-        try? fm.removeItem(at: isoURL)
+        removeIfExists(isoURL, label: "旧 unattend ISO")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
         proc.arguments = [
@@ -410,7 +423,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         let fm = FileManager.default
         try fm.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: bundle.logsDirURL, withIntermediateDirectories: true)
-        try? fm.removeItem(at: sockURL)  // 陈旧 socket 清理
+        removeIfExists(sockURL, label: "陈旧 swtpm socket")
 
         let swtpmArgs = [
             "socket",
@@ -603,7 +616,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             if config.boot.serialDebug {
                 // 诊断模式:guest 串口写到 edk2.log, 抓 EDK2 / bootmgr / kernel early debug
                 // 每次启动前先清旧内容(QEMU -serial file: 是 append 模式, 不清就无限增长)
-                try? FileManager.default.removeItem(at: bundle.edk2LogURL)
+                removeIfExists(bundle.edk2LogURL, label: "旧 edk2.log")
                 try FileManager.default.createDirectory(at: bundle.logsDirURL, withIntermediateDirectories: true)
                 args += ["-serial", "file:\(bundle.edk2LogURL.path)"]
             } else {
@@ -656,7 +669,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
                 // socket_vmnet 约定: QEMU 以 unix stream 连 helper socket, helper 把
                 // 以太网帧转进 vmnet.framework。每个 NIC 独立连自己的 socket,
                 // 允许同一 VM 跨多个 vmnet 模式(例: 一张 shared 上网 + 一张 bridged 暴露服务)。
-                let sock = net.effectiveSocketPath ?? "/var/run/socket_vmnet"
+                let sock = net.effectiveSocketPath ?? SocketPaths.vmnetShared
                 out += ["-netdev", "stream,id=\(netdevID),addr.type=unix,addr.path=\(sock)"]
                 out += ["-device", deviceOpts]
             case .none:

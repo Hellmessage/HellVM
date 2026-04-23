@@ -42,14 +42,14 @@ public enum VMnetSupervisor {
     /// 列出当前系统上已就绪的 vmnet socket, 给 "网络诊断" 面板展示.
     public static func presentSockets() -> (shared: Bool, host: Bool, bridged: [String]) {
         let fm = FileManager.default
-        let shared = fm.fileExists(atPath: "/var/run/socket_vmnet")
-        let host   = fm.fileExists(atPath: "/var/run/socket_vmnet.host")
+        let shared = fm.fileExists(atPath: SocketPaths.vmnetShared)
+        let host   = fm.fileExists(atPath: SocketPaths.vmnetHost)
         // bridged.<iface> 扫一遍 /var/run
         var bridged: [String] = []
         let runURL = URL(fileURLWithPath: "/var/run")
         if let items = try? fm.contentsOfDirectory(atPath: runURL.path) {
             for name in items {
-                let prefix = "socket_vmnet.bridged."
+                let prefix = (SocketPaths.vmnetBase as NSString).lastPathComponent + ".bridged."
                 if name.hasPrefix(prefix) {
                     bridged.append(String(name.dropFirst(prefix.count)))
                 }

@@ -109,6 +109,80 @@ done
 DYLIB_COUNT=$(find "$FRAMEWORKS" -maxdepth 1 -name "*.dylib" 2>/dev/null | wc -l | tr -d ' ')
 echo "    共收集 $DYLIB_COUNT 个 dylib"
 
+# ---------- 6a. dylib 传递依赖二次重写 ----------
+# collect-dylibs.sh 递归有时会漏改 FRAMEWORKS 内 dylib 之间的传递依赖
+# (already_seen 命中时只 cp 不重写内部 LC_LOAD_DYLIB)。这里做 closure pass:
+# 遍历 FRAMEWORKS, 对每个非 /usr/lib / @rpath 的依赖, 若同名 dylib 已在
+# FRAMEWORKS 里, 改成 @rpath/<name>。
+echo "==> 二次重写 dylib 传递依赖 (@rpath 闭包)"
+rewrite_dylib_paths() {
+    local target="$1"
+    chmod u+w "$target" 2>/dev/null || true
+    # 修 LC_ID_DYLIB
+    local id
+    id=$(otool -D "$target" 2>/dev/null | tail -n +2 | awk '{$1=$1};1')
+    case "$id" in
+        /opt/homebrew/*|/usr/local/*)
+            install_name_tool -id "@rpath/$(basename "$target")" "$target" 2>/dev/null || true
+            ;;
+    esac
+    # 修 LC_LOAD_DYLIB
+    while IFS= read -r dep; do
+        case "$dep" in
+            /opt/homebrew/*|/usr/local/*)
+                local name
+                name=$(basename "$dep")
+                if [ -f "$FRAMEWORKS/$name" ]; then
+                    install_name_tool -change "$dep" "@rpath/$name" "$target" 2>/dev/null || true
+                fi
+                ;;
+        esac
+    done < <(otool -L "$target" 2>/dev/null | tail -n +2 | awk '{print $1}')
+}
+for d in "$FRAMEWORKS"/*.dylib; do
+    [ -f "$d" ] || continue
+    rewrite_dylib_paths "$d"
+done
+for b in "$RES_QEMU/bin/"qemu-*; do
+    [ -f "$b" ] || continue
+    rewrite_dylib_paths "$b"
+done
+
+# ---------- 6b. dylib 依赖完整性检查 ----------
+# 所有 QEMU 二进制 + Frameworks 里的 dylib, 其依赖路径必须只是:
+#   /usr/lib/*, /System/*              — macOS 系统库
+#   @rpath/*, @executable_path/*, @loader_path/*  — bundle 内相对路径
+# 任何残留的 /opt/homebrew/ 或 /usr/local/ 说明 collect-dylibs.sh 漏拷了传递依赖
+echo "==> 校验 dylib 传递依赖"
+FAILED=0
+check_dylib_deps() {
+    local target="$1"
+    local bad
+    bad=$(otool -L "$target" 2>/dev/null \
+          | tail -n +2 \
+          | awk '{print $1}' \
+          | grep -vE '^(/usr/lib/|/System/|@rpath/|@executable_path/|@loader_path/)' \
+          | grep -v "^$target:$" || true)
+    if [ -n "$bad" ]; then
+        echo "    ❌ $(basename "$target") 引用未打包的库:"
+        echo "$bad" | sed 's/^/        /'
+        FAILED=1
+    fi
+}
+for b in "$RES_QEMU/bin/"qemu-*; do
+    [ -f "$b" ] || continue
+    check_dylib_deps "$b"
+done
+for d in "$FRAMEWORKS"/*.dylib; do
+    [ -f "$d" ] || continue
+    check_dylib_deps "$d"
+done
+if [ "$FAILED" = 1 ]; then
+    echo "==> dylib 依赖完整性检查失败, 请检查 scripts/collect-dylibs.sh 是否遗漏"
+    exit 1
+fi
+echo "    所有二进制/dylib 只引用系统库或 @rpath, 自包含"
+
 # ---------- 7. 签名(自下而上) ----------
 SIGN_ID="$(resolve_sign_identity)"
 echo "==> 签名 (身份: $SIGN_ID)"

@@ -12,3 +12,6 @@ Package.resolved
 *.swp
 /.vscode/*.log
 /.cursor/
+
+# 虚拟机驱动
+driver/virtio-win.iso

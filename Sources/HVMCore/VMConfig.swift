@@ -155,18 +155,15 @@ public struct NetworkConfig: Codable, Sendable {
     }
 
     /// 推导实际使用的 socket 路径(vmnet* 模式): 用户显式填 socketVmnetPath 优先,
-    /// 否则按模式约定:
-    ///   shared  → /var/run/socket_vmnet
-    ///   host    → /var/run/socket_vmnet.host
-    ///   bridged → /var/run/socket_vmnet.bridged.<iface>
+    /// 否则走 SocketPaths 集中的标准约定。
     public var effectiveSocketPath: String? {
         if let p = socketVmnetPath, !p.isEmpty { return p }
         switch mode {
-        case .vmnetShared:  return "/var/run/socket_vmnet"
-        case .vmnetHost:    return "/var/run/socket_vmnet.host"
+        case .vmnetShared:  return SocketPaths.vmnetShared
+        case .vmnetHost:    return SocketPaths.vmnetHost
         case .vmnetBridged:
             let iface = (bridgedInterface?.isEmpty == false) ? bridgedInterface! : "en0"
-            return "/var/run/socket_vmnet.bridged.\(iface)"
+            return SocketPaths.vmnetBridged(interface: iface)
         case .user, .none:  return nil
         }
     }

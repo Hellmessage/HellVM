@@ -58,7 +58,7 @@ public enum NICHotplug {
             netdevArgs["type"] = "user"
         case .vmnetShared, .vmnetHost, .vmnetBridged:
             netdevArgs["type"] = "stream"
-            let sock = net.effectiveSocketPath ?? "/var/run/socket_vmnet"
+            let sock = net.effectiveSocketPath ?? SocketPaths.vmnetShared
             netdevArgs["addr"] = ["type": "unix", "data": ["path": sock]]
         case .none:
             return   // 禁用的 NIC 不 attach

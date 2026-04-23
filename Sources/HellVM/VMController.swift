@@ -202,9 +202,7 @@ struct VMController {
                         sizeGB: UInt64,
                         format: DiskConfig.Format,
                         fileName: String? = nil) async throws {
-        guard !item.bundle.isRunning() else {
-            throw VMError.invalidConfig("VM 正在运行,请先停机再操作磁盘")
-        }
+        try requireStoppedForDiskOp(item)
         guard sizeGB >= 1 && sizeGB <= 8192 else {
             throw VMError.invalidConfig("磁盘大小需在 1-8192 GB 之间")
         }
@@ -243,12 +241,8 @@ struct VMController {
     static func removeDisk(_ item: VMListItem,
                            store: VMListStore,
                            at index: Int) throws {
-        guard !item.bundle.isRunning() else {
-            throw VMError.invalidConfig("VM 正在运行,请先停机再操作磁盘")
-        }
-        guard index >= 0 && index < item.config.disks.count else {
-            throw VMError.invalidConfig("磁盘序号越界: \(index)")
-        }
+        try requireStoppedForDiskOp(item)
+        try requireValidDiskIndex(index, in: item.config.disks)
         guard item.config.disks.count > 1 else {
             throw VMError.invalidConfig("至少保留一块磁盘")
         }
@@ -268,12 +262,8 @@ struct VMController {
                            store: VMListStore,
                            at index: Int,
                            newSizeGB: UInt64) async throws {
-        guard !item.bundle.isRunning() else {
-            throw VMError.invalidConfig("VM 正在运行,请先停机再操作磁盘")
-        }
-        guard index >= 0 && index < item.config.disks.count else {
-            throw VMError.invalidConfig("磁盘序号越界: \(index)")
-        }
+        try requireStoppedForDiskOp(item)
+        try requireValidDiskIndex(index, in: item.config.disks)
         let disk = item.config.disks[index]
         guard newSizeGB > disk.sizeGB else {
             throw VMError.invalidConfig("只支持扩容(当前 \(disk.sizeGB)G → 目标 \(newSizeGB)G)")
@@ -294,12 +284,8 @@ struct VMController {
                             store: VMListStore,
                             at index: Int,
                             to newFormat: DiskConfig.Format) async throws {
-        guard !item.bundle.isRunning() else {
-            throw VMError.invalidConfig("VM 正在运行,请先停机再操作磁盘")
-        }
-        guard index >= 0 && index < item.config.disks.count else {
-            throw VMError.invalidConfig("磁盘序号越界: \(index)")
-        }
+        try requireStoppedForDiskOp(item)
+        try requireValidDiskIndex(index, in: item.config.disks)
         let disk = item.config.disks[index]
         guard disk.format != newFormat else { return }
 
@@ -333,16 +319,29 @@ struct VMController {
                          store: VMListStore,
                          from: Int,
                          to: Int) throws {
-        guard !item.bundle.isRunning() else {
-            throw VMError.invalidConfig("VM 正在运行,请先停机再操作磁盘")
-        }
+        try requireStoppedForDiskOp(item)
         try updateConfig(item, store: store) { cfg in
-            guard from >= 0 && from < cfg.disks.count,
-                  to >= 0 && to < cfg.disks.count else {
-                throw VMError.invalidConfig("磁盘序号越界")
-            }
+            try requireValidDiskIndex(from, in: cfg.disks)
+            try requireValidDiskIndex(to, in: cfg.disks)
             let d = cfg.disks.remove(at: from)
             cfg.disks.insert(d, at: to)
+        }
+    }
+
+    // MARK: - 磁盘操作共用辅助
+
+    /// 所有磁盘操作共同前提: VM 必须处于停机态(qemu-img 直接读写磁盘, 运行中改会损坏)
+    @MainActor
+    private static func requireStoppedForDiskOp(_ item: VMListItem) throws {
+        if item.bundle.isRunning() {
+            throw VMError.invalidConfig("VM 正在运行,请先停机再操作磁盘")
+        }
+    }
+
+    /// 校验磁盘索引是否在 [0, disks.count) 区间, 否则抛 invalidConfig
+    private static func requireValidDiskIndex(_ index: Int, in disks: [DiskConfig]) throws {
+        guard index >= 0 && index < disks.count else {
+            throw VMError.invalidConfig("磁盘序号越界: \(index)")
         }
     }
 
