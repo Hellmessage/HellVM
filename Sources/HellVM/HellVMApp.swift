@@ -14,7 +14,7 @@ struct HellVMApp: App {
         WindowGroup {
             MainView()
                 .preferredColorScheme(.dark)
-                .frame(minWidth: 960, minHeight: 600)
+                .frame(minWidth: 1060, minHeight: 600)
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
@@ -108,23 +108,25 @@ final class HellVMAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static func shutdownOne(_ bundle: VMBundle) async {
-        let qmp = QMPClient()
         do {
-            try await qmp.connect(socketPath: bundle.qmpSocketURL.path)
-            _ = try await qmp.execute("system_powerdown")
-            await qmp.close()
+            try await QMPClient.withSession(socketPath: bundle.qmpSocketURL.path) { qmp in
+                _ = try await qmp.execute("system_powerdown")
+            }
         } catch {
             log.warn(.backend, "QMP system_powerdown failed for \(bundle.url.lastPathComponent): \(error)")
         }
 
-        // 等退出, 轮询 PID, 上限 20s
-        for _ in 0..<40 {
+        // 等 VM 自己关机, 轮询 PID 是否消失
+        let shutdownTimeoutSec = 20
+        let pollIntervalMs: UInt64 = 500
+        let iterations = shutdownTimeoutSec * 1_000 / Int(pollIntervalMs)
+        for _ in 0..<iterations {
             if !bundle.isRunning() { return }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: pollIntervalMs * 1_000_000)
         }
         // 超时 → SIGTERM
         if let pid = bundle.readPID() {
-            log.warn(.backend, "shutdown timeout, sending SIGTERM to \(pid)")
+            log.warn(.backend, "shutdown timeout (\(shutdownTimeoutSec)s), sending SIGTERM to \(pid)")
             kill(pid, SIGTERM)
         }
     }

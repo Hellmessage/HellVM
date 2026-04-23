@@ -7,6 +7,7 @@ struct MainView: View {
     @State private var showingWizard: Bool = false
     @State private var pendingDeleteItem: VMListItem?
     @State private var logViewerItem: VMListItem?
+    @State private var errorMessage: String?
 
     var selectedItem: VMListItem? {
         guard let id = selectedID else { return nil }
@@ -63,6 +64,17 @@ struct MainView: View {
                 }
             }
 
+            if let message = errorMessage {
+                ModalOverlay {
+                    ErrorDialog(
+                        title: "操作失败",
+                        message: message,
+                        onClose: { errorMessage = nil }
+                    )
+                    .frame(width: 400)
+                }
+            }
+
             if let item = pendingDeleteItem {
                 ModalOverlay {
                     ConfirmDialog(
@@ -72,10 +84,15 @@ struct MainView: View {
                         destructive: true,
                         onCancel: { pendingDeleteItem = nil },
                         onConfirm: {
-                            do { try VMController.remove(item) } catch {}
-                            pendingDeleteItem = nil
-                            store.refresh()
-                            if selectedID == item.id { selectedID = nil }
+                            do {
+                                try VMController.remove(item)
+                                pendingDeleteItem = nil
+                                store.refresh()
+                                if selectedID == item.id { selectedID = nil }
+                            } catch {
+                                pendingDeleteItem = nil
+                                errorMessage = "删除「\(item.config.name)」失败:\(error.localizedDescription)"
+                            }
                         }
                     )
                     .frame(width: 400)

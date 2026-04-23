@@ -18,6 +18,27 @@ public actor QMPClient {
 
     public init() {}
 
+    // MARK: - 便捷会话
+
+    /// 典型 QMP 用法:连一次、执行几条命令、关掉。
+    /// 把 connect/close 样板收到一起,调用方只写闭包里的命令。
+    /// 即使 body 抛异常,close 也会被执行。
+    public static func withSession<T>(
+        socketPath: String,
+        _ body: (QMPClient) async throws -> T
+    ) async throws -> T {
+        let qmp = QMPClient()
+        do {
+            try await qmp.connect(socketPath: socketPath)
+            let result = try await body(qmp)
+            await qmp.close()
+            return result
+        } catch {
+            await qmp.close()
+            throw error
+        }
+    }
+
     // MARK: - 连接
 
     /// 连接并完成握手

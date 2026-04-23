@@ -120,7 +120,12 @@ struct VMSettingsEditor: View {
                     // 保存前快照旧 networks, 用于运行时热插拔 diff
                     let oldNetworks = item.config.networks
                     let wasRunning = item.bundle.isRunning()
-                    try VMController.updateConfig(item, store: store) { cfg in
+                    try VMController.updateConfig(
+                        item, store: store,
+                        allowWhenRunning: wasRunning   // 运行中仅网络差异会通过校验
+                    ) { cfg in
+                        // 运行中只允许改 networks. 其他字段即使赋值, 由于 readOnly
+                        // draft 仍等于原值, updateConfig 的 hot-safe 比对会放行.
                         cfg.cpuCount  = draft.cpuCount
                         cfg.memoryMB  = draft.memoryMB
                         cfg.boot      = draft.boot

@@ -115,7 +115,7 @@ struct VMRunningBanner: View {
         HStack(spacing: 8) {
             Image(systemName: "info.circle.fill")
                 .foregroundStyle(Theme.warning)
-            Text("VM 运行中 · 设置只读,停机后可编辑")
+            Text("VM 运行中 · 仅网络支持 QMP 热插拔, 其它设置需停机才能改")
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.textPrimary.opacity(0.85))
             Spacer()

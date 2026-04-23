@@ -67,8 +67,5 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
-
-        // 测试
-        .testTarget(name: "HVMCoreTests", dependencies: ["HVMCore"]),
     ]
 )

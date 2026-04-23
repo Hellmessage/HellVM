@@ -552,7 +552,8 @@ func vmSettingsNetworksEqual(_ a: [NetworkConfig], _ b: [NetworkConfig]) -> Bool
            x.macAddress != y.macAddress ||
            x.socketVmnetPath != y.socketVmnetPath ||
            x.bridgedInterface != y.bridgedInterface ||
-           x.deviceModel != y.deviceModel {
+           x.deviceModel != y.deviceModel ||
+           x.enabled != y.enabled {
             return false
         }
     }

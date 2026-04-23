@@ -71,16 +71,9 @@ public struct QEMUPaths: Sendable {
 
     /// 从可执行文件位置回溯项目根下的 Vendor/qemu
     private static func vendorPrefix() -> URL? {
-        var root = URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath()
-            .deletingLastPathComponent()
-        for _ in 0..<6 {
-            let probe = root.appendingPathComponent("Vendor/qemu/bin/qemu-img")
-            if FileManager.default.isExecutableFile(atPath: probe.path) {
-                return root.appendingPathComponent("Vendor/qemu")
-            }
-            root = root.deletingLastPathComponent()
+        guard let root = ProjectRootFinder.ancestor(containing: "Vendor/qemu/bin/qemu-img") else {
+            return nil
         }
-        return nil
+        return root.appendingPathComponent("Vendor/qemu")
     }
 }

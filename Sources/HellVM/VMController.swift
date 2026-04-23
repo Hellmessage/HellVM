@@ -45,11 +45,10 @@ struct VMController {
             return
         }
 
-        let qmp = QMPClient()
         do {
-            try await qmp.connect(socketPath: item.bundle.qmpSocketURL.path)
-            _ = try await qmp.execute("system_powerdown")
-            await qmp.close()
+            try await QMPClient.withSession(socketPath: item.bundle.qmpSocketURL.path) { qmp in
+                _ = try await qmp.execute("system_powerdown")
+            }
         } catch {
             try killPID(item.bundle, signal: SIGTERM)
         }
@@ -63,20 +62,46 @@ struct VMController {
         }
     }
 
+    /// 强制关机 —— 介于"停止"与"断电"之间:
+    /// - 不发 ACPI power button(跳过 guest 优雅关机流程, guest 看起来像瞬间断电)
+    /// - 但通过 QMP `quit` 让 QEMU 进程**自己清理退出**(刷盘/关 fd/结 socket),
+    ///   而不是被 SIGKILL 硬杀, 减少磁盘写入 race 损坏风险
+    /// - QMP 命令失败时 fallback 到 SIGTERM, 再不行才 SIGKILL
+    @MainActor
+    static func forceShutdown(_ item: VMListItem, store: VMListStore, timeout: TimeInterval = 5) async throws {
+        defer { store.releaseBackend(for: item.id) }
+
+        do {
+            try await QMPClient.withSession(socketPath: item.bundle.qmpSocketURL.path) { qmp in
+                _ = try await qmp.execute("quit")
+            }
+        } catch {
+            // QMP socket 已断或不响应, 退而求其次发 SIGTERM
+            try? killPID(item.bundle, signal: SIGTERM)
+        }
+
+        // 短等 QEMU 自退 —— quit/SIGTERM 都应在秒级生效
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline && item.bundle.isRunning() {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        if item.bundle.isRunning() {
+            try killPID(item.bundle, signal: SIGKILL)
+        }
+    }
+
     /// 暂停
     static func pause(_ item: VMListItem) async throws {
-        let qmp = QMPClient()
-        try await qmp.connect(socketPath: item.bundle.qmpSocketURL.path)
-        _ = try await qmp.execute("stop")
-        await qmp.close()
+        try await QMPClient.withSession(socketPath: item.bundle.qmpSocketURL.path) { qmp in
+            _ = try await qmp.execute("stop")
+        }
     }
 
     /// 恢复
     static func resume(_ item: VMListItem) async throws {
-        let qmp = QMPClient()
-        try await qmp.connect(socketPath: item.bundle.qmpSocketURL.path)
-        _ = try await qmp.execute("cont")
-        await qmp.close()
+        try await QMPClient.withSession(socketPath: item.bundle.qmpSocketURL.path) { qmp in
+            _ = try await qmp.execute("cont")
+        }
     }
 
     /// 删除 bundle(要求 VM 已停止)
@@ -264,16 +289,45 @@ struct VMController {
     @discardableResult
     static func updateConfig(_ item: VMListItem,
                              store: VMListStore,
+                             allowWhenRunning: Bool = false,
                              mutate: (inout VMConfig) throws -> Void) throws -> VMConfig {
-        guard !item.bundle.isRunning() else {
+        let running = item.bundle.isRunning()
+        if running && !allowWhenRunning {
             throw VMError.invalidConfig("VM 正在运行,请先停机再修改配置")
         }
-        var cfg = try item.bundle.loadConfig()
+        let original = try item.bundle.loadConfig()
+        var cfg = original
         try mutate(&cfg)
+        if running {
+            // 运行中只允许网络字段改动(走 QMP 热插拔); 其他字段保持不变, 否则拒绝
+            var hotSafe = cfg
+            hotSafe.networks = original.networks
+            if !configsEquivalent(hotSafe, original) {
+                throw VMError.invalidConfig("VM 运行中仅允许改网络, 其它字段请先停机")
+            }
+        }
         try validate(cfg)
         try item.bundle.saveConfig(cfg)
         store.refresh()
         return cfg
+    }
+
+    /// 结构等价比较(忽略 updatedAt). Equatable 合成太烦, 手写关键字段对比更直观.
+    private static func configsEquivalent(_ a: VMConfig, _ b: VMConfig) -> Bool {
+        a.name == b.name &&
+        a.architecture == b.architecture &&
+        a.osType == b.osType &&
+        a.cpuCount == b.cpuCount &&
+        a.memoryMB == b.memoryMB &&
+        a.display == b.display &&
+        a.boot == b.boot &&
+        a.disks.count == b.disks.count &&
+        zip(a.disks, b.disks).allSatisfy {
+            $0.relativePath == $1.relativePath &&
+            $0.sizeGB == $1.sizeGB &&
+            $0.format == $1.format &&
+            $0.readOnly == $1.readOnly
+        }
     }
 
     /// 基础配置校验(CPU/内存区间、磁盘非空等)

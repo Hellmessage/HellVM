@@ -19,6 +19,10 @@ struct VMDetailPane: View {
     @State private var lastError: String?
     @State private var selectedTab: DetailTab = .settings
     @State private var showingLogSettings: Bool = false
+    /// 强制关机确认弹窗
+    @State private var forceShutdownTarget: VMListItem?
+    /// 断电(SIGKILL 拔电)确认弹窗
+    @State private var powerCutTarget: VMListItem?
     @AppStorage("hellvm.detail.showInlineLog") private var showInlineLog: Bool = false
     @ObservedObject private var consoleMgr = ConsoleWindowManager.shared
 
@@ -113,6 +117,46 @@ struct VMDetailPane: View {
         }
         .sheet(isPresented: $showingLogSettings) {
             LogSettingsView(isPresented: $showingLogSettings)
+        }
+        .sheet(item: $forceShutdownTarget) { target in
+            ConfirmDialog(
+                title: "强制关机 \(target.config.name)?",
+                message: """
+                跳过 guest 的优雅关机流程 —— guest 来不及保存未提交的写入, 但 \
+                QEMU 本身会清退刷盘, 数据损坏风险低于"断电"。
+
+                适合 guest 挂死/不响应 ACPI 时快速收场。
+                """,
+                confirmText: "强制关机",
+                destructive: true,
+                onCancel: { forceShutdownTarget = nil },
+                onConfirm: {
+                    forceShutdownTarget = nil
+                    Task {
+                        await runAction { try await VMController.forceShutdown(target, store: store) }
+                    }
+                }
+            )
+            .frame(width: 440)
+        }
+        .sheet(item: $powerCutTarget) { target in
+            ConfirmDialog(
+                title: "断电 \(target.config.name)?",
+                message: """
+                立即 SIGKILL QEMU 进程, 等价于拔掉电源线。 guest 任何未刷盘的写入
+                都会丢失, qcow2 有损坏风险。只在其他方式都失败时使用。
+                """,
+                confirmText: "断电",
+                destructive: true,
+                onCancel: { powerCutTarget = nil },
+                onConfirm: {
+                    powerCutTarget = nil
+                    Task {
+                        await runAction { try await VMController.stop(target, store: store, force: true) }
+                    }
+                }
+            )
+            .frame(width: 440)
         }
     }
 
@@ -255,8 +299,11 @@ struct VMDetailPane: View {
                 SecondaryButton(title: "停止", systemImage: "stop.fill", tint: Theme.warning) {
                     Task { await runAction { try await VMController.stop(item, store: store, force: false) } }
                 }
+                SecondaryButton(title: "强制关机", systemImage: "power.circle.fill", tint: Theme.warning) {
+                    forceShutdownTarget = item
+                }
                 SecondaryButton(title: "断电", systemImage: "bolt.slash.fill", tint: Theme.danger) {
-                    Task { await runAction { try await VMController.stop(item, store: store, force: true) } }
+                    powerCutTarget = item
                 }
             } else {
                 PrimaryButton(title: "启动", systemImage: "play.fill") {

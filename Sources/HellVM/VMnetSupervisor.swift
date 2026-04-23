@@ -121,15 +121,9 @@ public enum VMnetSupervisor {
             }
         }
         // 开发模式: 从可执行文件回溯找项目根
-        var root = URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath()
-            .deletingLastPathComponent()
-        for _ in 0..<6 {
-            let probe = root.appendingPathComponent("scripts/install-vmnet-daemons.sh")
-            if FileManager.default.isExecutableFile(atPath: probe.path) {
-                return probe.path
-            }
-            root = root.deletingLastPathComponent()
+        let marker = "scripts/install-vmnet-daemons.sh"
+        if let root = ProjectRootFinder.ancestor(containing: marker) {
+            return root.appendingPathComponent(marker).path
         }
         throw VMnetError.scriptNotFound
     }
