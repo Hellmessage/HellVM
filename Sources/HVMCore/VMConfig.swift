@@ -6,6 +6,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
     public var id: UUID
     public var name: String
     public var architecture: VMArchitecture
+    public var osType: GuestOSType
     public var cpuCount: Int
     public var memoryMB: UInt64
     public var disks: [DiskConfig]
@@ -19,6 +20,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         id: UUID = UUID(),
         name: String,
         architecture: VMArchitecture,
+        osType: GuestOSType = .other,
         cpuCount: Int = 2,
         memoryMB: UInt64 = 2048,
         disks: [DiskConfig] = [],
@@ -31,6 +33,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         self.id = id
         self.name = name
         self.architecture = architecture
+        self.osType = osType
         self.cpuCount = cpuCount
         self.memoryMB = memoryMB
         self.disks = disks
@@ -40,6 +43,42 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, architecture, osType
+        case cpuCount, memoryMB, disks, networks
+        case display, boot, createdAt, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id           = try c.decode(UUID.self,           forKey: .id)
+        self.name         = try c.decode(String.self,         forKey: .name)
+        self.architecture = try c.decode(VMArchitecture.self, forKey: .architecture)
+        /* 兼容旧 config(无 osType 字段): 默认 .other, 保持旧行为 */
+        self.osType       = try c.decodeIfPresent(GuestOSType.self, forKey: .osType) ?? .other
+        self.cpuCount     = try c.decode(Int.self,            forKey: .cpuCount)
+        self.memoryMB     = try c.decode(UInt64.self,         forKey: .memoryMB)
+        self.disks        = try c.decode([DiskConfig].self,   forKey: .disks)
+        self.networks     = try c.decode([NetworkConfig].self, forKey: .networks)
+        self.display      = try c.decode(DisplayConfig.self,  forKey: .display)
+        self.boot         = try c.decode(BootConfig.self,     forKey: .boot)
+        self.createdAt    = try c.decode(Date.self,           forKey: .createdAt)
+        self.updatedAt    = try c.decode(Date.self,           forKey: .updatedAt)
+    }
+}
+
+/// 客户机操作系统类型 —— 新建向导决定 display/boot 合理默认
+/// - linux:   virtio-gpu 加速, 无 TPM
+/// - windows: 关闭 virtio-gpu (bootmgr 在 virtio-gpu 存在时挂死),
+///            启用 TPM, 启用 Win11 检查绕过
+/// - macOS:   保留占位, 当前仍按 Linux 默认处理
+/// - other:   保持历史默认行为(virtio-gpu 开, 无 TPM), 旧 config 解码兜底
+public enum GuestOSType: String, Codable, Sendable, CaseIterable {
+    case linux
+    case windows
+    case macOS
+    case other
 }
 
 /// 磁盘配置(路径相对于 bundle 根目录)
@@ -145,7 +184,7 @@ public struct NetworkConfig: Codable, Sendable {
 }
 
 /// 显示配置
-public struct DisplayConfig: Codable, Sendable {
+public struct DisplayConfig: Codable, Sendable, Equatable {
     public var width: Int
     public var height: Int
     public var enabled: Bool
@@ -248,5 +287,40 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.serialDebug   = try c.decodeIfPresent(Bool.self,   forKey: .serialDebug) ?? false
         // 兼容旧 config(无 bypassWin11Checks 字段): 默认 false
         self.bypassWin11Checks = try c.decodeIfPresent(Bool.self, forKey: .bypassWin11Checks) ?? false
+    }
+}
+
+// MARK: - 按 OS 类型计算 display / boot 合理默认
+
+extension VMConfig {
+    /// 依据客户机 OS 类型产出 display / boot 的推荐默认值。
+    /// 新建向导用,未来在 Settings 里按钮"应用 OS 默认"也可复用。
+    public static func defaults(for osType: GuestOSType,
+                                width: Int = 1280,
+                                height: Int = 800,
+                                graphical: Bool = true,
+                                isoPath: String? = nil)
+        -> (display: DisplayConfig, boot: BootConfig)
+    {
+        switch osType {
+        case .windows:
+            // Windows ARM64: bootmgr 不能和 virtio-gpu 共存, 需要 TPM 2.0 和 Win11 检查绕过
+            let disp = DisplayConfig(width: width, height: height,
+                                     enabled: graphical, virtioGpu: false)
+            let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical,
+                                  tpm: true, bypassWin11Checks: true)
+            return (disp, boot)
+        case .linux, .macOS:
+            let disp = DisplayConfig(width: width, height: height,
+                                     enabled: graphical, virtioGpu: true)
+            let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical)
+            return (disp, boot)
+        case .other:
+            // 未指定 OS: 保持历史默认(virtio-gpu 开), 避免对现有用户行为改变
+            let disp = DisplayConfig(width: width, height: height,
+                                     enabled: graphical, virtioGpu: true)
+            let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical)
+            return (disp, boot)
+        }
     }
 }

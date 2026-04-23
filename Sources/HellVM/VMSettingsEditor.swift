@@ -39,6 +39,7 @@ struct VMSettingsEditor: View {
         draft.cpuCount  != item.config.cpuCount  ||
         draft.memoryMB  != item.config.memoryMB  ||
         draft.boot      != item.config.boot      ||
+        draft.display   != item.config.display   ||
         !networksEqual(draft.networks, item.config.networks)
     }
 
@@ -468,6 +469,10 @@ struct VMSettingsEditor: View {
                 keyValue("UEFI", value: item.config.boot.efi ? "启用" : "关闭")
                 keyValue("显示模式", value: item.config.boot.graphical
                          ? "图形(virtio-gpu + 键鼠)" : "串口(-nographic)")
+                if item.config.boot.graphical {
+                    keyValue("virtio-GPU 加速",
+                             value: item.config.display.virtioGpu ? "启用" : "关闭")
+                }
                 if let iso = item.config.boot.isoPath {
                     keyValue("ISO", value: iso, mono: true)
                 } else {
@@ -484,6 +489,28 @@ struct VMSettingsEditor: View {
                            off: ("串口",  "terminal"),
                            value: Binding(get: { draft.boot.graphical },
                                           set: { draft.boot.graphical = $0 }))
+                if draft.boot.graphical {
+                    // virtio-GPU 加速开关:
+                    // - 开: virtio-gpu-pci + ramfb 双 console (Linux 建议, 能加速)
+                    // - 关: 仅 ramfb 单 console (Windows 必选, 防 bootmgr 挂死 / 多 console flicker)
+                    togglePair(label: "virtio-GPU 加速",
+                               on:  ("启用", "bolt.fill"),
+                               off: ("关闭", "bolt.slash"),
+                               value: Binding(get: { draft.display.virtioGpu },
+                                              set: { draft.display.virtioGpu = $0 }))
+                    if !draft.display.virtioGpu {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.textTertiary)
+                            Text("仅挂 ramfb —— Windows 客户机推荐, 避免多 console 画面闪烁")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.textTertiary)
+                            Spacer()
+                        }
+                        .padding(.top, -4)
+                    }
+                }
                 VStack(alignment: .leading, spacing: 6) {
                     FieldLabel("ISO(可选)")
                     HStack(spacing: 8) {
@@ -557,6 +584,7 @@ struct VMSettingsEditor: View {
                         cfg.cpuCount  = draft.cpuCount
                         cfg.memoryMB  = draft.memoryMB
                         cfg.boot      = draft.boot
+                        cfg.display   = draft.display
                         cfg.networks  = draft.networks
                     }
                 }

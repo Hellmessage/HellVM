@@ -14,6 +14,10 @@
 
 - 所有构建产物输出到根目录 `build/`
 - 编译和测试必须通过 `make build` 执行
+- **零环境可构建**: 空白 Mac 上 `make build` 必须一条命令跑通,脚本自动处理
+  Xcode Command Line Tools / Xcode license / Homebrew / brew formulas / QEMU 源码编译。
+  新增外部依赖时,必须同步更新 `scripts/install-deps.sh`(和/或 `scripts/build-qemu.sh`),
+  不能要求用户手动 `brew install xxx` 才能 build。
 
 ## 代码约束
 

@@ -9,6 +9,7 @@ struct NewVMWizardView: View {
 
     @State private var name: String = ""
     @State private var architecture: VMArchitecture = .aarch64
+    @State private var osType: GuestOSType = .linux
     @State private var cpuCount: Int = 2
     @State private var memoryMB: Int = 2048
     @State private var diskSizeGB: Int = 20
@@ -34,6 +35,10 @@ struct NewVMWizardView: View {
 
                     FieldLabel("架构")
                     archPicker
+
+                    FieldLabel("客户机类型")
+                    osTypePicker
+                    osTypeHint
 
                     HStack(alignment: .top, spacing: 16) {
                         VStack(alignment: .leading, spacing: 8) {
@@ -131,6 +136,61 @@ struct NewVMWizardView: View {
             archCard(.aarch64, title: "aarch64", subtitle: "Apple Silicon 主力", icon: "cpu")
             archCard(.x86_64, title: "x86_64", subtitle: "Intel / AMD", icon: "cpu.fill")
             archCard(.riscv64, title: "riscv64", subtitle: "实验性", icon: "bolt.fill")
+        }
+    }
+
+    // MARK: - 客户机类型选择
+
+    private var osTypePicker: some View {
+        HStack(spacing: 8) {
+            osCard(.linux,   title: "Linux",   subtitle: "virtio-gpu 加速",  icon: "terminal.fill")
+            osCard(.windows, title: "Windows", subtitle: "关 gpu, TPM", icon: "square.stack.fill")
+            osCard(.macOS,   title: "macOS",   subtitle: "实验性",           icon: "apple.logo")
+            osCard(.other,   title: "其他",    subtitle: "手动调",           icon: "questionmark.circle")
+        }
+    }
+
+    private func osCard(_ type: GuestOSType, title: String, subtitle: String, icon: String) -> some View {
+        let selected = osType == type
+        return Button(action: { osType = type }) {
+            VStack(alignment: .leading, spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(selected ? Theme.accent : Theme.textSecondary)
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(selected ? Theme.textPrimary : Theme.textSecondary)
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textTertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(selected ? Theme.accent.opacity(0.12) : Theme.surfaceElevated)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(selected ? Theme.accent : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var osTypeHint: some View {
+        if osType == .windows {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textTertiary)
+                Text("已关闭 virtio-gpu(防 bootmgr 挂死)、启用 TPM、自动绕过 Win11 硬件检查")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textTertiary)
+                Spacer()
+            }
+            .padding(.top, -12)
         }
     }
 
@@ -245,6 +305,7 @@ struct NewVMWizardView: View {
             _ = try await VMController.create(
                 name: name,
                 architecture: architecture,
+                osType: osType,
                 cpu: cpuCount,
                 memoryMB: UInt64(memoryMB),
                 diskSizeGB: UInt64(diskSizeGB),

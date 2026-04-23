@@ -32,6 +32,17 @@ resolve_sign_identity() {
 }
 
 # ---------- 1. 依赖 ----------
+# 首次构建提示: 若 CLT 或 Homebrew 缺失, 提前告知用户 sudo + 耗时
+if ! command -v swift >/dev/null 2>&1 || ! command -v brew >/dev/null 2>&1; then
+    cat <<'EOF'
+==> 检测到空白环境, 即将自动安装:
+    - Xcode Command Line Tools (若缺失, 需 sudo, 下载 10-30 分钟)
+    - Homebrew                  (若缺失, 需 sudo)
+    - brew formulas             (ninja/glib/meson/pixman/dtc/libslirp/socket_vmnet)
+    - QEMU (首次编译 20-40 分钟)
+    总耗时首次约 1 小时, 后续增量 < 1 分钟.
+EOF
+fi
 bash scripts/install-deps.sh
 
 # ---------- 2. QEMU ----------

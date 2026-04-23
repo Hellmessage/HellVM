@@ -78,6 +78,7 @@ struct VMController {
     static func create(
         name: String,
         architecture: VMArchitecture,
+        osType: GuestOSType = .other,
         cpu: Int,
         memoryMB: UInt64,
         diskSizeGB: UInt64,
@@ -110,15 +111,22 @@ struct VMController {
         }
 
         // 构造配置 + 创建 bundle
+        // display/boot 按 osType 推导默认值: Windows 关闭 virtio-gpu 并启用 TPM/bypass,
+        // Linux/macOS 默认启用 virtio-gpu, other 保持历史行为
         let disk = DiskConfig(relativePath: "disks/main.qcow2", sizeGB: diskSizeGB, format: .qcow2)
+        let (display, boot) = VMConfig.defaults(for: osType,
+                                                graphical: graphical,
+                                                isoPath: isoAbs)
         let config = VMConfig(
             name: name,
             architecture: architecture,
+            osType: osType,
             cpuCount: cpu,
             memoryMB: memoryMB,
             disks: [disk],
             networks: [NetworkConfig(mode: networkMode)],
-            boot: BootConfig(isoPath: isoAbs, efi: true, graphical: graphical)
+            display: display,
+            boot: boot
         )
         let bundle = try VMBundle.create(at: bundleURL, config: config)
 
