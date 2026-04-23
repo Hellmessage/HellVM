@@ -126,6 +126,9 @@ public struct NetworkConfig: Codable, Sendable {
     /// QEMU NIC 设备型号. Linux 默认 virtio(自带驱动), Windows 默认 e1000e
     /// (Windows ARM 开箱自带 e1000e 驱动; 装 NetKVM 驱动后可切 virtio 更快)
     public var deviceModel: NICModel
+    /// 是否启用此网卡 —— false 时启动不挂, 运行中可通过 QMP 热插拔 attach/detach.
+    /// 和删除的区别: 禁用保留配置(MAC/模式等), 后续再启用恢复同样的 NIC 身份。
+    public var enabled: Bool
 
     public enum Mode: String, Codable, Sendable {
         case user          // -netdev user, 内置 NAT
@@ -140,13 +143,15 @@ public struct NetworkConfig: Codable, Sendable {
         macAddress: String? = nil,
         socketVmnetPath: String? = nil,
         bridgedInterface: String? = nil,
-        deviceModel: NICModel = .virtio
+        deviceModel: NICModel = .virtio,
+        enabled: Bool = true
     ) {
         self.mode = mode
         self.macAddress = macAddress
         self.socketVmnetPath = socketVmnetPath
         self.bridgedInterface = bridgedInterface
         self.deviceModel = deviceModel
+        self.enabled = enabled
     }
 
     /// 推导实际使用的 socket 路径(vmnet* 模式): 用户显式填 socketVmnetPath 优先,
@@ -167,7 +172,7 @@ public struct NetworkConfig: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case mode, macAddress, socketVmnetPath, bridgedInterface, deviceModel
+        case mode, macAddress, socketVmnetPath, bridgedInterface, deviceModel, enabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -187,6 +192,16 @@ public struct NetworkConfig: Codable, Sendable {
         self.bridgedInterface = try c.decodeIfPresent(String.self, forKey: .bridgedInterface)
         /* 兼容旧 config(无 deviceModel 字段): 默认 virtio, 保持现有行为 */
         self.deviceModel      = try c.decodeIfPresent(NICModel.self, forKey: .deviceModel) ?? .virtio
+        /* 兼容旧 config(无 enabled 字段): 默认 true */
+        self.enabled          = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    /// QEMU 侧稳定 ID —— 热插拔要求添加/删除时 ID 一致. 用 MAC 去冒号做后缀,
+    /// guest 看到的仍然是 NIC 顺序, 这里只是 host 端 QEMU 的内部句柄名。
+    /// MAC 为空(极端情况)时返回 nil, 调用方应 fallback 到索引 ID。
+    public var qemuStableSuffix: String? {
+        guard let mac = macAddress, !mac.isEmpty else { return nil }
+        return mac.replacingOccurrences(of: ":", with: "").lowercased()
     }
 }
 

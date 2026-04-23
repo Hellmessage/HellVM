@@ -9,6 +9,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import HVMCore
+import HVMBackendQEMU
 
 struct VMSettingsEditor: View {
     let store: VMListStore
@@ -33,8 +34,8 @@ struct VMSettingsEditor: View {
     /// 安装/卸载后 bump 一下, 强制 vmnetDaemonPanel 重读 socket 状态
     @State private var vmnetRefreshToken: UInt64 = 0
 
-    /// 多网卡卡片折叠状态 —— 记录已展开的 NIC 下标. 默认只展开 NIC 0.
-    @State private var expandedNICs: Set<Int> = [0]
+    /// 多网卡卡片折叠状态 —— 记录已展开的 NIC 下标. 默认全部折叠, 新加的自动展开.
+    @State private var expandedNICs: Set<Int> = []
 
     /// 每个 NIC 的模式下拉展开状态 (inline 而非系统 Menu, 为了和暗色主题一致)
     @State private var openModeMenus: Set<Int> = []
@@ -79,9 +80,9 @@ struct VMSettingsEditor: View {
                 divider()
                 bootSection
 
-                if !readOnly {
-                    saveBar
-                }
+                // 运行中也显示 saveBar, 但只有网络脏(会热插拔)才有意义;
+                // 其它字段因为 readOnly 不会变, 保存按钮自然 dirty=false 灰掉
+                saveBar
             }
             .padding(.bottom, 32)
         }
@@ -352,79 +353,81 @@ struct VMSettingsEditor: View {
     }
 
     // MARK: - 网络
+    //
+    // 网络分组即使 VM 运行中也可编辑 —— 保存时通过 QMP 热插拔应用改动.
+    // 不像 CPU/内存/启动配置必须重启才生效, NIC 能在线添加/删除/切换模式。
 
     private var networkSection: some View {
         section(title: "网络") {
-            if readOnly {
-                let nets = item.config.networks
-                if nets.isEmpty {
-                    keyValue("网卡", value: "无")
-                } else {
-                    ForEach(nets.indices, id: \.self) { idx in
-                        let net = nets[idx]
-                        keyValue("NIC \(idx)", value: "\(displayName(of: net.mode))  ·  \(net.deviceModel.rawValue)")
-                        if let iface = net.bridgedInterface, !iface.isEmpty {
-                            keyValue("  桥接网卡", value: iface, mono: true)
-                        }
-                        if let mac = net.macAddress, !mac.isEmpty {
-                            keyValue("  MAC", value: mac, mono: true)
-                        }
-                    }
-                }
-            } else {
-                ForEach(draft.networks.indices, id: \.self) { idx in
-                    nicCard(at: idx)
-                }
-                HStack(spacing: 8) {
-                    SecondaryButton(title: "添加网卡", systemImage: "plus") { addNIC() }
-                    Text("多网卡允许同一 VM 同时用不同网络(例: shared 上网 + bridged 暴露服务)")
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.textTertiary)
-                    Spacer()
-                }
-                vmnetDaemonPanel
+            ForEach(draft.networks.indices, id: \.self) { idx in
+                nicCard(at: idx)
             }
+            HStack(spacing: 8) {
+                SecondaryButton(title: "添加网卡", systemImage: "plus") { addNIC() }
+                Text(item.bundle.isRunning()
+                     ? "VM 运行中 —— 保存时会 QMP 热插拔应用改动"
+                     : "多网卡允许同一 VM 同时用不同网络(例: shared 上网 + bridged 暴露服务)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textTertiary)
+                Spacer()
+            }
+            vmnetDaemonPanel
         }
     }
 
-    /// 单块 NIC 的折叠卡片 —— 头部单行可点击展开/折叠
+    /// 单块 NIC 的折叠卡片 —— 头部单行可点击展开/折叠, 右侧带启用开关 + 删除
     @ViewBuilder
     private func nicCard(at idx: Int) -> some View {
         if idx < draft.networks.count {
             let expanded = expandedNICs.contains(idx)
+            let enabled = draft.networks[idx].enabled
             VStack(alignment: .leading, spacing: 0) {
-                // 头部: 点击整行切换展开
-                Button(action: { toggleNICExpanded(idx) }) {
-                    HStack(spacing: 8) {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(Theme.textTertiary)
-                            .frame(width: 10)
-                        Image(systemName: "network")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Theme.accent)
-                        Text("NIC \(idx)")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Theme.textPrimary)
-                        Text(nicSummary(at: idx))
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.textSecondary)
-                            .lineLimit(1)
-                        Spacer()
-                        Button(action: { removeNIC(at: idx) }) {
-                            Image(systemName: "trash")
+                HStack(spacing: 8) {
+                    // 头部点击区: 仅 chevron + 标题 + 摘要(右边 toggle/delete 独立事件)
+                    Button(action: { toggleNICExpanded(idx) }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Theme.textTertiary)
+                                .frame(width: 10)
+                            Image(systemName: "network")
+                                .font(.system(size: 12))
+                                .foregroundStyle(enabled ? Theme.accent : Theme.textTertiary)
+                            Text("NIC \(idx)")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(enabled ? Theme.textPrimary : Theme.textTertiary)
+                            Text(nicSummary(at: idx))
                                 .font(.system(size: 11))
-                                .foregroundStyle(Theme.danger)
-                                .padding(.horizontal, 8).padding(.vertical, 4)
-                                .background(RoundedRectangle(cornerRadius: 6).fill(Theme.danger.opacity(0.10)))
+                                .foregroundStyle(Theme.textSecondary.opacity(enabled ? 1.0 : 0.5))
+                                .lineLimit(1)
+                            Spacer()
                         }
-                        .buttonStyle(.plain)
-                        .help("删除此网卡")
+                        .contentShape(Rectangle())
                     }
-                    .padding(.horizontal, 12).padding(.vertical, 10)
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+
+                    // 启用开关(独立事件, 点击不影响展开态)
+                    Toggle("", isOn: Binding(
+                        get: { draft.networks[idx].enabled },
+                        set: { new in draft.networks[idx].enabled = new }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
+                    .help(enabled ? "点击禁用此网卡(保留配置, 启动时不挂)" : "点击启用此网卡")
+
+                    // 删除按钮
+                    Button(action: { removeNIC(at: idx) }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.danger)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.danger.opacity(0.10)))
+                    }
+                    .buttonStyle(.plain)
+                    .help("删除此网卡")
                 }
-                .buttonStyle(.plain)
+                .padding(.horizontal, 12).padding(.vertical, 10)
 
                 if expanded {
                     Rectangle().fill(Theme.divider).frame(height: 1)
@@ -445,13 +448,18 @@ struct VMSettingsEditor: View {
         }
     }
 
-    /// 折叠状态下的一行摘要: 模式 · NIC 型号 · MAC 尾
+    /// 折叠状态下的一行摘要: [已禁用] 模式 · NIC 型号 · MAC 尾
     private func nicSummary(at idx: Int) -> String {
         let net = draft.networks[idx]
-        var parts: [String] = [displayName(of: net.mode)]
-        if net.mode == .vmnetBridged, let iface = net.bridgedInterface, !iface.isEmpty {
-            parts[0] += "(\(iface))"
+        var parts: [String] = []
+        if !net.enabled {
+            parts.append("已禁用")
         }
+        var modeStr = displayName(of: net.mode)
+        if net.mode == .vmnetBridged, let iface = net.bridgedInterface, !iface.isEmpty {
+            modeStr += "(\(iface))"
+        }
+        parts.append(modeStr)
         parts.append(net.deviceModel.rawValue)
         if let mac = net.macAddress, mac.count >= 8 {
             parts.append("…\(mac.suffix(8))")
@@ -803,6 +811,44 @@ struct VMSettingsEditor: View {
 
     // MARK: - vmnet daemon 安装操作
 
+    // MARK: - 网络热插拔
+
+    /// 对比 old / new 两份 networks, 通过 QMP 应用差异 (detach 掉不再启用的,
+    /// attach 新启用或字段变化的). 非 fatal: 单张 NIC 失败不影响其他。
+    @MainActor
+    private func applyNetworkHotplug(old: [NetworkConfig], new: [NetworkConfig]) async {
+        let (toAttach, toDetach) = NICHotplug.diff(old: old, new: new)
+        guard !toAttach.isEmpty || !toDetach.isEmpty else { return }
+
+        let qmp = QMPClient()
+        do {
+            try await qmp.connect(socketPath: item.bundle.qmpSocketURL.path)
+        } catch {
+            errorText = "QMP 连接失败, 热插拔未生效: \(error.localizedDescription)"
+            return
+        }
+        defer { Task { await qmp.close() } }
+
+        // 先 detach 再 attach, 避免同 MAC 冲突
+        for net in toDetach {
+            do {
+                try await NICHotplug.detach(net, via: qmp)
+                log.info(.backend, "hotplug: detached \(NICHotplug.deviceID(for: net) ?? "?")")
+            } catch {
+                log.warn(.backend, "hotplug: detach failed: \(error)")
+            }
+        }
+        for net in toAttach {
+            do {
+                try await NICHotplug.attach(net, via: qmp)
+                log.info(.backend, "hotplug: attached \(NICHotplug.deviceID(for: net) ?? "?")")
+            } catch {
+                errorText = "热插拔 \(NICHotplug.deviceID(for: net) ?? "?") 失败: \(error.localizedDescription)"
+                log.warn(.backend, "hotplug: attach failed: \(error)")
+            }
+        }
+    }
+
     @MainActor
     private func installVmnet() async {
         vmnetBusy = true
@@ -1045,13 +1091,20 @@ struct VMSettingsEditor: View {
                 draft = item.config
             }
             PrimaryButton(title: busy ? "保存中…" : "保存", systemImage: "checkmark.circle", disabled: !dirty || busy) {
-                runTask {
+                runTaskAsync {
+                    // 保存前快照旧 networks, 用于运行时热插拔 diff
+                    let oldNetworks = item.config.networks
+                    let wasRunning = item.bundle.isRunning()
                     try VMController.updateConfig(item, store: store) { cfg in
                         cfg.cpuCount  = draft.cpuCount
                         cfg.memoryMB  = draft.memoryMB
                         cfg.boot      = draft.boot
                         cfg.display   = draft.display
                         cfg.networks  = draft.networks
+                    }
+                    // VM 在运行 → 计算 diff, QMP 热插拔生效
+                    if wasRunning {
+                        await applyNetworkHotplug(old: oldNetworks, new: draft.networks)
                     }
                 }
             }

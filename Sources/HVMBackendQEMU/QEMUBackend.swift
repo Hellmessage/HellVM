@@ -657,22 +657,25 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
 
     /// 根据 NetworkConfig 列表产出 `-netdev` / `-device` / `-nic` 参数。
     ///
-    /// 支持多网卡: 每个 NetworkConfig 生成独立的 netdev (id=net0/net1/...) + 对应的
-    /// virtio-net-pci/e1000e/rtl8139 PCI device。.none 模式的条目被跳过但保留位置,
-    /// 这样用户在 Settings 里暂时关掉某块网卡不影响其他网卡的序号/MAC。
+    /// 支持多网卡 + 热插拔: 每个启用的 NetworkConfig 生成独立的 netdev/device,
+    /// ID 派生自 MAC(qemuStableSuffix), 保证 boot-time 和运行时 QMP 热插拔 attach
+    /// 用的是同一个句柄 —— 不会因为 UI 里挪动 NIC 顺序而错位。
     ///
-    /// 空数组 / 全部 .none → `-nic none` 禁用自动兜底 NIC(QEMU 不加这行会隐式塞一张 user NAT)
+    /// 过滤规则: 跳过 enabled=false 或 mode==.none 的 NIC; 两者全部为空 → -nic none
     private func buildNetArgs(_ networks: [NetworkConfig]) -> [String] {
-        // 过滤启用的 NIC(但保留原始索引, 确保 id=netN 稳定, MAC 不串位置)
-        let active = networks.enumerated().filter { $0.element.mode != .none }
+        let active = networks.enumerated().filter { (_, n) in
+            n.enabled && n.mode != .none
+        }
         guard !active.isEmpty else {
             return ["-nic", "none"]
         }
 
         var out: [String] = []
         for (idx, net) in active {
-            let netdevID = "net\(idx)"
-            var deviceOpts = "\(net.deviceModel.qemuDeviceName),netdev=\(netdevID)"
+            let suffix = net.qemuStableSuffix ?? String(idx)
+            let netdevID = "net_\(suffix)"
+            let deviceID = "nic_\(suffix)"
+            var deviceOpts = "\(net.deviceModel.qemuDeviceName),netdev=\(netdevID),id=\(deviceID)"
             if let mac = net.macAddress, !mac.isEmpty {
                 deviceOpts += ",mac=\(mac)"
             }
