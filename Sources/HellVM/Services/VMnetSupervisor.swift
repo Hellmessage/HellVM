@@ -66,14 +66,24 @@ public enum VMnetSupervisor {
     /// 会走 osascript administrator privileges 弹授权框. 用户拒绝时 throw.
     public static func installAllDaemons(extraBridgedInterfaces: [String] = []) async throws {
         var bridgedSet = Set<String>()
-        if let items = try? VMBundle.listAll() {
-            for b in items {
-                guard let cfg = try? b.loadConfig() else { continue }
+        let items: [VMBundle]
+        do {
+            items = try VMBundle.listAll()
+        } catch {
+            // 列 VM bundle 失败不致命: 仍可按 extraBridgedInterfaces 装 daemon, 但要留痕排查
+            log.warn(.backend, "vmnet: 扫描已有 VM bundle 失败, 跳过: \(error.localizedDescription)")
+            items = []
+        }
+        for b in items {
+            do {
+                let cfg = try b.loadConfig()
                 for net in cfg.networks where net.mode == .vmnetBridged {
                     if let iface = net.bridgedInterface, !iface.isEmpty {
                         bridgedSet.insert(iface)
                     }
                 }
+            } catch {
+                log.warn(.backend, "vmnet: 加载 \(b.url.lastPathComponent) config 失败, 跳过: \(error.localizedDescription)")
             }
         }
         for iface in extraBridgedInterfaces where !iface.isEmpty {

@@ -10,31 +10,31 @@ import Foundation
 import HVMCore
 import HVMBundle
 
-public final class SwtpmSupervisor: @unchecked Sendable {
+final class SwtpmSupervisor: @unchecked Sendable {
     private let bundle: VMBundle
     private let lock = NSLock()
     private var spawned: SpawnedProcess?
 
-    public init(bundle: VMBundle) {
+    init(bundle: VMBundle) {
         self.bundle = bundle
     }
 
     /// 当前 swtpm 的 pg leader pgid —— QEMU spawn 时传 joinPGID 加入同 pg.
     /// 未启动时返回 nil, 此时 QEMU 会自己当 pg leader(等价于没有 TPM 的情况)。
-    public var pgid: pid_t? {
+    var pgid: pid_t? {
         lock.lock(); defer { lock.unlock() }
         return spawned?.pgid
     }
 
     /// 是否已启动(有未退出的子进程)
-    public var isRunning: Bool {
+    var isRunning: Bool {
         lock.lock(); defer { lock.unlock() }
         return spawned?.isRunning ?? false
     }
 
     /// 启动 swtpm 子进程并等它监听的 unix socket 出现.
     /// - Returns: socket 绝对路径
-    public func start() throws -> String {
+    func start() throws -> String {
         let swtpmURL = try Self.findBinary()
         let stateDir = bundle.tpmStateDirURL
         let sockURL = bundle.tpmSocketURL
@@ -90,7 +90,7 @@ public final class SwtpmSupervisor: @unchecked Sendable {
 
     /// 幂等终止 swtpm. 正常路径上 QEMU 退出时 `,terminate` 会让 swtpm 自退,
     /// 这里只是双保险和异常路径清理。
-    public func terminate() {
+    func terminate() {
         let proc: SpawnedProcess? = {
             lock.lock(); defer { lock.unlock() }
             let p = self.spawned

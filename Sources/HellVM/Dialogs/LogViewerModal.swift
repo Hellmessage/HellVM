@@ -2,24 +2,25 @@
 import SwiftUI
 import AppKit
 
-struct LogSource: Hashable {
-    let label: String
-    let fileURL: URL
-}
-
 struct LogViewerModal: View {
+    /// 单条日志源(标签 + 文件路径)
+    struct Source: Hashable {
+        let label: String
+        let fileURL: URL
+    }
+
     let title: String
-    let sources: [LogSource]
+    let sources: [Source]
     let onClose: () -> Void
 
     /// 便捷构造:单一日志
     init(title: String, fileURL: URL, onClose: @escaping () -> Void) {
         self.title = title
-        self.sources = [LogSource(label: "QEMU 运行", fileURL: fileURL)]
+        self.sources = [Source(label: "QEMU 运行", fileURL: fileURL)]
         self.onClose = onClose
     }
 
-    init(title: String, sources: [LogSource], onClose: @escaping () -> Void) {
+    init(title: String, sources: [Source], onClose: @escaping () -> Void) {
         self.title = title
         self.sources = sources
         self.onClose = onClose

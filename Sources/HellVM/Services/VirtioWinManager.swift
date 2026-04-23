@@ -78,20 +78,21 @@ public final class VirtioWinManager: ObservableObject {
         log.info(.ui, "virtio-win: 开始下载 \(Self.downloadURL.absoluteString)")
         let dest = VMBundle.virtioWinCacheURL
         let tmp = dest.appendingPathExtension("part")
+        let fm = FileManager.default
         // 旧 .part 残留清一下, 避免 URLSession resume 歧义
-        try? FileManager.default.removeItem(at: tmp)
+        fm.removeIfExists(tmp, label: "陈旧 virtio-win .part", category: .ui)
 
         do {
             try await runDownload(to: tmp)
             // 原子替换
-            try? FileManager.default.removeItem(at: dest)
-            try FileManager.default.moveItem(at: tmp, to: dest)
+            fm.removeIfExists(dest, label: "旧 virtio-win.iso", category: .ui)
+            try fm.moveItem(at: tmp, to: dest)
             downloadProgress = nil
             log.info(.ui, "virtio-win: 下载完成 \(dest.path)")
         } catch {
             downloadProgress = nil
             lastError = "下载失败: \(error.localizedDescription)"
-            try? FileManager.default.removeItem(at: tmp)
+            fm.removeIfExists(tmp, label: "下载失败后的 .part", category: .ui)
             log.warn(.ui, "virtio-win: 下载失败 \(error)")
             throw error
         }
@@ -115,7 +116,7 @@ public final class VirtioWinManager: ObservableObject {
                     case .success(let srcURL):
                         do {
                             // URLSession 把文件下到临时路径, 我们 move 到 .part
-                            try? FileManager.default.removeItem(at: tmp)
+                            FileManager.default.removeIfExists(tmp, label: "残留 .part 中间文件", category: .ui)
                             try FileManager.default.moveItem(at: srcURL, to: tmp)
                             cont.resume()
                         } catch {

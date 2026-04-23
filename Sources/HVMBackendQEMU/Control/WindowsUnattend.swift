@@ -10,14 +10,14 @@ import HVMCore
 import HVMBundle
 
 /// Windows 自动应答 ISO 生成器 —— 纯命名空间, 无状态
-public enum WindowsUnattend {
+enum WindowsUnattend {
 
     /// 确保 bundle 下有最新 AutoUnattend ISO (幂等):
     /// - XML 未变 → 直接复用
     /// - XML 变了 / ISO 缺失 → 重建 stage 目录 + hdiutil makehybrid
     ///
     /// - Parameter autoInstallVirtioWin: true 时追加 oobeSystem pass, 首次登录自动装 virtio-win MSI
-    public static func ensureISO(bundle: VMBundle, autoInstallVirtioWin: Bool) throws {
+    static func ensureISO(bundle: VMBundle, autoInstallVirtioWin: Bool) throws {
         let xml = unattendXML(autoInstallVirtioWin: autoInstallVirtioWin)
         let stageDir = bundle.url.appendingPathComponent(".unattend-stage")
         /* 文件名三份都写: 不同版本 Windows Setup 对大小写的要求不统一.

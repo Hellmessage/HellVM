@@ -38,8 +38,11 @@ let package = Package(
         .target(name: "HVMBackendQEMU", dependencies: ["HVMCore", "HVMBundle"]),
 
         // P4: iosurface display backend 协议对端 C 辅助(recvmsg + SCM_RIGHTS)
+        // 源码物理上住在 HVMDisplay/C 下, 逻辑上仍是独立 target
+        // (SwiftPM 5.9 不允许同 target 混 Swift/C, 所以拆成两个 target 共享一个父目录)
         .target(
             name: "HVMDisplayC",
+            path: "Sources/HVMDisplay/C",
             publicHeadersPath: "include"
         ),
 
@@ -47,7 +50,8 @@ let package = Package(
         //     输入通道复用 HVMBackendQEMU 的 QMPClient
         .target(
             name: "HVMDisplay",
-            dependencies: ["HVMCore", "HVMBundle", "HVMDisplayC", "HVMBackendQEMU"]
+            dependencies: ["HVMCore", "HVMBundle", "HVMDisplayC", "HVMBackendQEMU"],
+            exclude: ["C"]   // C 子目录归 HVMDisplayC target 管, 别当 Swift 源扫
         ),
 
         // 主 App(SwiftUI)
