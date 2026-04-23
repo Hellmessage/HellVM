@@ -14,6 +14,7 @@ struct NewVMWizardView: View {
     @State private var diskSizeGB: Int = 20
     @State private var isoPath: String = ""
     @State private var graphical: Bool = true
+    @State private var networkMode: NetworkConfig.Mode = .user
 
     @State private var submitting: Bool = false
     @State private var errorText: String?
@@ -56,6 +57,9 @@ struct NewVMWizardView: View {
 
                     FieldLabel("显示模式")
                     graphicalToggle
+
+                    FieldLabel("网络模式")
+                    networkPicker
 
                     if let errorText {
                         HStack(alignment: .top, spacing: 8) {
@@ -194,6 +198,43 @@ struct NewVMWizardView: View {
         }
     }
 
+    // MARK: - 网络模式选择
+
+    private var networkPicker: some View {
+        HStack(spacing: 6) {
+            networkChip(.user,         title: "NAT",       icon: "network")
+            networkChip(.vmnetShared,  title: "vmnet",     icon: "shared.with.you")
+            networkChip(.vmnetBridged, title: "桥接",      icon: "antenna.radiowaves.left.and.right")
+            networkChip(.vmnetHost,    title: "host-only", icon: "house")
+            networkChip(.none,         title: "无",        icon: "xmark.octagon")
+        }
+    }
+
+    private func networkChip(_ mode: NetworkConfig.Mode, title: String, icon: String) -> some View {
+        let selected = networkMode == mode
+        return Button(action: { networkMode = mode }) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 13))
+                    .foregroundStyle(selected ? Theme.textPrimary : Theme.textTertiary)
+                Text(title)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(selected ? Theme.textPrimary : Theme.textSecondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(selected ? Theme.accent.opacity(0.15) : Theme.surfaceElevated)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - 提交
 
     private func submit() async {
@@ -208,7 +249,8 @@ struct NewVMWizardView: View {
                 memoryMB: UInt64(memoryMB),
                 diskSizeGB: UInt64(diskSizeGB),
                 isoPath: isoPath.isEmpty ? nil : isoPath,
-                graphical: graphical
+                graphical: graphical,
+                networkMode: networkMode
             )
             onCreated(name)
         } catch {
@@ -230,90 +272,3 @@ struct NewVMWizardView: View {
     }
 }
 
-// MARK: - 小组件
-
-private struct FieldLabel: View {
-    let text: String
-    init(_ text: String) { self.text = text }
-    var body: some View {
-        Text(text)
-            .font(.system(size: 11, weight: .bold))
-            .tracking(0.6)
-            .foregroundStyle(Theme.textTertiary)
-    }
-}
-
-private struct StyledTextField: View {
-    let placeholder: String
-    @Binding var text: String
-    var monospaced: Bool = false
-
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        TextField(placeholder, text: $text)
-            .textFieldStyle(.plain)
-            .font(monospaced ? Font2.mono : Font2.body)
-            .foregroundStyle(Theme.textPrimary)
-            .focused($focused)
-            .padding(.horizontal, 11)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(focused ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1)
-            )
-    }
-}
-
-private struct StepperCard: View {
-    @Binding var value: Int
-    let unit: String
-    let range: ClosedRange<Int>
-    let step: Int
-
-    var body: some View {
-        HStack(spacing: 0) {
-            Button(action: decrement) {
-                Image(systemName: "minus")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(Theme.textSecondary)
-                    .frame(width: 44, height: 36)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(value <= range.lowerBound)
-
-            Rectangle().fill(Theme.divider).frame(width: 1, height: 16)
-
-            Text("\(value) \(unit)")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Theme.textPrimary)
-                .frame(maxWidth: .infinity)
-
-            Rectangle().fill(Theme.divider).frame(width: 1, height: 16)
-
-            Button(action: increment) {
-                Image(systemName: "plus")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(Theme.textSecondary)
-                    .frame(width: 44, height: 36)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(value >= range.upperBound)
-        }
-        .background(
-            RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated)
-        )
-    }
-
-    private func increment() {
-        value = min(range.upperBound, value + step)
-    }
-    private func decrement() {
-        value = max(range.lowerBound, value - step)
-    }
-}

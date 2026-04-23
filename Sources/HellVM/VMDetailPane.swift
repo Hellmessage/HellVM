@@ -195,46 +195,9 @@ struct VMDetailPane: View {
     }
 
     private func settingsTab(for item: VMListItem) -> some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                section(title: "基本信息") {
-                    keyValue("架构", value: item.config.architecture.rawValue)
-                    keyValue("CPU 核心", value: "\(item.config.cpuCount)")
-                    keyValue("内存", value: "\(item.config.memoryMB) MB")
-                    keyValue("Bundle 路径", value: item.bundle.url.path, mono: true)
-                }
-
-                Rectangle().fill(Theme.divider).frame(height: 1)
-                    .padding(.horizontal, 32)
-
-                section(title: "磁盘") {
-                    if item.config.disks.isEmpty {
-                        keyValue("—", value: "无磁盘")
-                    } else {
-                        ForEach(item.config.disks, id: \.id) { d in
-                            keyValue(d.relativePath, value: "\(d.sizeGB) GB · \(d.format.rawValue)", mono: true)
-                        }
-                    }
-                }
-
-                Rectangle().fill(Theme.divider).frame(height: 1)
-                    .padding(.horizontal, 32)
-
-                section(title: "启动") {
-                    keyValue("UEFI", value: item.config.boot.efi ? "启用" : "关闭")
-                    keyValue("显示模式",
-                             value: item.config.boot.graphical
-                                ? "图形(virtio-gpu + 键鼠)"
-                                : "串口(-nographic)")
-                    if let iso = item.config.boot.isoPath {
-                        keyValue("ISO", value: iso, mono: true)
-                    } else {
-                        keyValue("ISO", value: "(无)")
-                    }
-                }
-            }
-            .padding(.bottom, 32)
-        }
+        // item.id 切换时重建编辑器,清空 draft 状态;同一个 VM 内部改动不 reset
+        VMSettingsEditor(store: store, item: item)
+            .id(item.id)
     }
 
     // MARK: - Hero
@@ -317,36 +280,6 @@ struct VMDetailPane: View {
     }
 
     // MARK: - Section / KV
-
-    private func section(title: String, @ViewBuilder content: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(title)
-                .font(.system(size: 11, weight: .bold))
-                .tracking(0.8)
-                .foregroundStyle(Theme.textTertiary)
-                .padding(.top, 22)
-            VStack(alignment: .leading, spacing: 10) {
-                content()
-            }
-        }
-        .padding(.horizontal, 32)
-        .padding(.bottom, 22)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func keyValue(_ label: String, value: String, mono: Bool = false) -> some View {
-        HStack(alignment: .top, spacing: 16) {
-            Text(label)
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.textTertiary)
-                .frame(width: 100, alignment: .leading)
-            Text(value)
-                .font(mono ? Font2.mono : Font2.body)
-                .foregroundStyle(Theme.textPrimary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
 
     private func errorBanner(_ text: String) -> some View {
         HStack(alignment: .top, spacing: 8) {

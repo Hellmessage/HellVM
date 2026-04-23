@@ -22,7 +22,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         cpuCount: Int = 2,
         memoryMB: UInt64 = 2048,
         disks: [DiskConfig] = [],
-        networks: [NetworkConfig] = [.init(mode: .nat)],
+        networks: [NetworkConfig] = [.init(mode: .user)],
         display: DisplayConfig = .default,
         boot: BootConfig = .init(),
         createdAt: Date = Date(),
@@ -71,20 +71,76 @@ public struct DiskConfig: Codable, Sendable, Identifiable {
 }
 
 /// 网络配置
+///
+/// 后端一览:
+/// - `.user` —— QEMU 内置 user-mode(NAT),零依赖,默认
+/// - `.vmnetShared` / `.vmnetHost` / `.vmnetBridged` —— 走外部 socket_vmnet helper
+///   (`brew install socket_vmnet` + `sudo brew services start socket_vmnet`)
+/// - `.none` —— 禁用网络(`-nic none`)
 public struct NetworkConfig: Codable, Sendable {
     public var mode: Mode
     public var macAddress: String?
+    /// socket_vmnet unix socket 路径(仅 vmnet* 模式用,留空则按 mode 取默认值)
+    public var socketVmnetPath: String?
+    /// vmnetBridged 模式要桥接的宿主网卡(如 `en0`),其它模式忽略
+    public var bridgedInterface: String?
 
     public enum Mode: String, Codable, Sendable {
-        case nat        // NAT(共享宿主机网络)
-        case bridged    // 桥接
-        case hostOnly   // 仅宿主机
-        case none       // 无网络
+        case user          // -netdev user, 内置 NAT
+        case vmnetShared   // socket_vmnet shared(NAT+DHCP, 走 vmnet.framework)
+        case vmnetHost     // socket_vmnet host-only
+        case vmnetBridged  // socket_vmnet bridged(真二层桥接)
+        case none          // 无网络
     }
 
-    public init(mode: Mode, macAddress: String? = nil) {
+    public init(
+        mode: Mode = .user,
+        macAddress: String? = nil,
+        socketVmnetPath: String? = nil,
+        bridgedInterface: String? = nil
+    ) {
         self.mode = mode
         self.macAddress = macAddress
+        self.socketVmnetPath = socketVmnetPath
+        self.bridgedInterface = bridgedInterface
+    }
+
+    /// 推导实际使用的 socket 路径(vmnet* 模式): 用户显式填 socketVmnetPath 优先,
+    /// 否则按模式约定:
+    ///   shared  → /var/run/socket_vmnet
+    ///   host    → /var/run/socket_vmnet.host
+    ///   bridged → /var/run/socket_vmnet.bridged.<iface>
+    public var effectiveSocketPath: String? {
+        if let p = socketVmnetPath, !p.isEmpty { return p }
+        switch mode {
+        case .vmnetShared:  return "/var/run/socket_vmnet"
+        case .vmnetHost:    return "/var/run/socket_vmnet.host"
+        case .vmnetBridged:
+            let iface = (bridgedInterface?.isEmpty == false) ? bridgedInterface! : "en0"
+            return "/var/run/socket_vmnet.bridged.\(iface)"
+        case .user, .none:  return nil
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case mode, macAddress, socketVmnetPath, bridgedInterface
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // 兼容旧枚举名: nat → user, bridged → vmnetBridged, hostOnly → vmnetHost
+        let raw = try c.decode(String.self, forKey: .mode)
+        switch raw {
+        case "user", "nat":             self.mode = .user
+        case "vmnetShared":             self.mode = .vmnetShared
+        case "vmnetHost", "hostOnly":   self.mode = .vmnetHost
+        case "vmnetBridged", "bridged": self.mode = .vmnetBridged
+        case "none":                    self.mode = .none
+        default:                        self.mode = .user   // 未知值兜底为 user
+        }
+        self.macAddress       = try c.decodeIfPresent(String.self, forKey: .macAddress)
+        self.socketVmnetPath  = try c.decodeIfPresent(String.self, forKey: .socketVmnetPath)
+        self.bridgedInterface = try c.decodeIfPresent(String.self, forKey: .bridgedInterface)
     }
 }
 
@@ -104,7 +160,7 @@ public struct DisplayConfig: Codable, Sendable {
 }
 
 /// 启动配置
-public struct BootConfig: Codable, Sendable {
+public struct BootConfig: Codable, Sendable, Equatable {
     public var isoPath: String?         // 绝对路径(ISO 通常不复制进 bundle,节省空间)
     public var kernelPath: String?
     public var initrdPath: String?
@@ -115,13 +171,24 @@ public struct BootConfig: Codable, Sendable {
     /// 适合无桌面的服务器镜像/云 init 等场景。默认 true。
     public var graphical: Bool
 
+    /// TPM 2.0 模拟(swtpm + tpm-tis-device),Win11 安装硬依赖
+    public var tpm: Bool
+
+    /// 诊断开关:图形模式下把 guest 串口重定向到 logs/edk2.log,
+    /// 用于抓 EDK2 固件 / Windows bootmgr / Linux kernel early 的 debug 输出。
+    /// 默认 false — 串口丢弃,避免长时间运行日志无限增长。
+    /// 排查启动问题时打开,日志来源:EDK2 PEI/DXE/BDS/bootmgr debug 文本。
+    public var serialDebug: Bool
+
     public init(
         isoPath: String? = nil,
         kernelPath: String? = nil,
         initrdPath: String? = nil,
         kernelCmdline: String? = nil,
         efi: Bool = true,
-        graphical: Bool = true
+        graphical: Bool = true,
+        tpm: Bool = false,
+        serialDebug: Bool = false
     ) {
         self.isoPath = isoPath
         self.kernelPath = kernelPath
@@ -129,10 +196,12 @@ public struct BootConfig: Codable, Sendable {
         self.kernelCmdline = kernelCmdline
         self.efi = efi
         self.graphical = graphical
+        self.tpm = tpm
+        self.serialDebug = serialDebug
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical
+        case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical, tpm, serialDebug
     }
 
     public init(from decoder: Decoder) throws {
@@ -144,5 +213,9 @@ public struct BootConfig: Codable, Sendable {
         self.efi           = try c.decodeIfPresent(Bool.self,   forKey: .efi)       ?? true
         // 兼容旧 config(无 graphical 字段): 默认 true
         self.graphical     = try c.decodeIfPresent(Bool.self,   forKey: .graphical) ?? true
+        // 兼容旧 config(无 tpm 字段): 默认 false
+        self.tpm           = try c.decodeIfPresent(Bool.self,   forKey: .tpm)       ?? false
+        // 兼容旧 config(无 serialDebug 字段): 默认 false
+        self.serialDebug   = try c.decodeIfPresent(Bool.self,   forKey: .serialDebug) ?? false
     }
 }

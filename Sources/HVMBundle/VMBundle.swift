@@ -28,6 +28,9 @@ public struct VMBundle: Sendable {
     /// 非图形模式(-nographic)的 guest 串口输出文件
     public var serialLogURL: URL { logsDirURL.appendingPathComponent("serial.log") }
 
+    /// 图形模式下 guest 串口输出文件(EDK2 固件 debug 打到这里, Windows bootmgr 也会打)
+    public var edk2LogURL: URL { logsDirURL.appendingPathComponent("edk2.log") }
+
     /// 运行时 QEMU PID 文件
     public var pidFileURL: URL { url.appendingPathComponent("qemu.pid") }
 
@@ -39,6 +42,12 @@ public struct VMBundle: Sendable {
 
     /// 运行时 iosurface display backend 的 unix socket(Swift 侧作为客户端连入)
     public var iosurfaceSocketURL: URL { url.appendingPathComponent("iosurface.sock") }
+
+    /// swtpm 状态持久化目录(TPM NVRAM / PCR 等需要持久化)
+    public var tpmStateDirURL: URL { url.appendingPathComponent("tpm") }
+
+    /// swtpm 控制 socket(QEMU 通过 chardev socket 连入)
+    public var tpmSocketURL: URL { url.appendingPathComponent("swtpm.sock") }
 
     /// 读取 PID 文件,返回 qemu 进程 PID(若存在且能解析)
     public func readPID() -> Int32? {
@@ -59,6 +68,8 @@ public struct VMBundle: Sendable {
     }
 
     /// 清理陈旧的运行时文件(PID + socket),确保下次启动干净
+    /// 注:不清理 tpmSocketURL ——它由 swtpm 先于 QEMU 启动创建,QEMUBackend.startSwtpm()
+    /// 自己负责清理陈旧 socket。若在这里清理,会把刚创建的 socket 误删导致 QEMU 连接失败。
     public func cleanupRuntimeFiles() {
         let fm = FileManager.default
         try? fm.removeItem(at: pidFileURL)

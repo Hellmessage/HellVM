@@ -53,6 +53,34 @@ public struct DiskManager: Sendable {
         ])
     }
 
+    /// 转换磁盘格式 —— `qemu-img convert -f <src> -O <dst> <in> <out>`
+    /// - Note: 写入临时文件成功后原子替换原路径,失败不影响原文件
+    public func convert(at url: URL,
+                        from srcFormat: DiskConfig.Format,
+                        to dstFormat: DiskConfig.Format) async throws {
+        guard srcFormat != dstFormat else { return }
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).convert.tmp")
+        // 先确保没有残留
+        try? FileManager.default.removeItem(at: tmp)
+        try await run(arguments: [
+            "convert",
+            "-f", srcFormat.rawValue,
+            "-O", dstFormat.rawValue,
+            url.path,
+            tmp.path,
+        ])
+        // 原子替换(跨进程安全; 目标不存在时 replaceItemAt 也能处理)
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+    }
+
+    /// 删除磁盘文件(不可恢复)
+    public func remove(at url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
     // MARK: - 内部
 
     private func run(arguments: [String]) async throws {

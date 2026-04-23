@@ -15,6 +15,8 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     private let stateLock = NSLock()
     private var _state: VMState = .stopped
     private var process: Process?
+    /// swtpm 子进程(启用 TPM 时在 QEMU 之前拉起,QEMU 退出时连带清理)
+    private var swtpmProcess: Process?
 
     public var state: VMState {
         withStateLock { _state }
@@ -39,7 +41,19 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         setState(.starting)
 
         let efiVars = try prepareEFIVars()
-        let args = try buildArguments(efiVars: efiVars)
+
+        // 启用 TPM: 先起 swtpm 子进程, 让它 listen 在 unix socket 上, QEMU 后面通过 chardev 连入
+        var tpmSocketPath: String? = nil
+        if config.boot.tpm {
+            do {
+                tpmSocketPath = try startSwtpm()
+            } catch {
+                setState(.error)
+                throw error
+            }
+        }
+
+        let args = try buildArguments(efiVars: efiVars, tpmSocketPath: tpmSocketPath)
 
         let qemuURL = paths.qemuSystem(config.architecture)
         guard FileManager.default.isExecutableFile(atPath: qemuURL.path) else {
@@ -86,6 +100,8 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             // 关闭 pipe handler, 避免僵尸 readability callback
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
+            // QEMU 退出时连带杀掉 swtpm(swtpm 带 --ctrl ...,terminate 也会自动退, 这里是双保险)
+            self?.terminateSwtpm()
             self?.setState(.stopped)
         }
 
@@ -113,6 +129,8 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
 
         if force {
             kill(proc.processIdentifier, SIGKILL)
+            // 强制停止时 QEMU terminationHandler 可能来不及跑, 这里兜底
+            terminateSwtpm()
         } else {
             // 优先走 QMP system_powerdown,失败再退回 SIGTERM
             if !(await gracefulPowerdown()) {
@@ -190,9 +208,15 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     /// 成功时不返回(process image 被替换),失败时抛错。
     /// 这样 qemu 直接继承用户终端的 TTY / controlling terminal / 所有 FD,
     /// 绕开 Swift Foundation.Process + posix_spawn 在 TTY 继承上的行为差异。
+    /// 注:本函数会 exec 替换当前进程, 所以提前拉起的 swtpm 会被自动"过继"给 init(pid=1),
+    /// 但带 `--ctrl ...,terminate` 标志, QEMU 退出时 swtpm 仍会自己清理。
     public func execReplacing() throws {
         let efiVars = try prepareEFIVars()
-        let args = try buildArguments(efiVars: efiVars)
+        var tpmSocketPath: String? = nil
+        if config.boot.tpm {
+            tpmSocketPath = try startSwtpm()
+        }
+        let args = try buildArguments(efiVars: efiVars, tpmSocketPath: tpmSocketPath)
         let qemuURL = paths.qemuSystem(config.architecture)
         guard FileManager.default.isExecutableFile(atPath: qemuURL.path) else {
             throw VMError.startFailed("找不到 qemu 可执行文件:\(qemuURL.path)")
@@ -241,8 +265,95 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         return dst
     }
 
+    /// 查找 swtpm 可执行路径(Homebrew / MacPorts 常见安装位置)
+    private func findSwtpmBinary() throws -> URL {
+        let candidates = [
+            "/opt/homebrew/bin/swtpm",
+            "/usr/local/bin/swtpm",
+            "/opt/local/bin/swtpm",
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return URL(fileURLWithPath: path)
+            }
+        }
+        throw VMError.startFailed("swtpm 未安装, 请执行: brew install swtpm")
+    }
+
+    /// 启动 swtpm 子进程, 返回它监听的 unix socket 路径
+    ///
+    /// socket 上用 `,terminate` 标志:当 QEMU 连上又断开(VM 关机)时 swtpm 自动退出,
+    /// 避免需要从外部显式发信号。stateDir 内会生成 tpm2-00.permall 等持久化文件。
+    private func startSwtpm() throws -> String {
+        let swtpmURL = try findSwtpmBinary()
+        let stateDir = bundle.tpmStateDirURL
+        let sockURL = bundle.tpmSocketURL
+        let logFile = bundle.logsDirURL.appendingPathComponent("swtpm.log")
+
+        let fm = FileManager.default
+        try fm.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: bundle.logsDirURL, withIntermediateDirectories: true)
+        try? fm.removeItem(at: sockURL)  // 陈旧 socket 清理
+
+        let proc = Process()
+        proc.executableURL = swtpmURL
+        proc.arguments = [
+            "socket",
+            "--tpmstate", "dir=\(stateDir.path)",
+            "--ctrl", "type=unixio,path=\(sockURL.path),terminate",
+            "--tpm2",
+            "--flags", "startup-clear",
+            "--log", "level=5,file=\(logFile.path)",
+        ]
+        // swtpm 的 stdout/stderr 并入主 log, 方便排查启动失败
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let data = h.availableData
+            if data.isEmpty { h.readabilityHandler = nil; return }
+            if let s = String(data: data, encoding: .utf8) {
+                for line in s.split(separator: "\n") {
+                    log.warn(.qemu, "[swtpm] \(line)")
+                }
+            }
+        }
+
+        do {
+            try proc.run()
+        } catch {
+            throw VMError.startFailed("swtpm 启动失败: \(error.localizedDescription)")
+        }
+
+        withStateLock { self.swtpmProcess = proc }
+
+        // 等 socket 出现(最多 3 秒), 出不来说明 swtpm 挂了
+        for _ in 0..<30 {
+            if fm.fileExists(atPath: sockURL.path) {
+                log.info(.qemu, "[swtpm] 已启动, socket=\(sockURL.path) state=\(stateDir.path)")
+                return sockURL.path
+            }
+            usleep(100_000)  // 100ms
+        }
+        terminateSwtpm()
+        throw VMError.startFailed("swtpm 启动 3 秒内未产生 socket, 请检查 \(logFile.path)")
+    }
+
+    /// 终止 swtpm 子进程(幂等)。QEMU 退出时 socket terminate 已会让 swtpm 自退出,
+    /// 这里是双保险 / 异常路径清理。
+    private func terminateSwtpm() {
+        let proc: Process? = withStateLock {
+            let p = self.swtpmProcess
+            self.swtpmProcess = nil
+            return p
+        }
+        guard let proc, proc.isRunning else { return }
+        kill(proc.processIdentifier, SIGTERM)
+    }
+
     /// 构造 qemu 命令行参数
-    private func buildArguments(efiVars: URL) throws -> [String] {
+    /// - Parameter tpmSocketPath: 若非 nil, 会加 `-chardev/-tpmdev/-device tpm-tis-device` 三件套
+    private func buildArguments(efiVars: URL, tpmSocketPath: String? = nil) throws -> [String] {
         var args: [String] = []
 
         // 运行时控制通道:PID 文件 + 两个 QMP socket
@@ -285,19 +396,37 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             ]
         }
 
-        // 用户态网络(NAT)
-        args += ["-netdev", "user,id=net0"]
-        args += ["-device", "virtio-net-pci,netdev=net0"]
+        // TPM 2.0(swtpm + tpm-tis-device): QEMU 通过 chardev socket 连入 swtpm
+        if let sockPath = tpmSocketPath {
+            args += [
+                "-chardev", "socket,id=chrtpm,path=\(sockPath)",
+                "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
+                "-device", "tpm-tis-device,tpmdev=tpm0",
+            ]
+        }
+
+        // 网络(user / vmnet* / none, 详见 NetworkConfig)
+        args += buildNetArgs(config.networks)
 
         if config.boot.graphical {
             // 图形模式: virtio-gpu + USB HID + iosurface backend
             args += ["-device", "virtio-gpu-pci"]
+            // ramfb 备用帧缓冲: 供早期 bootloader(bootmgfw 等)使用,避免只依赖 virtio-gpu GOP 实现
+            args += ["-device", "ramfb"]
             // USB HID 键鼠: UEFI 只内置 USB 驱动, 不识别 virtio-kbd/tablet
             args += ["-device", "qemu-xhci,id=usbbus"]
             args += ["-device", "usb-kbd,bus=usbbus.0"]
             args += ["-device", "usb-tablet,bus=usbbus.0"]
-            // guest 串口丢弃(QEMU 自身日志走 Process stdout/stderr -> Logger)
-            args += ["-serial", "null"]
+            if config.boot.serialDebug {
+                // 诊断模式:guest 串口写到 edk2.log, 抓 EDK2 / bootmgr / kernel early debug
+                // 每次启动前先清旧内容(QEMU -serial file: 是 append 模式, 不清就无限增长)
+                try? FileManager.default.removeItem(at: bundle.edk2LogURL)
+                try FileManager.default.createDirectory(at: bundle.logsDirURL, withIntermediateDirectories: true)
+                args += ["-serial", "file:\(bundle.edk2LogURL.path)"]
+            } else {
+                // 默认: guest 串口丢弃, 避免不需要诊断时日志无限增长
+                args += ["-serial", "null"]
+            }
             args += ["-vga", "none"]
             // IOSurface 后端: 每 VM 独占一个 unix socket
             args += ["-display", "iosurface,socket=\(bundle.iosurfaceSocketURL.path)"]
@@ -310,5 +439,37 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         }
 
         return args
+    }
+
+    /// 根据 NetworkConfig 列表产出 `-netdev` / `-device` / `-nic` 参数。
+    /// 目前仅消费第一块网卡(多网卡 P6+);空数组或 .none 均视作禁用网络。
+    private func buildNetArgs(_ networks: [NetworkConfig]) -> [String] {
+        guard let net = networks.first, net.mode != .none else {
+            // 禁用全部自动网卡(QEMU 不加 -nic none 时会隐式兜底一张 user)
+            return ["-nic", "none"]
+        }
+
+        let netdevID = "net0"
+        var deviceOpts = "virtio-net-pci,netdev=\(netdevID)"
+        if let mac = net.macAddress, !mac.isEmpty {
+            deviceOpts += ",mac=\(mac)"
+        }
+
+        var out: [String] = []
+        switch net.mode {
+        case .user:
+            out += ["-netdev", "user,id=\(netdevID)"]
+            out += ["-device", deviceOpts]
+        case .vmnetShared, .vmnetHost, .vmnetBridged:
+            // socket_vmnet 约定:QEMU 以 unix stream 连 helper socket, helper
+            // 把以太网帧转进 vmnet.framework。helper 模式(shared/host/bridged)
+            // 由 daemon 启动参数决定, 这里只负责指向对应 socket。
+            let sock = net.effectiveSocketPath ?? "/var/run/socket_vmnet"
+            out += ["-netdev", "stream,id=\(netdevID),addr.type=unix,addr.path=\(sock)"]
+            out += ["-device", deviceOpts]
+        case .none:
+            break   // 已在 guard 里处理
+        }
+        return out
     }
 }
