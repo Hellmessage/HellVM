@@ -14,9 +14,11 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
 
     private let stateLock = NSLock()
     private var _state: VMState = .stopped
-    private var process: Process?
-    /// swtpm 子进程(启用 TPM 时在 QEMU 之前拉起,QEMU 退出时连带清理)
-    private var swtpmProcess: Process?
+    /// QEMU 子进程, 走 posix_spawn + 独立 process group
+    private var process: SpawnedProcess?
+    /// swtpm 子进程 —— 启用 TPM 时先拉起, 作为 pg leader, QEMU 加入同 pg
+    /// 这样 stop(force:true) 一次 killpg 就能原子清掉两者, 不会留孤儿
+    private var swtpmProcess: SpawnedProcess?
 
     public var state: VMState {
         withStateLock { _state }
@@ -40,84 +42,80 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         try ensureState(.stopped, action: "start")
         setState(.starting)
 
-        let efiVars = try prepareEFIVars()
+        let efiVars: URL
+        do {
+            efiVars = try prepareEFIVars()
+        } catch {
+            setState(.error)
+            throw error
+        }
 
         // 启用 TPM: 先起 swtpm 子进程, 让它 listen 在 unix socket 上, QEMU 后面通过 chardev 连入
+        // swtpm 作 pg leader, QEMU 加入同 pg → stop(force) 时 killpg 一次清干净
         var tpmSocketPath: String? = nil
+        var swtpmStarted: SpawnedProcess? = nil
         if config.boot.tpm {
             do {
                 tpmSocketPath = try startSwtpm()
+                swtpmStarted = withStateLock { self.swtpmProcess }
             } catch {
                 setState(.error)
                 throw error
             }
         }
 
-        let args = try buildArguments(efiVars: efiVars, tpmSocketPath: tpmSocketPath)
+        let args: [String]
+        do {
+            args = try buildArguments(efiVars: efiVars, tpmSocketPath: tpmSocketPath)
+        } catch {
+            if swtpmStarted != nil { terminateSwtpm() }
+            setState(.error)
+            throw error
+        }
 
         let qemuURL = paths.qemuSystem(config.architecture)
         guard FileManager.default.isExecutableFile(atPath: qemuURL.path) else {
+            if swtpmStarted != nil { terminateSwtpm() }
             setState(.error)
             throw VMError.startFailed("找不到 qemu 可执行文件:\(qemuURL.path)")
         }
 
-        let proc = Process()
-        proc.executableURL = qemuURL
-        proc.arguments = args
-
-        // GUI 模式: stdin 丢 /dev/null; stdout/stderr 走 Pipe, 逐行送 Logger(.qemu)
-        // 日志统一落到 <bundle>/logs/hellvm.log(Logger 管理 + 10MB 滚动), 不再
-        // 单独维护 qemu.log。
-        proc.standardInput = FileHandle(forReadingAtPath: "/dev/null")
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        proc.standardOutput = stdoutPipe
-        proc.standardError  = stderrPipe
-
-        let outBuffer = LineBuffer()
-        stdoutPipe.fileHandleForReading.readabilityHandler = { h in
-            let data = h.availableData
-            if data.isEmpty {
-                h.readabilityHandler = nil
-                return
-            }
-            outBuffer.append(data)
-            outBuffer.drainLines { line in log.info(.qemu, line) }
-        }
-        let errBuffer = LineBuffer()
-        stderrPipe.fileHandleForReading.readabilityHandler = { h in
-            let data = h.availableData
-            if data.isEmpty {
-                h.readabilityHandler = nil
-                return
-            }
-            errBuffer.append(data)
-            errBuffer.drainLines { line in log.warn(.qemu, line) }
-        }
-
-        proc.terminationHandler = { [weak self] p in
-            // 关闭 pipe handler, 避免僵尸 readability callback
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            // QEMU 退出时连带杀掉 swtpm(swtpm 带 --ctrl ...,terminate 也会自动退, 这里是双保险)
-            self?.terminateSwtpm()
-            self?.setState(.stopped)
-        }
-
+        // GUI 模式: stdin=/dev/null, stdout/stderr 逐行送 Logger(.qemu).
+        // 日志统一落到 <bundle>/logs/hellvm.log (Logger 10MB 滚动).
+        let spawned: SpawnedProcess
         do {
-            try proc.run()
+            spawned = try SpawnedProcess.spawn(
+                executable: qemuURL,
+                arguments: args,
+                joinPGID: swtpmStarted?.pgid,
+                lineHandler: { line, isStderr in
+                    if isStderr {
+                        log.warn(.qemu, line)
+                    } else {
+                        log.info(.qemu, line)
+                    }
+                }
+            )
         } catch {
+            if swtpmStarted != nil { terminateSwtpm() }
             setState(.error)
             throw VMError.startFailed("启动 qemu 失败:\(error.localizedDescription)")
         }
 
-        withStateLock { self.process = proc }
+        spawned.terminationHandler = { [weak self] _ in
+            guard let self = self else { return }
+            // QEMU 退出时连带杀掉 swtpm(swtpm 的 ,terminate 标志也会自退, 双保险)
+            self.terminateSwtpm()
+            self.withStateLock { self.process = nil }
+            self.setState(.stopped)
+        }
+
+        withStateLock { self.process = spawned }
         setState(.running)
     }
 
     public func stop(force: Bool) async throws {
-        let proc: Process? = withStateLock {
+        let proc: SpawnedProcess? = withStateLock {
             guard let p = self.process, self._state == .running || self._state == .starting else {
                 return nil
             }
@@ -128,13 +126,13 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         stateContinuation.yield(.stopping)
 
         if force {
-            kill(proc.processIdentifier, SIGKILL)
-            // 强制停止时 QEMU terminationHandler 可能来不及跑, 这里兜底
-            terminateSwtpm()
+            // killpg 一次清掉整个 pg (QEMU + swtpm 原子, 不会留孤儿).
+            // 若未启 TPM, pg 只有 QEMU 自己, 等价于 kill(qemu, SIGKILL).
+            proc.terminateProcessGroup(SIGKILL)
         } else {
-            // 优先走 QMP system_powerdown,失败再退回 SIGTERM
+            // 优先走 QMP system_powerdown, 失败再退回 SIGTERM
             if !(await gracefulPowerdown()) {
-                kill(proc.processIdentifier, SIGTERM)
+                proc.sendSignal(SIGTERM)
             }
         }
     }
@@ -150,7 +148,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     /// 阻塞等待 VM 进程退出(GUI 异步模式使用)
     public func waitUntilExit() async {
         let proc = withStateLock { self.process }
-        proc?.waitUntilExit()
+        if let p = proc { _ = await p.waitForExit() }
     }
 
     // MARK: - QMP 便捷方法
@@ -178,30 +176,6 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return body()
-    }
-
-    /// 流式切行 buffer: 类而非 inout Data, 避免并发闭包里捕获 var 的警告
-    private final class LineBuffer: @unchecked Sendable {
-        private var data = Data()
-
-        func append(_ chunk: Data) { data.append(chunk) }
-
-        /// 每凑出一行(不含 \n)就回调
-        func drainLines(_ emit: (String) -> Void) {
-            while let nlIdx = data.firstIndex(of: 0x0a) {
-                let lineData = data[data.startIndex..<nlIdx]
-                data.removeSubrange(data.startIndex...nlIdx)
-                var line = String(data: Data(lineData), encoding: .utf8) ?? ""
-                if line.hasSuffix("\r") { line.removeLast() }
-                if !line.isEmpty { emit(line) }
-            }
-            // 超长单行保护(无 \n), 避免 buffer 无限增长
-            if data.count > 64 * 1024 {
-                let line = String(data: data, encoding: .utf8) ?? ""
-                data.removeAll(keepingCapacity: true)
-                if !line.isEmpty { emit(line) }
-            }
-        }
     }
 
     /// CLI 前台模式:用 execv 替换当前进程为 qemu。
@@ -438,9 +412,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         try fm.createDirectory(at: bundle.logsDirURL, withIntermediateDirectories: true)
         try? fm.removeItem(at: sockURL)  // 陈旧 socket 清理
 
-        let proc = Process()
-        proc.executableURL = swtpmURL
-        proc.arguments = [
+        let swtpmArgs = [
             "socket",
             "--tpmstate", "dir=\(stateDir.path)",
             "--ctrl", "type=unixio,path=\(sockURL.path),terminate",
@@ -448,32 +420,29 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             "--flags", "startup-clear",
             "--log", "level=5,file=\(logFile.path)",
         ]
-        // swtpm 的 stdout/stderr 并入主 log, 方便排查启动失败
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-        pipe.fileHandleForReading.readabilityHandler = { h in
-            let data = h.availableData
-            if data.isEmpty { h.readabilityHandler = nil; return }
-            if let s = String(data: data, encoding: .utf8) {
-                for line in s.split(separator: "\n") {
+
+        // swtpm 先起 → 自己当 pg leader; QEMU 后加入同 pg, 便于 killpg 原子清理.
+        // stdout/stderr 并入主 log, 方便排查启动失败.
+        let spawned: SpawnedProcess
+        do {
+            spawned = try SpawnedProcess.spawn(
+                executable: swtpmURL,
+                arguments: swtpmArgs,
+                joinPGID: nil,
+                lineHandler: { line, _ in
                     log.warn(.qemu, "[swtpm] \(line)")
                 }
-            }
-        }
-
-        do {
-            try proc.run()
+            )
         } catch {
             throw VMError.startFailed("swtpm 启动失败: \(error.localizedDescription)")
         }
 
-        withStateLock { self.swtpmProcess = proc }
+        withStateLock { self.swtpmProcess = spawned }
 
         // 等 socket 出现(最多 3 秒), 出不来说明 swtpm 挂了
         for _ in 0..<30 {
             if fm.fileExists(atPath: sockURL.path) {
-                log.info(.qemu, "[swtpm] 已启动, socket=\(sockURL.path) state=\(stateDir.path)")
+                log.info(.qemu, "[swtpm] 已启动, pid=\(spawned.pid) socket=\(sockURL.path) state=\(stateDir.path)")
                 return sockURL.path
             }
             usleep(100_000)  // 100ms
@@ -485,13 +454,13 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     /// 终止 swtpm 子进程(幂等)。QEMU 退出时 socket terminate 已会让 swtpm 自退出,
     /// 这里是双保险 / 异常路径清理。
     private func terminateSwtpm() {
-        let proc: Process? = withStateLock {
+        let proc: SpawnedProcess? = withStateLock {
             let p = self.swtpmProcess
             self.swtpmProcess = nil
             return p
         }
         guard let proc, proc.isRunning else { return }
-        kill(proc.processIdentifier, SIGTERM)
+        proc.sendSignal(SIGTERM)
     }
 
     /// 构造 qemu 命令行参数

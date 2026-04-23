@@ -1,4 +1,6 @@
-// 新建 VM 向导 —— 视觉打磨:大图标 + 分组表单 + accent 主按钮
+// 新建 VM 向导 —— 大图标 + 分组表单 + accent 主按钮
+//
+// 字段承接在 VMConfigDraft 上, 便于与 Settings 层共享默认值与校验逻辑。
 import SwiftUI
 import UniformTypeIdentifiers
 import HVMCore
@@ -7,25 +9,13 @@ struct NewVMWizardView: View {
     let onCancel: () -> Void
     let onCreated: (String) -> Void
 
-    @State private var name: String = ""
-    @State private var architecture: VMArchitecture = .aarch64
-    @State private var osType: GuestOSType = .linux
-    @State private var cpuCount: Int = 2
-    @State private var memoryMB: Int = 2048
-    @State private var diskSizeGB: Int = 20
-    @State private var isoPath: String = ""
-    @State private var graphical: Bool = true
-    @State private var networkMode: NetworkConfig.Mode = .user
-    @State private var bridgedInterface: String = HostNetworkInterfaces.recommendedDefault()
-
+    @State private var draft: VMConfigDraft = .forNewVM()
     @State private var submitting: Bool = false
     @State private var errorText: String?
 
     @StateObject private var virtioWin = VirtioWinManager.shared
 
-    var canSubmit: Bool {
-        !name.isEmpty && cpuCount > 0 && memoryMB >= 128 && diskSizeGB > 0 && !submitting
-    }
+    var canSubmit: Bool { draft.canSubmit && !submitting }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,7 +24,7 @@ struct NewVMWizardView: View {
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 22) {
                     FieldLabel("名称")
-                    StyledTextField(placeholder: "例如 ubuntu-24", text: $name)
+                    StyledTextField(placeholder: "例如 ubuntu-24", text: $draft.name)
 
                     FieldLabel("架构")
                     archPicker
@@ -42,27 +32,38 @@ struct NewVMWizardView: View {
                     FieldLabel("客户机类型")
                     osTypePicker
                     osTypeHint
-                    if osType == .windows {
+                    if draft.config.osType == .windows {
                         virtioWinStatusRow
                     }
 
                     HStack(alignment: .top, spacing: 16) {
                         VStack(alignment: .leading, spacing: 8) {
                             FieldLabel("CPU 核心")
-                            StepperCard(value: $cpuCount, unit: "核", range: 1...16, step: 1)
+                            StepperCard(value: $draft.config.cpuCount, unit: "核",
+                                        range: 1...16, step: 1)
                         }
                         VStack(alignment: .leading, spacing: 8) {
                             FieldLabel("内存")
-                            StepperCard(value: $memoryMB, unit: "MB", range: 256...65536, step: 512)
+                            StepperCard(value: Binding(
+                                get: { Int(draft.config.memoryMB) },
+                                set: { draft.config.memoryMB = UInt64($0) }
+                            ), unit: "MB", range: 256...65536, step: 512)
                         }
                     }
 
                     FieldLabel("磁盘大小")
-                    StepperCard(value: $diskSizeGB, unit: "GB", range: 1...1024, step: 5)
+                    StepperCard(value: $draft.firstDiskSizeGB, unit: "GB", range: 1...1024, step: 5)
 
                     FieldLabel("ISO(可选)")
                     HStack(spacing: 8) {
-                        StyledTextField(placeholder: "启动光盘路径", text: $isoPath, monospaced: true)
+                        StyledTextField(
+                            placeholder: "启动光盘路径",
+                            text: Binding(
+                                get: { draft.config.boot.isoPath ?? "" },
+                                set: { v in draft.config.boot.isoPath = v.isEmpty ? nil : v }
+                            ),
+                            monospaced: true
+                        )
                         SecondaryButton(title: "选择…", systemImage: "folder") { pickISO() }
                     }
 
@@ -71,11 +72,12 @@ struct NewVMWizardView: View {
 
                     FieldLabel("网络模式")
                     networkPicker
-                    if networkMode == .vmnetBridged {
+                    if draft.primaryNetworkMode == .vmnetBridged {
                         bridgedInterfacePicker
                     }
-                    if networkMode == .vmnetShared || networkMode == .vmnetHost
-                        || networkMode == .vmnetBridged {
+                    if draft.primaryNetworkMode == .vmnetShared ||
+                       draft.primaryNetworkMode == .vmnetHost ||
+                       draft.primaryNetworkMode == .vmnetBridged {
                         vmnetDaemonHint
                     }
 
@@ -100,7 +102,7 @@ struct NewVMWizardView: View {
         }
     }
 
-    // MARK: - Header
+    // MARK: - Header / Footer
 
     private var header: some View {
         HStack(spacing: 12) {
@@ -127,8 +129,6 @@ struct NewVMWizardView: View {
         .padding(.vertical, 14)
     }
 
-    // MARK: - Footer
-
     private var footerBar: some View {
         HStack(spacing: 10) {
             Spacer()
@@ -142,30 +142,31 @@ struct NewVMWizardView: View {
         .background(Theme.surface)
     }
 
-    // MARK: - 架构选择
+    // MARK: - 架构 / OS 类型
 
     private var archPicker: some View {
         HStack(spacing: 8) {
             archCard(.aarch64, title: "aarch64", subtitle: "Apple Silicon 主力", icon: "cpu")
-            archCard(.x86_64, title: "x86_64", subtitle: "Intel / AMD", icon: "cpu.fill")
-            archCard(.riscv64, title: "riscv64", subtitle: "实验性", icon: "bolt.fill")
+            archCard(.x86_64,  title: "x86_64",  subtitle: "Intel / AMD",        icon: "cpu.fill")
+            archCard(.riscv64, title: "riscv64", subtitle: "实验性",              icon: "bolt.fill")
         }
     }
 
-    // MARK: - 客户机类型选择
-
     private var osTypePicker: some View {
         HStack(spacing: 8) {
-            osCard(.linux,   title: "Linux",   subtitle: "virtio-gpu 加速",  icon: "terminal.fill")
-            osCard(.windows, title: "Windows", subtitle: "GPU + TPM", icon: "square.stack.fill")
+            osCard(.linux,   title: "Linux",   subtitle: "virtio-gpu 加速", icon: "terminal.fill")
+            osCard(.windows, title: "Windows", subtitle: "GPU + TPM",       icon: "square.stack.fill")
             osCard(.macOS,   title: "macOS",   subtitle: "实验性",           icon: "apple.logo")
             osCard(.other,   title: "其他",    subtitle: "手动调",           icon: "questionmark.circle")
         }
     }
 
     private func osCard(_ type: GuestOSType, title: String, subtitle: String, icon: String) -> some View {
-        let selected = osType == type
-        return Button(action: { osType = type }) {
+        let selected = draft.config.osType == type
+        return Button(action: {
+            draft.config.osType = type
+            draft.applyOSDefaults(graphical: draft.config.boot.graphical)
+        }) {
             VStack(alignment: .leading, spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 16, weight: .medium))
@@ -179,14 +180,8 @@ struct NewVMWizardView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: 9)
-                    .fill(selected ? Theme.accent.opacity(0.12) : Theme.surfaceElevated)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9)
-                    .stroke(selected ? Theme.accent : Color.clear, lineWidth: 1)
-            )
+            .background(RoundedRectangle(cornerRadius: 9).fill(selected ? Theme.accent.opacity(0.12) : Theme.surfaceElevated))
+            .overlay(RoundedRectangle(cornerRadius: 9).stroke(selected ? Theme.accent : Color.clear, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -197,8 +192,7 @@ struct NewVMWizardView: View {
         let status = VirtioWinManager.status()
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 8) {
-                Image(systemName: status.exists ? "checkmark.seal.fill"
-                      : (virtioWin.downloadProgress != nil ? "arrow.down.circle" : "shippingbox"))
+                Image(systemName: status.exists ? "checkmark.seal.fill" : (virtioWin.downloadProgress != nil ? "arrow.down.circle" : "shippingbox"))
                     .font(.system(size: 11))
                     .foregroundStyle(status.exists ? Theme.success : Theme.warning)
                 VStack(alignment: .leading, spacing: 2) {
@@ -231,9 +225,7 @@ struct NewVMWizardView: View {
                 }
             }
             if let p = virtioWin.downloadProgress {
-                ProgressView(value: p)
-                    .progressViewStyle(.linear)
-                    .tint(Theme.accent)
+                ProgressView(value: p).progressViewStyle(.linear).tint(Theme.accent)
             }
         }
         .padding(10)
@@ -247,7 +239,7 @@ struct NewVMWizardView: View {
 
     @ViewBuilder
     private var osTypeHint: some View {
-        if osType == .windows {
+        if draft.config.osType == .windows {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "info.circle")
                     .font(.system(size: 11))
@@ -262,8 +254,8 @@ struct NewVMWizardView: View {
     }
 
     private func archCard(_ arch: VMArchitecture, title: String, subtitle: String, icon: String) -> some View {
-        let selected = architecture == arch
-        return Button(action: { architecture = arch }) {
+        let selected = draft.config.architecture == arch
+        return Button(action: { draft.config.architecture = arch }) {
             VStack(alignment: .leading, spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 16, weight: .medium))
@@ -277,23 +269,23 @@ struct NewVMWizardView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: 9)
-                    .fill(selected ? Theme.accent.opacity(0.12) : Theme.surfaceElevated)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9)
-                    .stroke(selected ? Theme.accent : Color.clear, lineWidth: 1)
-            )
+            .background(RoundedRectangle(cornerRadius: 9).fill(selected ? Theme.accent.opacity(0.12) : Theme.surfaceElevated))
+            .overlay(RoundedRectangle(cornerRadius: 9).stroke(selected ? Theme.accent : Color.clear, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
 
+    // MARK: - 显示模式
+
     private var graphicalToggle: some View {
         HStack(spacing: 10) {
             ForEach([true, false], id: \.self) { g in
-                let selected = graphical == g
-                Button(action: { graphical = g }) {
+                let selected = draft.config.boot.graphical == g
+                Button(action: {
+                    draft.config.boot.graphical = g
+                    // graphical 切换会影响 display/boot 的推荐默认 (特别是 Windows)
+                    draft.applyOSDefaults(graphical: g)
+                }) {
                     HStack(spacing: 8) {
                         Image(systemName: g ? "display" : "terminal")
                             .font(.system(size: 14))
@@ -310,14 +302,8 @@ struct NewVMWizardView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(selected ? Theme.surfaceElevated : Theme.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1)
-                    )
+                    .background(RoundedRectangle(cornerRadius: 8).fill(selected ? Theme.surfaceElevated : Theme.surface))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1))
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -325,7 +311,7 @@ struct NewVMWizardView: View {
         }
     }
 
-    // MARK: - 网络模式选择
+    // MARK: - 网络模式
 
     private var networkPicker: some View {
         HStack(spacing: 6) {
@@ -338,8 +324,8 @@ struct NewVMWizardView: View {
     }
 
     private func networkChip(_ mode: NetworkConfig.Mode, title: String, icon: String) -> some View {
-        let selected = networkMode == mode
-        return Button(action: { networkMode = mode }) {
+        let selected = draft.primaryNetworkMode == mode
+        return Button(action: { draft.primaryNetworkMode = mode }) {
             VStack(spacing: 4) {
                 Image(systemName: icon)
                     .font(.system(size: 13))
@@ -350,19 +336,11 @@ struct NewVMWizardView: View {
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(selected ? Theme.accent.opacity(0.15) : Theme.surfaceElevated)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1)
-            )
+            .background(RoundedRectangle(cornerRadius: 8).fill(selected ? Theme.accent.opacity(0.15) : Theme.surfaceElevated))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
-
-    // MARK: - 桥接接口选择
 
     @ViewBuilder
     private var bridgedInterfacePicker: some View {
@@ -371,7 +349,7 @@ struct NewVMWizardView: View {
             FieldLabel("桥接接口")
             Menu {
                 ForEach(ifaces, id: \.id) { iface in
-                    Button(iface.displayLabel) { bridgedInterface = iface.name }
+                    Button(iface.displayLabel) { draft.primaryBridgedInterface = iface.name }
                 }
                 if ifaces.isEmpty {
                     Button("(扫描不到接口)") {}.disabled(true)
@@ -380,7 +358,7 @@ struct NewVMWizardView: View {
                 HStack {
                     Image(systemName: "antenna.radiowaves.left.and.right")
                         .foregroundStyle(Theme.textSecondary)
-                    Text(menuLabel(for: bridgedInterface, among: ifaces))
+                    Text(menuLabel(for: draft.primaryBridgedInterface, among: ifaces))
                         .foregroundStyle(Theme.textPrimary)
                     Spacer()
                     Image(systemName: "chevron.down")
@@ -396,17 +374,14 @@ struct NewVMWizardView: View {
     }
 
     private func menuLabel(for name: String, among ifaces: [HostNetworkInterface]) -> String {
-        if let hit = ifaces.first(where: { $0.name == name }) {
-            return hit.displayLabel
-        }
+        if let hit = ifaces.first(where: { $0.name == name }) { return hit.displayLabel }
         return "\(name) — (当前不存在)"
     }
 
-    /// vmnet 模式下提示 daemon 状态, 缺失时提示到 Settings 安装
     @ViewBuilder
     private var vmnetDaemonHint: some View {
-        let fakeNet = NetworkConfig(mode: networkMode,
-                                    bridgedInterface: bridgedInterface)
+        let fakeNet = NetworkConfig(mode: draft.primaryNetworkMode,
+                                    bridgedInterface: draft.primaryBridgedInterface)
         let status = VMnetSupervisor.status(for: fakeNet)
         let ok = status.socketExists
         HStack(alignment: .top, spacing: 8) {
@@ -435,18 +410,19 @@ struct NewVMWizardView: View {
         defer { submitting = false }
         do {
             _ = try await VMController.create(
-                name: name,
-                architecture: architecture,
-                osType: osType,
-                cpu: cpuCount,
-                memoryMB: UInt64(memoryMB),
-                diskSizeGB: UInt64(diskSizeGB),
-                isoPath: isoPath.isEmpty ? nil : isoPath,
-                graphical: graphical,
-                networkMode: networkMode,
-                bridgedInterface: networkMode == .vmnetBridged ? bridgedInterface : nil
+                name: draft.name,
+                architecture: draft.config.architecture,
+                osType: draft.config.osType,
+                cpu: draft.config.cpuCount,
+                memoryMB: draft.config.memoryMB,
+                diskSizeGB: UInt64(draft.firstDiskSizeGB),
+                isoPath: draft.config.boot.isoPath,
+                graphical: draft.config.boot.graphical,
+                networkMode: draft.primaryNetworkMode,
+                bridgedInterface: draft.primaryNetworkMode == .vmnetBridged
+                    ? draft.primaryBridgedInterface : nil
             )
-            onCreated(name)
+            onCreated(draft.name)
         } catch {
             errorText = "\(error)"
         }
@@ -461,8 +437,7 @@ struct NewVMWizardView: View {
             UTType(filenameExtension: "img") ?? .data,
         ]
         if panel.runModal() == .OK, let url = panel.url {
-            isoPath = url.path
+            draft.config.boot.isoPath = url.path
         }
     }
 }
-
