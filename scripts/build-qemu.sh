@@ -8,6 +8,7 @@
 #   QEMU_JOBS      默认 $(sysctl -n hw.ncpu)
 #   SKIP_SIGN      非空则跳过签名步骤(用于调试)
 set -euo pipefail
+source "$(dirname "$0")/common.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENDOR="$ROOT/Vendor"
@@ -57,13 +58,6 @@ if [ ${#missing[@]} -gt 0 ]; then
 fi
 
 # ---------- 签名身份 ----------
-resolve_sign_identity() {
-    if [ -n "${SIGN_IDENTITY:-}" ]; then echo "$SIGN_IDENTITY"; return; fi
-    if security find-identity -v -p codesigning 2>/dev/null | grep -q '"Hell Dev"'; then
-        echo "Hell Dev"; return
-    fi
-    echo "-"
-}
 SIGN_ID="$(resolve_sign_identity)"
 
 # ---------- 获取源码 ----------
@@ -92,6 +86,17 @@ fi
 
 # QEMU 的 pc-bios/ 携带预编译 UEFI/BIOS 固件,不需要 EDK2 源码。
 # 构建期 meson 会按需下载少量 subprojects(keycodemapdb/slirp),不做 --disable-download
+
+# ---------- ccache ----------
+# 可选: 若系统装了 ccache 就让它代理 cc/cxx,加速重编 (首次完全缓存未命中,后续命中率 70%+)
+# 没装就静默跳过,保持"零环境可构建"承诺
+if command -v ccache >/dev/null 2>&1; then
+    export CC="ccache clang"
+    export CXX="ccache clang++"
+    echo "==> ccache 已启用 ($(ccache --version | head -n1))"
+else
+    echo "==> ccache 未安装, 使用系统 clang (brew install ccache 可加速重编)"
+fi
 
 # ---------- 配置 ----------
 echo "==> configure (prefix=$PREFIX targets=$QEMU_TARGETS)"

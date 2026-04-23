@@ -91,6 +91,23 @@ if [ -d "$PATCHES_DIR" ] && ls "$PATCHES_DIR"/*.patch >/dev/null 2>&1; then
         || { echo "补丁应用失败"; exit 1; }
 fi
 
+# ---------- 3.5 ccache ----------
+# EDK2 通过 $GCC5_AARCH64_PREFIX + gcc/g++ 走 PATH 查找。brew ccache 的 libexec 里
+# 只 symlink 了常见编译器,没有 aarch64-elf-gcc。自己造 wrapper 目录,塞到 PATH 前面。
+# 没装 ccache 就静默跳过。
+if command -v ccache >/dev/null 2>&1; then
+    CCACHE_WRAPPERS="$VENDOR/.ccache-wrappers"
+    mkdir -p "$CCACHE_WRAPPERS"
+    CCACHE_BIN="$(command -v ccache)"
+    for tool in aarch64-elf-gcc aarch64-elf-g++ clang clang++ cc c++; do
+        ln -sf "$CCACHE_BIN" "$CCACHE_WRAPPERS/$tool"
+    done
+    export PATH="$CCACHE_WRAPPERS:$PATH"
+    echo "==> ccache 已启用 (wrappers: $CCACHE_WRAPPERS)"
+else
+    echo "==> ccache 未安装, 使用原生交叉工具链 (brew install ccache 可加速重编)"
+fi
+
 # ---------- 4. BaseTools ----------
 # EDK2 的 Python 构建系统首次需要编译 C 小工具链
 export WORKSPACE="$SRC"

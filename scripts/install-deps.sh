@@ -106,7 +106,7 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 
 # ---------- 3/4. formulas ----------
-BUILD=(ninja pkg-config meson glib pixman dtc libslirp
+BUILD=(ninja pkg-config meson glib pixman dtc libslirp ccache
        aarch64-elf-gcc aarch64-elf-binutils)
 RUNTIME=(socket_vmnet)
 

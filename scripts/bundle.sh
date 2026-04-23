@@ -8,6 +8,7 @@
 #   6. codesign         —— 自下而上:dylib → QEMU → 主 App
 #   7. 验证
 set -euo pipefail
+source "$(dirname "$0")/common.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
@@ -23,13 +24,7 @@ VENDOR_QEMU="$ROOT/Vendor/qemu"
 cd "$ROOT"
 
 # ---------- 签名身份 ----------
-resolve_sign_identity() {
-    if [ -n "${SIGN_IDENTITY:-}" ]; then echo "$SIGN_IDENTITY"; return; fi
-    if security find-identity -v -p codesigning 2>/dev/null | grep -q '"Hell Dev"'; then
-        echo "Hell Dev"; return
-    fi
-    echo "-"
-}
+# resolve_sign_identity 来自 scripts/common.sh
 
 # ---------- 1. 依赖 ----------
 # 首次构建提示: 若 CLT 或 Homebrew 缺失, 提前告知用户 sudo + 耗时

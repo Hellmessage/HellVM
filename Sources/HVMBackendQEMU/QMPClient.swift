@@ -135,10 +135,30 @@ public actor QMPClient {
         return fd
     }
 
+    /// 读 socket 的超时(毫秒)。QEMU 半死(socket 半开、不 flush) 时兜底,
+    /// 避免 Task 永远 hang。默认 5 秒足以覆盖正常命令响应。
+    private static let readTimeoutMs: Int32 = 5000
+
     /// 把阻塞 read 封装成 async(用后台 queue 避免卡 actor)
+    /// 用 poll() 先等可读事件, 超时抛 VMError.backendUnavailable
     private static func blockingRead(fd: Int32) async throws -> Data {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let pollRc = withUnsafeMutablePointer(to: &pfd) { ptr in
+                    Darwin.poll(ptr, 1, readTimeoutMs)
+                }
+                if pollRc == 0 {
+                    cont.resume(throwing: VMError.backendUnavailable(
+                        "QMP read 超时 (\(readTimeoutMs)ms), QEMU 可能已死"))
+                    return
+                }
+                if pollRc < 0 {
+                    cont.resume(throwing: VMError.backendUnavailable(
+                        "poll() 失败:\(String(cString: strerror(errno)))"))
+                    return
+                }
+                // POLLHUP / POLLERR 也会让 poll 返回 >0, 后面 read 会返回 0 或 -1
                 var buf = [UInt8](repeating: 0, count: 4096)
                 let n = buf.withUnsafeMutableBufferPointer { bp -> Int in
                     Darwin.read(fd, bp.baseAddress, bp.count)
