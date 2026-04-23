@@ -11,6 +11,20 @@ struct VMController {
     @MainActor
     static func start(_ item: VMListItem, store: VMListStore) async throws {
         log.info(.backend, "start enter name=\(item.config.name) isRunning=\(item.isRunning)")
+
+        // vmnet 预检: 任一网卡走 vmnet* 但 socket 不存在 → 拒启动并给明确指引,
+        // 避免让 QEMU 起来后因为 connect(unix) EACCES 死黑屏
+        for net in item.config.networks {
+            let status = VMnetSupervisor.status(for: net)
+            if status.required && !status.socketExists {
+                throw VMError.startFailed("""
+                vmnet 后端 socket 不存在: \(status.socketPath ?? "(未知)")
+                请到 Settings → 网络 → 点 "安装 vmnet daemon" 一次性初始化 \
+                (需管理员密码; 以后重启不用再装).
+                """)
+            }
+        }
+
         let paths = try QEMUPaths.discover()
         log.debug(.backend, "QEMUPaths.discover OK prefix=\(paths.prefix.path)")
         let backend = try QEMUBackend(config: item.config, bundle: item.bundle, paths: paths)
@@ -84,7 +98,8 @@ struct VMController {
         diskSizeGB: UInt64,
         isoPath: String?,
         graphical: Bool = true,
-        networkMode: NetworkConfig.Mode = .user
+        networkMode: NetworkConfig.Mode = .user,
+        bridgedInterface: String? = nil
     ) async throws -> VMBundle {
         // 名称校验
         guard !name.isEmpty, !name.contains("/"), !name.contains("\0") else {
@@ -111,12 +126,13 @@ struct VMController {
         }
 
         // 构造配置 + 创建 bundle
-        // display/boot 按 osType 推导默认值: Windows 关闭 virtio-gpu 并启用 TPM/bypass,
-        // Linux/macOS 默认启用 virtio-gpu, other 保持历史行为
+        // display/boot/NIC 按 osType 推导默认值: Windows 关闭 virtio-gpu 并启用 TPM/bypass
+        // 且 NIC 选 e1000e(开箱自带驱动), Linux/macOS 默认启用 virtio-gpu + virtio-net,
+        // other 保持历史行为
         let disk = DiskConfig(relativePath: "disks/main.qcow2", sizeGB: diskSizeGB, format: .qcow2)
-        let (display, boot) = VMConfig.defaults(for: osType,
-                                                graphical: graphical,
-                                                isoPath: isoAbs)
+        let (display, boot, nic) = VMConfig.defaults(for: osType,
+                                                     graphical: graphical,
+                                                     isoPath: isoAbs)
         let config = VMConfig(
             name: name,
             architecture: architecture,
@@ -124,7 +140,10 @@ struct VMController {
             cpuCount: cpu,
             memoryMB: memoryMB,
             disks: [disk],
-            networks: [NetworkConfig(mode: networkMode)],
+            networks: [NetworkConfig(mode: networkMode,
+                                     macAddress: NetworkConfig.generateRandomMAC(),
+                                     bridgedInterface: bridgedInterface,
+                                     deviceModel: nic)],
             display: display,
             boot: boot
         )

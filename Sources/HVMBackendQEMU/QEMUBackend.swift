@@ -257,7 +257,7 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     /// 在 windowsPE pass 阶段预置 5 个 Bypass*Check DWORD=1, 安装器跑完它们再做硬件检查.
     /// ISO 只在缺失或 XML 变化时重新生成, 避免每次启动重打 ISO 浪费时间.
     private func prepareUnattendISO() throws {
-        let xml = Self.unattendXML
+        let xml = Self.unattendXML(autoInstallVirtioWin: config.boot.autoInstallVirtioWin)
         let stageDir = bundle.url.appendingPathComponent(".unattend-stage")
         /* 文件名三份都写: 不同版本 Windows Setup 对大小写的要求不统一.
          * - Autounattend.xml (A 大写, MS docs 官方)
@@ -311,55 +311,90 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     }
 
     /// AutoUnattend.xml 内容
-    /// windowsPE pass 阶段跑 5 个 reg add, 写 HKLM\SYSTEM\Setup\LabConfig 下的
-    /// Bypass*Check DWORD=1。这些值会让 Setup 的硬件检查模块跳过 TPM/SB/RAM/CPU/存储。
+    ///
+    /// windowsPE pass:
+    ///   跑 5 个 reg add, 写 HKLM\SYSTEM\Setup\LabConfig 下的 Bypass*Check DWORD=1。
+    ///   这些值会让 Setup 的硬件检查模块跳过 TPM/SB/RAM/CPU/存储。
+    ///
+    /// oobeSystem pass (当 autoInstallVirtioWin=true 时才加):
+    ///   FirstLogonCommands 在 OOBE 完成后首次登录时跑, 扫所有盘符找 virtio-win-gt-arm64.msi
+    ///   静默安装. 装完 NetKVM / viostor / viogpudo / qemu-ga 等驱动。
+    ///
     /// 该 XML 和 Microsoft 官方 unattend schema 兼容,Setup 自动扫描移动介质根目录.
     ///
     /// 格式约定:
     /// - 命令无引号, `/f` 放末尾(与 Microsoft docs 示例保持一致)
     /// - DWORD 值用 `0x1` 十六进制(某些 Setup 版本对十进制不识别)
     /// - 第一条先显式 create LabConfig 节, 避免并行 reg add 在 key 不存在时失败
-    private static let unattendXML: String = """
-    <?xml version="1.0" encoding="utf-8"?>
-    <unattend xmlns="urn:schemas-microsoft-com:unattend">
-      <settings pass="windowsPE">
-        <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-          <RunSynchronous>
-            <RunSynchronousCommand wcm:action="add">
-              <Order>1</Order>
-              <Path>reg add HKLM\\System\\Setup\\LabConfig /f</Path>
-              <Description>create LabConfig</Description>
-            </RunSynchronousCommand>
-            <RunSynchronousCommand wcm:action="add">
-              <Order>2</Order>
-              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 0x1 /f</Path>
-            </RunSynchronousCommand>
-            <RunSynchronousCommand wcm:action="add">
-              <Order>3</Order>
-              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 0x1 /f</Path>
-            </RunSynchronousCommand>
-            <RunSynchronousCommand wcm:action="add">
-              <Order>4</Order>
-              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassRAMCheck /t REG_DWORD /d 0x1 /f</Path>
-            </RunSynchronousCommand>
-            <RunSynchronousCommand wcm:action="add">
-              <Order>5</Order>
-              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassCPUCheck /t REG_DWORD /d 0x1 /f</Path>
-            </RunSynchronousCommand>
-            <RunSynchronousCommand wcm:action="add">
-              <Order>6</Order>
-              <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassStorageCheck /t REG_DWORD /d 0x1 /f</Path>
-            </RunSynchronousCommand>
-            <RunSynchronousCommand wcm:action="add">
-              <Order>7</Order>
-              <Path>reg add HKLM\\System\\Setup\\MoSetup /v AllowUpgradesWithUnsupportedTPMOrCPU /t REG_DWORD /d 0x1 /f</Path>
-              <Description>legacy upgrade-path bypass</Description>
-            </RunSynchronousCommand>
-          </RunSynchronous>
-        </component>
-      </settings>
-    </unattend>
-    """
+    private static func unattendXML(autoInstallVirtioWin: Bool) -> String {
+        var oobeBlock = ""
+        if autoInstallVirtioWin {
+            /* FirstLogonCommands 的 CommandLine 字段在 XML 里是字符串, 内部 cmd 要
+             * 处理变量 %D 和 > 转义. 用 ^ 转义也行, 但实测直接 %D 在 unattend 的
+             * CommandLine 正确识别; <> 则需用 &gt;/&lt;. 这里只用 %D, 安全.
+             *
+             * 逻辑: 枚举 C..Z 盘符, 遇到第一个有 virtio-win-gt-arm64.msi 的就装它.
+             * msiexec /quiet /norestart 静默安装, 不弹 UAC 也不重启.
+             * 日志写 C:\hellvm-viowin.log 便于用户排查.
+             */
+            oobeBlock = """
+              <settings pass="oobeSystem">
+                <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+                  <FirstLogonCommands>
+                    <SynchronousCommand wcm:action="add">
+                      <Order>1</Order>
+                      <CommandLine>cmd /c for %D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %D:\\virtio-win-gt-arm64.msi start /wait msiexec /i %D:\\virtio-win-gt-arm64.msi /quiet /norestart /L*v C:\\hellvm-viowin.log</CommandLine>
+                      <Description>HellVM auto-install virtio-win drivers (NetKVM, viostor, viogpudo, qemu-ga)</Description>
+                      <RequiresUserInput>false</RequiresUserInput>
+                    </SynchronousCommand>
+                  </FirstLogonCommands>
+                </component>
+              </settings>
+            """
+        }
+
+        return """
+        <?xml version="1.0" encoding="utf-8"?>
+        <unattend xmlns="urn:schemas-microsoft-com:unattend">
+          <settings pass="windowsPE">
+            <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+              <RunSynchronous>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>1</Order>
+                  <Path>reg add HKLM\\System\\Setup\\LabConfig /f</Path>
+                  <Description>create LabConfig</Description>
+                </RunSynchronousCommand>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>2</Order>
+                  <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 0x1 /f</Path>
+                </RunSynchronousCommand>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>3</Order>
+                  <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 0x1 /f</Path>
+                </RunSynchronousCommand>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>4</Order>
+                  <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassRAMCheck /t REG_DWORD /d 0x1 /f</Path>
+                </RunSynchronousCommand>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>5</Order>
+                  <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassCPUCheck /t REG_DWORD /d 0x1 /f</Path>
+                </RunSynchronousCommand>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>6</Order>
+                  <Path>reg add HKLM\\System\\Setup\\LabConfig /v BypassStorageCheck /t REG_DWORD /d 0x1 /f</Path>
+                </RunSynchronousCommand>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>7</Order>
+                  <Path>reg add HKLM\\System\\Setup\\MoSetup /v AllowUpgradesWithUnsupportedTPMOrCPU /t REG_DWORD /d 0x1 /f</Path>
+                  <Description>legacy upgrade-path bypass</Description>
+                </RunSynchronousCommand>
+              </RunSynchronous>
+            </component>
+          </settings>
+        \(oobeBlock)</unattend>
+        """
+    }
 
     /// 每个 VM 有自己的 EFI 变量存储(首次启动时从模板复制)
     private func prepareEFIVars() throws -> URL {
@@ -532,6 +567,21 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             }
         }
 
+        // virtio-win 驱动盘: 第三个 CD-ROM, 只读, Windows guest 装好后 AutoUnattend 的
+        // FirstLogonCommands 会静默装 virtio-win-gt-arm64.msi (给 NetKVM / viostor /
+        // viogpudo 等驱动上位). ISO 来自全局缓存, 多台 Win VM 共享.
+        let vwPath = VMBundle.virtioWinCacheURL.path
+        if config.boot.autoInstallVirtioWin && config.boot.graphical
+            && FileManager.default.fileExists(atPath: vwPath) {
+            args += [
+                "-drive", "if=none,id=cdrom_vwin,media=cdrom,file=\(vwPath),readonly=on",
+                "-device", "usb-storage,drive=cdrom_vwin,removable=true,bus=usbbus.0",
+            ]
+            log.info(.qemu, "[autoInstallVirtioWin] 已挂 virtio-win.iso \(vwPath)")
+        } else if config.boot.autoInstallVirtioWin && config.boot.graphical {
+            log.warn(.qemu, "[autoInstallVirtioWin] 开关已开但缓存不存在, 跳过: \(vwPath)")
+        }
+
         // TPM 2.0(swtpm + tpm-crb-device): Windows 首选 CRB 接口
         // 我们已把 UTM 的 tpm_crb_sysbus 补丁 port 到 QEMU, 现在 aarch64 也支持 tpm-crb-device
         if let sockPath = tpmSocketPath {
@@ -598,7 +648,9 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         }
 
         let netdevID = "net0"
-        var deviceOpts = "virtio-net-pci,netdev=\(netdevID)"
+        // 按配置选 NIC 型号: virtio-net-pci / e1000e / rtl8139
+        // Windows 默认用 e1000e 开箱即有驱动; Linux 用 virtio 性能最好
+        var deviceOpts = "\(net.deviceModel.qemuDeviceName),netdev=\(netdevID)"
         if let mac = net.macAddress, !mac.isEmpty {
             deviceOpts += ",mac=\(mac)"
         }

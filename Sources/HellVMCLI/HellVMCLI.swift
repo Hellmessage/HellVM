@@ -155,6 +155,8 @@ struct Create: AsyncParsableCommand {
             cpuCount: cpu,
             memoryMB: memory,
             disks: [diskConfig],
+            networks: [NetworkConfig(mode: .user,
+                                     macAddress: NetworkConfig.generateRandomMAC())],
             boot: BootConfig(isoPath: isoAbsolute, efi: true)
         )
 

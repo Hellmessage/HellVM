@@ -16,9 +16,12 @@ struct NewVMWizardView: View {
     @State private var isoPath: String = ""
     @State private var graphical: Bool = true
     @State private var networkMode: NetworkConfig.Mode = .user
+    @State private var bridgedInterface: String = HostNetworkInterfaces.recommendedDefault()
 
     @State private var submitting: Bool = false
     @State private var errorText: String?
+
+    @StateObject private var virtioWin = VirtioWinManager.shared
 
     var canSubmit: Bool {
         !name.isEmpty && cpuCount > 0 && memoryMB >= 128 && diskSizeGB > 0 && !submitting
@@ -39,6 +42,9 @@ struct NewVMWizardView: View {
                     FieldLabel("客户机类型")
                     osTypePicker
                     osTypeHint
+                    if osType == .windows {
+                        virtioWinStatusRow
+                    }
 
                     HStack(alignment: .top, spacing: 16) {
                         VStack(alignment: .leading, spacing: 8) {
@@ -65,6 +71,13 @@ struct NewVMWizardView: View {
 
                     FieldLabel("网络模式")
                     networkPicker
+                    if networkMode == .vmnetBridged {
+                        bridgedInterfacePicker
+                    }
+                    if networkMode == .vmnetShared || networkMode == .vmnetHost
+                        || networkMode == .vmnetBridged {
+                        vmnetDaemonHint
+                    }
 
                     if let errorText {
                         HStack(alignment: .top, spacing: 8) {
@@ -144,7 +157,7 @@ struct NewVMWizardView: View {
     private var osTypePicker: some View {
         HStack(spacing: 8) {
             osCard(.linux,   title: "Linux",   subtitle: "virtio-gpu 加速",  icon: "terminal.fill")
-            osCard(.windows, title: "Windows", subtitle: "virtio-ramfb + TPM", icon: "square.stack.fill")
+            osCard(.windows, title: "Windows", subtitle: "GPU + TPM", icon: "square.stack.fill")
             osCard(.macOS,   title: "macOS",   subtitle: "实验性",           icon: "apple.logo")
             osCard(.other,   title: "其他",    subtitle: "手动调",           icon: "questionmark.circle")
         }
@@ -176,6 +189,60 @@ struct NewVMWizardView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+    /// virtio-win.iso 状态 + 下载按钮(Windows 模板下显示)
+    @ViewBuilder
+    private var virtioWinStatusRow: some View {
+        let status = VirtioWinManager.status()
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: status.exists ? "checkmark.seal.fill"
+                      : (virtioWin.downloadProgress != nil ? "arrow.down.circle" : "shippingbox"))
+                    .font(.system(size: 11))
+                    .foregroundStyle(status.exists ? Theme.success : Theme.warning)
+                VStack(alignment: .leading, spacing: 2) {
+                    if status.exists {
+                        Text("virtio-win 驱动盘已就绪 (\(formatMB(status.sizeBytes)))")
+                            .font(.system(size: 11, weight: .medium))
+                    } else if let p = virtioWin.downloadProgress {
+                        Text(String(format: "正在下载 virtio-win.iso … %.0f%%", p * 100))
+                            .font(.system(size: 11, weight: .medium))
+                    } else {
+                        Text("virtio-win 驱动盘未下载")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    Text("装完 Windows 后 FirstLogon 会静默装 NetKVM/viostor/viogpudo 驱动, 可切 virtio-net 跑全速")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                    if let err = virtioWin.lastError {
+                        Text(err).font(.system(size: 10)).foregroundStyle(Theme.danger)
+                    }
+                }
+                Spacer()
+                if !status.exists && virtioWin.downloadProgress == nil {
+                    SecondaryButton(title: "下载", systemImage: "arrow.down.circle") {
+                        Task { try? await virtioWin.downloadIfNeeded() }
+                    }
+                } else if virtioWin.downloadProgress != nil {
+                    SecondaryButton(title: "取消", systemImage: "xmark.circle") {
+                        virtioWin.cancelDownload()
+                    }
+                }
+            }
+            if let p = virtioWin.downloadProgress {
+                ProgressView(value: p)
+                    .progressViewStyle(.linear)
+                    .tint(Theme.accent)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated))
+    }
+
+    private func formatMB(_ bytes: Int64?) -> String {
+        guard let b = bytes else { return "?" }
+        return String(format: "%.0f MB", Double(b) / 1024 / 1024)
     }
 
     @ViewBuilder
@@ -295,6 +362,71 @@ struct NewVMWizardView: View {
         .buttonStyle(.plain)
     }
 
+    // MARK: - 桥接接口选择
+
+    @ViewBuilder
+    private var bridgedInterfacePicker: some View {
+        let ifaces = HostNetworkInterfaces.list()
+        VStack(alignment: .leading, spacing: 6) {
+            FieldLabel("桥接接口")
+            Menu {
+                ForEach(ifaces, id: \.id) { iface in
+                    Button(iface.displayLabel) { bridgedInterface = iface.name }
+                }
+                if ifaces.isEmpty {
+                    Button("(扫描不到接口)") {}.disabled(true)
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .foregroundStyle(Theme.textSecondary)
+                    Text(menuLabel(for: bridgedInterface, among: ifaces))
+                        .foregroundStyle(Theme.textPrimary)
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .foregroundStyle(Theme.textTertiary)
+                        .font(.system(size: 10))
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+        }
+    }
+
+    private func menuLabel(for name: String, among ifaces: [HostNetworkInterface]) -> String {
+        if let hit = ifaces.first(where: { $0.name == name }) {
+            return hit.displayLabel
+        }
+        return "\(name) — (当前不存在)"
+    }
+
+    /// vmnet 模式下提示 daemon 状态, 缺失时提示到 Settings 安装
+    @ViewBuilder
+    private var vmnetDaemonHint: some View {
+        let fakeNet = NetworkConfig(mode: networkMode,
+                                    bridgedInterface: bridgedInterface)
+        let status = VMnetSupervisor.status(for: fakeNet)
+        let ok = status.socketExists
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: ok ? "checkmark.seal" : "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(ok ? Theme.success : Theme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                if ok {
+                    Text("vmnet daemon 已就绪: \(status.socketPath ?? "-")")
+                } else {
+                    Text("vmnet daemon 缺失, 首次用需到 Settings → 网络 → 安装 daemon (需管理员密码)")
+                }
+            }
+            .font(.system(size: 10))
+            .foregroundStyle(Theme.textTertiary)
+            Spacer()
+        }
+        .padding(.top, -8)
+    }
+
     // MARK: - 提交
 
     private func submit() async {
@@ -311,7 +443,8 @@ struct NewVMWizardView: View {
                 diskSizeGB: UInt64(diskSizeGB),
                 isoPath: isoPath.isEmpty ? nil : isoPath,
                 graphical: graphical,
-                networkMode: networkMode
+                networkMode: networkMode,
+                bridgedInterface: networkMode == .vmnetBridged ? bridgedInterface : nil
             )
             onCreated(name)
         } catch {

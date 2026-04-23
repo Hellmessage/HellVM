@@ -27,6 +27,15 @@ struct VMSettingsEditor: View {
     @State private var resizeSizeGB: Int = 0
     @State private var removingIndex: Int?
 
+    // vmnet daemon 安装/卸载状态
+    @State private var vmnetBusy: Bool = false
+    @State private var vmnetError: String?
+    /// 安装/卸载后 bump 一下, 强制 vmnetDaemonPanel 重读 socket 状态
+    @State private var vmnetRefreshToken: UInt64 = 0
+
+    // virtio-win.iso 下载状态
+    @StateObject private var virtioWin = VirtioWinManager.shared
+
     init(store: VMListStore, item: VMListItem) {
         self.store = store
         self.item = item
@@ -341,20 +350,27 @@ struct VMSettingsEditor: View {
             if readOnly {
                 let net = item.config.networks.first
                 keyValue("模式", value: net.map { displayName(of: $0.mode) } ?? "无")
+                if let nic = net?.deviceModel {
+                    keyValue("NIC 型号", value: nic.rawValue)
+                }
                 if let s = net?.effectiveSocketPath {
                     keyValue("socket", value: s, mono: true)
+                }
+                if let iface = net?.bridgedInterface, !iface.isEmpty {
+                    keyValue("桥接网卡", value: iface, mono: true)
                 }
                 if let mac = net?.macAddress, !mac.isEmpty {
                     keyValue("MAC", value: mac, mono: true)
                 }
             } else {
                 networkModePicker
+                nicModelPicker
                 if case .some(let m) = draft.networks.first?.mode,
                    m == .vmnetShared || m == .vmnetHost || m == .vmnetBridged {
                     networkVmnetOptions
                 }
                 networkMacField
-                vmnetHint
+                vmnetDaemonPanel
             }
         }
     }
@@ -407,57 +423,183 @@ struct VMSettingsEditor: View {
     private var networkVmnetOptions: some View {
         let mode = draft.networks.first?.mode ?? .user
         VStack(alignment: .leading, spacing: 8) {
-            FieldLabel("socket 路径(留空用默认)")
-            StyledTextField(
-                placeholder: draft.networks.first?.effectiveSocketPath ?? "/var/run/socket_vmnet",
-                text: Binding(
-                    get: { draft.networks.first?.socketVmnetPath ?? "" },
-                    set: { v in updateFirstNet { n in n.socketVmnetPath = v.isEmpty ? nil : v } }
-                ),
-                monospaced: true
-            )
             if mode == .vmnetBridged {
                 FieldLabel("桥接网卡")
+                bridgedInterfacePicker
+            }
+        }
+    }
+
+    private var bridgedInterfacePicker: some View {
+        let ifaces = HostNetworkInterfaces.list()
+        let current = draft.networks.first?.bridgedInterface ?? HostNetworkInterfaces.recommendedDefault()
+        return Menu {
+            ForEach(ifaces, id: \.id) { iface in
+                Button(iface.displayLabel) {
+                    updateFirstNet { $0.bridgedInterface = iface.name }
+                }
+            }
+            if ifaces.isEmpty {
+                Button("(扫描不到接口)") {}.disabled(true)
+            }
+        } label: {
+            HStack {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .foregroundStyle(Theme.textSecondary)
+                Text(labelFor(iface: current, among: ifaces))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+                Image(systemName: "chevron.down")
+                    .foregroundStyle(Theme.textTertiary)
+                    .font(.system(size: 10))
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+    }
+
+    private func labelFor(iface name: String, among ifaces: [HostNetworkInterface]) -> String {
+        if let hit = ifaces.first(where: { $0.name == name }) { return hit.displayLabel }
+        return "\(name) — (当前不存在)"
+    }
+
+    /// NIC 设备型号选择(virtio / e1000e / rtl8139)
+    private var nicModelPicker: some View {
+        let current = draft.networks.first?.deviceModel ?? .virtio
+        return VStack(alignment: .leading, spacing: 6) {
+            FieldLabel("NIC 型号")
+            HStack(spacing: 6) {
+                nicChip(.virtio,  title: "virtio",  subtitle: "Linux 最快", current: current)
+                nicChip(.e1000e,  title: "e1000e",  subtitle: "Win 开箱",   current: current)
+                nicChip(.rtl8139, title: "rtl8139", subtitle: "老系统兜底", current: current)
+            }
+        }
+    }
+
+    private func nicChip(_ m: NICModel, title: String, subtitle: String, current: NICModel) -> some View {
+        let selected = current == m
+        return Button(action: { updateFirstNet { $0.deviceModel = m } }) {
+            VStack(spacing: 3) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(selected ? Theme.textPrimary : Theme.textSecondary)
+                Text(subtitle)
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.textTertiary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 7)
+                .fill(selected ? Theme.accent.opacity(0.12) : Theme.surfaceElevated))
+            .overlay(RoundedRectangle(cornerRadius: 7)
+                .stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// MAC 地址字段 + 重新生成按钮
+    private var networkMacField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            FieldLabel("MAC 地址")
+            HStack(spacing: 8) {
                 StyledTextField(
-                    placeholder: "en0",
+                    placeholder: "52:54:00:xx:xx:xx",
                     text: Binding(
-                        get: { draft.networks.first?.bridgedInterface ?? "" },
-                        set: { v in updateFirstNet { n in n.bridgedInterface = v.isEmpty ? nil : v } }
+                        get: { draft.networks.first?.macAddress ?? "" },
+                        set: { v in updateFirstNet { $0.macAddress = v.isEmpty ? nil : v } }
                     ),
                     monospaced: true
                 )
+                SecondaryButton(title: "重新生成", systemImage: "arrow.clockwise") {
+                    updateFirstNet { $0.macAddress = NetworkConfig.generateRandomMAC() }
+                }
             }
         }
     }
 
-    private var networkMacField: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            FieldLabel("MAC 地址(可选)")
-            StyledTextField(
-                placeholder: "52:54:00:xx:xx:xx",
-                text: Binding(
-                    get: { draft.networks.first?.macAddress ?? "" },
-                    set: { v in updateFirstNet { $0.macAddress = v.isEmpty ? nil : v } }
-                ),
-                monospaced: true
-            )
-        }
-    }
-
+    /// vmnet daemon 状态面板: 状态行 + 安装 / 卸载按钮
     @ViewBuilder
-    private var vmnetHint: some View {
+    private var vmnetDaemonPanel: some View {
         let mode = draft.networks.first?.mode ?? .user
         if mode == .vmnetShared || mode == .vmnetHost || mode == .vmnetBridged {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "info.circle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.textTertiary)
-                Text("需先安装外挂 helper: brew install socket_vmnet && sudo brew services start socket_vmnet")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.textTertiary)
-                Spacer()
+            let sockets = VMnetSupervisor.presentSockets()
+            let draftNet = draft.networks.first ?? NetworkConfig()
+            let st = VMnetSupervisor.status(for: draftNet)
+            VStack(alignment: .leading, spacing: 6) {
+                FieldLabel("vmnet daemon")
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: st.socketExists ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(st.socketExists ? Theme.success : Theme.warning)
+                    VStack(alignment: .leading, spacing: 3) {
+                        if st.socketExists {
+                            Text("当前模式 socket 已就绪: \(st.socketPath ?? "-")")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.textSecondary)
+                        } else {
+                            Text("当前模式 socket 不存在: \(st.socketPath ?? "-")")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.textPrimary.opacity(0.9))
+                        }
+                        Text("已装: shared=\(sockets.shared ? "✓" : "✗") · host=\(sockets.host ? "✓" : "✗") · bridged=[\(sockets.bridged.joined(separator: ", "))]")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+                    Spacer()
+                }
+                HStack(spacing: 8) {
+                    SecondaryButton(title: vmnetBusy ? "正在安装…" : "安装 / 更新 daemon",
+                                    systemImage: "lock.shield",
+                                    disabled: vmnetBusy) {
+                        Task { await installVmnet() }
+                    }
+                    SecondaryButton(title: "卸载全部", systemImage: "trash",
+                                    disabled: vmnetBusy) {
+                        Task { await uninstallVmnet() }
+                    }
+                    Spacer()
+                }
+                if let err = vmnetError {
+                    Text(err)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.danger)
+                }
             }
-            .padding(.top, 4)
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surface))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.divider, lineWidth: 1))
+        }
+    }
+
+    // MARK: - vmnet daemon 安装操作
+
+    @MainActor
+    private func installVmnet() async {
+        vmnetBusy = true
+        vmnetError = nil
+        defer { vmnetBusy = false }
+        do {
+            let extra = (draft.networks.first?.bridgedInterface).map { [$0] } ?? []
+            try await VMnetSupervisor.installAllDaemons(extraBridgedInterfaces: extra)
+            // 装完后 socket 会在 1-2 秒后出现, 触发一次视图刷新
+            vmnetRefreshToken &+= 1
+        } catch {
+            vmnetError = "安装失败: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    private func uninstallVmnet() async {
+        vmnetBusy = true
+        vmnetError = nil
+        defer { vmnetBusy = false }
+        do {
+            try await VMnetSupervisor.uninstallAllDaemons()
+            vmnetRefreshToken &+= 1
+        } catch {
+            vmnetError = "卸载失败: \(error.localizedDescription)"
         }
     }
 
@@ -472,6 +614,10 @@ struct VMSettingsEditor: View {
                 if item.config.boot.graphical {
                     keyValue("virtio-GPU 加速",
                              value: item.config.display.virtioGpu ? "启用" : "关闭")
+                }
+                if item.config.osType == .windows {
+                    keyValue("virtio-win 自动装驱动",
+                             value: item.config.boot.autoInstallVirtioWin ? "启用" : "关闭")
                 }
                 if let iso = item.config.boot.isoPath {
                     keyValue("ISO", value: iso, mono: true)
@@ -531,8 +677,74 @@ struct VMSettingsEditor: View {
                         }
                     }
                 }
+                // Windows 客户机: 自动装 virtio-win 驱动 toggle + iso 状态
+                if draft.osType == .windows && draft.boot.graphical {
+                    togglePair(label: "自动装 virtio-win 驱动",
+                               on:  ("启用", "shippingbox.fill"),
+                               off: ("关闭", "shippingbox"),
+                               value: Binding(get: { draft.boot.autoInstallVirtioWin },
+                                              set: { draft.boot.autoInstallVirtioWin = $0 }))
+                    if draft.boot.autoInstallVirtioWin {
+                        virtioWinPanel
+                    }
+                }
             }
         }
+    }
+
+    /// virtio-win.iso 缓存状态 + 下载按钮
+    @ViewBuilder
+    private var virtioWinPanel: some View {
+        let status = VirtioWinManager.status()
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: status.exists ? "checkmark.seal.fill"
+                      : (virtioWin.downloadProgress != nil ? "arrow.down.circle" : "exclamationmark.triangle.fill"))
+                    .font(.system(size: 11))
+                    .foregroundStyle(status.exists ? Theme.success : Theme.warning)
+                VStack(alignment: .leading, spacing: 2) {
+                    if status.exists {
+                        Text("已缓存 virtio-win.iso (\(formatMB(status.sizeBytes)))")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textSecondary)
+                    } else if let p = virtioWin.downloadProgress {
+                        Text(String(format: "下载中 %.0f%%", p * 100))
+                            .font(.system(size: 10, weight: .medium))
+                    } else {
+                        Text("缓存缺失, 启动时会跳过驱动自动安装")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.warning)
+                    }
+                    Text(status.path)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                    if let err = virtioWin.lastError {
+                        Text(err).font(.system(size: 10)).foregroundStyle(Theme.danger)
+                    }
+                }
+                Spacer()
+                if !status.exists && virtioWin.downloadProgress == nil {
+                    SecondaryButton(title: "下载", systemImage: "arrow.down.circle") {
+                        Task { try? await virtioWin.downloadIfNeeded() }
+                    }
+                } else if virtioWin.downloadProgress != nil {
+                    SecondaryButton(title: "取消", systemImage: "xmark.circle") {
+                        virtioWin.cancelDownload()
+                    }
+                }
+            }
+            if let p = virtioWin.downloadProgress {
+                ProgressView(value: p).progressViewStyle(.linear).tint(Theme.accent)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.divider, lineWidth: 1))
+    }
+
+    private func formatMB(_ bytes: Int64?) -> String {
+        guard let b = bytes else { return "?" }
+        return String(format: "%.0f MB", Double(b) / 1024 / 1024)
     }
 
     private func togglePair(label: String,
@@ -775,7 +987,8 @@ private func networksEqual(_ a: [NetworkConfig], _ b: [NetworkConfig]) -> Bool {
         if x.mode != y.mode ||
            x.macAddress != y.macAddress ||
            x.socketVmnetPath != y.socketVmnetPath ||
-           x.bridgedInterface != y.bridgedInterface {
+           x.bridgedInterface != y.bridgedInterface ||
+           x.deviceModel != y.deviceModel {
             return false
         }
     }

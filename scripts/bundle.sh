@@ -73,6 +73,11 @@ for b in "$BIN_DIR"/*.bundle; do
     cp -R "$b" "$CONTENTS/Resources/"
 done
 
+# runtime 脚本(VMnetSupervisor 运行时需要调 install-vmnet-daemons.sh)
+mkdir -p "$CONTENTS/Resources/scripts"
+cp "$ROOT/scripts/install-vmnet-daemons.sh" "$CONTENTS/Resources/scripts/"
+chmod +x "$CONTENTS/Resources/scripts/install-vmnet-daemons.sh"
+
 # ---------- 5. QEMU + 固件嵌入 ----------
 echo "==> 嵌入 QEMU 二进制与固件"
 cp "$VENDOR_QEMU/bin/"qemu-* "$RES_QEMU/bin/" 2>/dev/null || true

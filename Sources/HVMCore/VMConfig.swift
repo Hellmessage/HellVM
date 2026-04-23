@@ -123,6 +123,9 @@ public struct NetworkConfig: Codable, Sendable {
     public var socketVmnetPath: String?
     /// vmnetBridged 模式要桥接的宿主网卡(如 `en0`),其它模式忽略
     public var bridgedInterface: String?
+    /// QEMU NIC 设备型号. Linux 默认 virtio(自带驱动), Windows 默认 e1000e
+    /// (Windows ARM 开箱自带 e1000e 驱动; 装 NetKVM 驱动后可切 virtio 更快)
+    public var deviceModel: NICModel
 
     public enum Mode: String, Codable, Sendable {
         case user          // -netdev user, 内置 NAT
@@ -136,12 +139,14 @@ public struct NetworkConfig: Codable, Sendable {
         mode: Mode = .user,
         macAddress: String? = nil,
         socketVmnetPath: String? = nil,
-        bridgedInterface: String? = nil
+        bridgedInterface: String? = nil,
+        deviceModel: NICModel = .virtio
     ) {
         self.mode = mode
         self.macAddress = macAddress
         self.socketVmnetPath = socketVmnetPath
         self.bridgedInterface = bridgedInterface
+        self.deviceModel = deviceModel
     }
 
     /// 推导实际使用的 socket 路径(vmnet* 模式): 用户显式填 socketVmnetPath 优先,
@@ -162,7 +167,7 @@ public struct NetworkConfig: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case mode, macAddress, socketVmnetPath, bridgedInterface
+        case mode, macAddress, socketVmnetPath, bridgedInterface, deviceModel
     }
 
     public init(from decoder: Decoder) throws {
@@ -180,6 +185,50 @@ public struct NetworkConfig: Codable, Sendable {
         self.macAddress       = try c.decodeIfPresent(String.self, forKey: .macAddress)
         self.socketVmnetPath  = try c.decodeIfPresent(String.self, forKey: .socketVmnetPath)
         self.bridgedInterface = try c.decodeIfPresent(String.self, forKey: .bridgedInterface)
+        /* 兼容旧 config(无 deviceModel 字段): 默认 virtio, 保持现有行为 */
+        self.deviceModel      = try c.decodeIfPresent(NICModel.self, forKey: .deviceModel) ?? .virtio
+    }
+}
+
+/// QEMU NIC 设备型号
+/// - virtio:  virtio-net-pci, 需 guest 驱动(Linux 自带, Windows 需装 NetKVM)
+/// - e1000e:  Intel 千兆网卡模拟, Windows ARM / macOS 自带驱动
+/// - rtl8139: Realtek 老网卡, 兼容性最广但性能最差, 超老 guest 兜底
+public enum NICModel: String, Codable, Sendable, CaseIterable {
+    case virtio
+    case e1000e
+    case rtl8139
+
+    /// 翻译成 QEMU `-device` 参数名
+    public var qemuDeviceName: String {
+        switch self {
+        case .virtio:  return "virtio-net-pci"
+        case .e1000e:  return "e1000e"
+        case .rtl8139: return "rtl8139"
+        }
+    }
+}
+
+// MARK: - 随机 MAC 地址
+
+extension NetworkConfig {
+    /// 生成一个 locally-administered + unicast 的随机 MAC 地址.
+    ///
+    /// 规则:
+    /// - OUI 固定用 QEMU 约定前缀 `52:54:00`(IEEE 分给 Qumranet/QEMU 虚拟网卡 OUI,
+    ///   首字节 bit1=1 locally administered, bit0=0 unicast)
+    /// - 后 3 字节随机, 碰撞概率 1/16M, 单主机上多 VM 足够
+    ///
+    /// 小写冒号分隔格式, 便于直接拼进 QEMU `mac=` 参数
+    public static func generateRandomMAC() -> String {
+        let tail = (0..<3).map { _ in UInt8.random(in: 0...255) }
+        return String(format: "52:54:00:%02x:%02x:%02x", tail[0], tail[1], tail[2])
+    }
+
+    /// 简单校验 MAC 字符串合法性(6 组十六进制, 冒号分隔, 大小写不限)
+    public static func isValidMAC(_ s: String) -> Bool {
+        let pattern = #"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$"#
+        return s.range(of: pattern, options: .regularExpression) != nil
     }
 }
 
@@ -246,6 +295,16 @@ public struct BootConfig: Codable, Sendable, Equatable {
     /// 用户的原版 ISO 完全不动, 关掉此开关时不挂. 默认 false, Win11 VM 建议开.
     public var bypassWin11Checks: Bool
 
+    /// 自动挂 virtio-win.iso 并通过 AutoUnattend 的 FirstLogonCommands 静默装
+    /// virtio-win-gt-arm64.msi。装完后 Windows 获得 NetKVM / viostor / viogpudo
+    /// 等一整套 virtio 驱动, 可以把 NIC 从 e1000e 切到 virtio-net 获得 10Gbps 级吞吐。
+    ///
+    /// 依赖:
+    /// - ISO 存放在全局缓存 ~/Library/Application Support/HellVM/cache/virtio-win.iso
+    /// - 启动前由 Swift 侧 VirtioWinManager 确认存在(不存在则跳过且警告)
+    /// 默认 false, Windows 模板建议开。
+    public var autoInstallVirtioWin: Bool
+
     public init(
         isoPath: String? = nil,
         kernelPath: String? = nil,
@@ -255,7 +314,8 @@ public struct BootConfig: Codable, Sendable, Equatable {
         graphical: Bool = true,
         tpm: Bool = false,
         serialDebug: Bool = false,
-        bypassWin11Checks: Bool = false
+        bypassWin11Checks: Bool = false,
+        autoInstallVirtioWin: Bool = false
     ) {
         self.isoPath = isoPath
         self.kernelPath = kernelPath
@@ -266,10 +326,12 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.tpm = tpm
         self.serialDebug = serialDebug
         self.bypassWin11Checks = bypassWin11Checks
+        self.autoInstallVirtioWin = autoInstallVirtioWin
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical, tpm, serialDebug, bypassWin11Checks
+        case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical, tpm, serialDebug
+        case bypassWin11Checks, autoInstallVirtioWin
     }
 
     public init(from decoder: Decoder) throws {
@@ -287,40 +349,52 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.serialDebug   = try c.decodeIfPresent(Bool.self,   forKey: .serialDebug) ?? false
         // 兼容旧 config(无 bypassWin11Checks 字段): 默认 false
         self.bypassWin11Checks = try c.decodeIfPresent(Bool.self, forKey: .bypassWin11Checks) ?? false
+        // 兼容旧 config(无 autoInstallVirtioWin 字段): 默认 false
+        self.autoInstallVirtioWin = try c.decodeIfPresent(Bool.self, forKey: .autoInstallVirtioWin) ?? false
     }
 }
 
 // MARK: - 按 OS 类型计算 display / boot 合理默认
 
 extension VMConfig {
-    /// 依据客户机 OS 类型产出 display / boot 的推荐默认值。
+    /// 依据客户机 OS 类型产出 display / boot / NIC model 的推荐默认值。
     /// 新建向导用,未来在 Settings 里按钮"应用 OS 默认"也可复用。
     public static func defaults(for osType: GuestOSType,
                                 width: Int = 1280,
                                 height: Int = 800,
                                 graphical: Bool = true,
                                 isoPath: String? = nil)
-        -> (display: DisplayConfig, boot: BootConfig)
+        -> (display: DisplayConfig, boot: BootConfig, nic: NICModel)
     {
         switch osType {
         case .windows:
-            // Windows ARM64: bootmgr 不能和 virtio-gpu 共存, 需要 TPM 2.0 和 Win11 检查绕过
+            // Windows ARM64: bootmgr 不能和 virtio-gpu 共存, 需要 TPM 2.0 和 Win11 检查绕过.
+            // 网卡用 e1000e 开箱即可获得网络(Windows ARM 自带驱动), autoInstallVirtioWin
+            // 会在 FirstLogonCommands 静默装 virtio-win-gt-arm64.msi, 装完用户可切到 virtio-net.
             let disp = DisplayConfig(width: width, height: height,
                                      enabled: graphical, virtioGpu: false)
             let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical,
-                                  tpm: true, bypassWin11Checks: true)
-            return (disp, boot)
-        case .linux, .macOS:
+                                  tpm: true, bypassWin11Checks: true,
+                                  autoInstallVirtioWin: true)
+            return (disp, boot, .e1000e)
+        case .linux:
             let disp = DisplayConfig(width: width, height: height,
                                      enabled: graphical, virtioGpu: true)
             let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical)
-            return (disp, boot)
+            return (disp, boot, .virtio)
+        case .macOS:
+            // macOS guest 目前 QEMU/HVF 下跑不起来, 占位待后续接入 Virtualization.framework;
+            // NIC 仍给 virtio 占位
+            let disp = DisplayConfig(width: width, height: height,
+                                     enabled: graphical, virtioGpu: true)
+            let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical)
+            return (disp, boot, .virtio)
         case .other:
             // 未指定 OS: 保持历史默认(virtio-gpu 开), 避免对现有用户行为改变
             let disp = DisplayConfig(width: width, height: height,
                                      enabled: graphical, virtioGpu: true)
             let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical)
-            return (disp, boot)
+            return (disp, boot, .virtio)
         }
     }
 }

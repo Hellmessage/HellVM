@@ -95,6 +95,19 @@ public struct VMBundle: Sendable {
         return base.appendingPathComponent("HellVM/VMs", isDirectory: true)
     }
 
+    /// ~/Library/Application Support/HellVM/cache/  —— 全局资源缓存目录
+    /// 用于存放所有 VM 共享、只读、大体积的资源(如 virtio-win.iso ~700MB)
+    public static var cacheDirURL: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appendingPathComponent("HellVM/cache", isDirectory: true)
+    }
+
+    /// virtio-win.iso 缓存路径(全局唯一, 多台 Windows VM 共享只读挂载)
+    public static var virtioWinCacheURL: URL {
+        cacheDirURL.appendingPathComponent("virtio-win.iso")
+    }
+
     // MARK: - 创建 / 读取 / 写入
 
     /// 在指定位置创建一个新 bundle(目录 + 空 disks/)
