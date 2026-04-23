@@ -379,42 +379,59 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             ]
         }
 
-        // 主磁盘(virtio)
-        for disk in config.disks {
+        // 主磁盘: 用 NVMe(Windows 内建支持 + UTM 验证过能跑 Win11; Linux 也支持)
+        for (idx, disk) in config.disks.enumerated() {
             let path = bundle.resolve(disk.relativePath).path
-            var opts = "if=virtio,file=\(path),format=\(disk.format.rawValue)"
-            if disk.readOnly { opts += ",readonly=on" }
-            args += ["-drive", opts]
+            let driveId = "hd\(idx)"
+            var driveOpts = "if=none,id=\(driveId),file=\(path),format=\(disk.format.rawValue)"
+            if disk.readOnly { driveOpts += ",readonly=on" }
+            args += ["-drive", driveOpts]
+            args += ["-device", "nvme,drive=\(driveId),serial=hellvm-\(driveId)"]
         }
 
-        // 启动介质(ISO)
+        // 图形模式先定义 USB 控制器; Win11 安装用的 usb-storage CD-ROM 也挂在这条总线
+        if config.boot.graphical {
+            args += ["-device", "qemu-xhci,id=usbbus"]
+        }
+
+        // 启动介质(ISO): 图形模式走 usb-storage(Win11 首选,对齐 UTM 经验证配置);
+        // 非图形模式保留 virtio-scsi-cd
         if let isoPath = config.boot.isoPath {
-            args += [
-                "-drive", "if=none,id=cdrom0,media=cdrom,file=\(isoPath),readonly=on",
-                "-device", "virtio-scsi-pci,id=scsi0",
-                "-device", "scsi-cd,drive=cdrom0,bootindex=1",
-            ]
+            if config.boot.graphical {
+                args += [
+                    "-drive", "if=none,id=cdrom0,media=cdrom,file=\(isoPath),readonly=on",
+                    "-device", "usb-storage,drive=cdrom0,removable=true,bootindex=0,bus=usbbus.0",
+                ]
+            } else {
+                args += [
+                    "-drive", "if=none,id=cdrom0,media=cdrom,file=\(isoPath),readonly=on",
+                    "-device", "virtio-scsi-pci,id=scsi0",
+                    "-device", "scsi-cd,drive=cdrom0,bootindex=1",
+                ]
+            }
         }
 
-        // TPM 2.0(swtpm + tpm-tis-device): QEMU 通过 chardev socket 连入 swtpm
+        // TPM 2.0(swtpm + tpm-crb-device): Windows 首选 CRB 接口
+        // 我们已把 UTM 的 tpm_crb_sysbus 补丁 port 到 QEMU, 现在 aarch64 也支持 tpm-crb-device
         if let sockPath = tpmSocketPath {
             args += [
                 "-chardev", "socket,id=chrtpm,path=\(sockPath)",
                 "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
-                "-device", "tpm-tis-device,tpmdev=tpm0",
+                "-device", "tpm-crb-device,tpmdev=tpm0",
             ]
         }
+
+        // Windows 默认把硬件时钟视为本地时间(Linux 视为 UTC)。为 Win 安装提供正确时区
+        args += ["-rtc", "base=localtime"]
 
         // 网络(user / vmnet* / none, 详见 NetworkConfig)
         args += buildNetArgs(config.networks)
 
         if config.boot.graphical {
-            // 图形模式: virtio-gpu + USB HID + iosurface backend
-            args += ["-device", "virtio-gpu-pci"]
-            // ramfb 备用帧缓冲: 供早期 bootloader(bootmgfw 等)使用,避免只依赖 virtio-gpu GOP 实现
+            // 图形模式: 只留 ramfb, 去掉 virtio-gpu-pci, 避免 Win bootmgr 在两个 GOP 间犹豫
+            // 早期 bootloader(bootmgfw)和 Windows 内核安装阶段都能用 ramfb 完成显示
             args += ["-device", "ramfb"]
-            // USB HID 键鼠: UEFI 只内置 USB 驱动, 不识别 virtio-kbd/tablet
-            args += ["-device", "qemu-xhci,id=usbbus"]
+            // USB HID 键鼠(挂到前面已定义的 usbbus 上)
             args += ["-device", "usb-kbd,bus=usbbus.0"]
             args += ["-device", "usb-tablet,bus=usbbus.0"]
             if config.boot.serialDebug {

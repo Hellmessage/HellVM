@@ -1,0 +1,279 @@
+From bb63eaf4ece71c79128b1290e9761290a2f49d36 Mon Sep 17 00:00:00 2001
+From: HellVM Build <build@hellvm.local>
+Date: Thu, 23 Apr 2026 11:36:32 +0800
+Subject: [PATCH] ArmVirtPkg: support extra RAM region via DTB /memory nodes
+ for Win11 ARM64 bootmgr compat
+
+---
+ ArmVirtPkg/ArmVirtPkg.dec                     |  2 +
+ .../ArmVirtMemoryInitPeiLib.c                 | 27 +++++++
+ .../ArmVirtMemoryInitPeiLib.inf               |  1 +
+ .../QemuVirtMemInfoLib/QemuVirtMemInfoLib.c   | 30 +++++++-
+ .../QemuVirtMemInfoLib/QemuVirtMemInfoLib.inf |  1 +
+ .../QemuVirtMemInfoPeiLib.inf                 |  1 +
+ .../QemuVirtMemInfoPeiLibConstructor.c        | 71 +++++++++++++++----
+ BaseTools/Source/C/Makefiles/header.makefile  |  2 +-
+ 8 files changed, 118 insertions(+), 17 deletions(-)
+
+diff --git a/ArmVirtPkg/ArmVirtPkg.dec b/ArmVirtPkg/ArmVirtPkg.dec
+index 6aa5ea0..8b5177d 100644
+--- a/ArmVirtPkg/ArmVirtPkg.dec
++++ b/ArmVirtPkg/ArmVirtPkg.dec
+@@ -33,6 +33,8 @@
+   gEarlyPL011BaseAddressGuid       = { 0xB199DEA9, 0xFD5C, 0x4A84, { 0x80, 0x82, 0x2F, 0x41, 0x70, 0x78, 0x03, 0x05 } }
+   gEarly16550UartBaseAddressGuid   = { 0xea67ca3e, 0x1f54, 0x436b, { 0x97, 0x88, 0xd4, 0xeb, 0x29, 0xc3, 0x42, 0x67 } }
+   gArmVirtSystemMemorySizeGuid     = { 0x504eccb9, 0x1bf0, 0x4420, { 0x86, 0x5d, 0xdc, 0x66, 0x06, 0xd4, 0x13, 0xbf } }
++  ## HellVM: 额外 RAM 区(DTB 里第二个 /memory 节点)位置+大小, 用于 Win11 ARM64 bootmgr 兼容
++  gHellVMArmVirtExtraMemoryGuid    = { 0x1710c4bb, 0xd0e4, 0x4e6f, { 0xa7, 0xf1, 0x0c, 0x1e, 0x1a, 0x51, 0xe5, 0x1a } }
+ 
+ [PcdsFeatureFlag]
+   #
+diff --git a/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.c b/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.c
+index 72e5c65..51b69cb 100644
+--- a/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.c
++++ b/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.c
+@@ -99,6 +99,33 @@ MemoryPeim (
+       );
+   }
+ 
++  //
++  // HellVM: 若 QemuVirtMemInfoPeiLibConstructor 发现了额外 /memory 节点,
++  // 这里也把它注册为 EFI_RESOURCE_SYSTEM_MEMORY, 这样 GCD 认得这块区域,
++  // Win11 ARM64 bootmgr 在 0x10000000 附近的 ConvertPages 才能成功。
++  //
++  {
++    typedef struct {
++      UINT64    Base;
++      UINT64    Size;
++    } HELLVM_EXTRA_MEMORY_HOB;
++
++    extern EFI_GUID             gHellVMArmVirtExtraMemoryGuid;
++    VOID                        *ExtraHob;
++    HELLVM_EXTRA_MEMORY_HOB     *Extra;
++
++    ExtraHob = GetFirstGuidHob (&gHellVMArmVirtExtraMemoryGuid);
++    if (ExtraHob != NULL) {
++      Extra = (HELLVM_EXTRA_MEMORY_HOB *)GET_GUID_HOB_DATA (ExtraHob);
++      BuildResourceDescriptorHob (
++        EFI_RESOURCE_SYSTEM_MEMORY,
++        ResourceAttributes,
++        Extra->Base,
++        Extra->Size
++        );
++    }
++  }
++
+   // Build Memory Allocation Hob
+   InitMmu ();
+ 
+diff --git a/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.inf b/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.inf
+index 48d9c66..6f2f8f3 100644
+--- a/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.inf
++++ b/ArmVirtPkg/Library/ArmVirtMemoryInitPeiLib/ArmVirtMemoryInitPeiLib.inf
+@@ -36,6 +36,7 @@
+ [Guids]
+   gArmVirtSystemMemorySizeGuid
+   gEfiMemoryTypeInformationGuid
++  gHellVMArmVirtExtraMemoryGuid   ## CONSUMES
+ 
+ [FeaturePcd]
+   gEmbeddedTokenSpaceGuid.PcdPrePiProduceMemoryTypeInformationHob
+diff --git a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.c b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.c
+index d435d72..9b1a8df 100644
+--- a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.c
++++ b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.c
+@@ -117,8 +117,34 @@ ArmVirtGetMemoryMap (
+   VirtualMemoryTable[2].Length       = FixedPcdGet32 (PcdFvSize);
+   VirtualMemoryTable[2].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_WRITE_BACK_RO;
+ 
+-  // End of Table
+-  ZeroMem (&VirtualMemoryTable[3], sizeof (ARM_MEMORY_REGION_DESCRIPTOR));
++  //
++  // HellVM: 若存在额外 RAM 区, 也要映射到 MMU 页表, 否则 bootmgr 访问这块区域
++  // 会触发 Synchronous Exception(data abort / prefetch abort)。
++  //
++  {
++    typedef struct {
++      UINT64    Base;
++      UINT64    Size;
++    } HELLVM_EXTRA_MEMORY_HOB;
++
++    extern EFI_GUID             gHellVMArmVirtExtraMemoryGuid;
++    VOID                        *ExtraHob;
++    HELLVM_EXTRA_MEMORY_HOB     *Extra;
++
++    ExtraHob = GetFirstGuidHob (&gHellVMArmVirtExtraMemoryGuid);
++    if (ExtraHob != NULL) {
++      Extra = (HELLVM_EXTRA_MEMORY_HOB *)GET_GUID_HOB_DATA (ExtraHob);
++      VirtualMemoryTable[3].PhysicalBase = Extra->Base;
++      VirtualMemoryTable[3].VirtualBase  = Extra->Base;
++      VirtualMemoryTable[3].Length       = Extra->Size;
++      VirtualMemoryTable[3].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_WRITE_BACK;
++      // End of Table
++      ZeroMem (&VirtualMemoryTable[4], sizeof (ARM_MEMORY_REGION_DESCRIPTOR));
++    } else {
++      // End of Table
++      ZeroMem (&VirtualMemoryTable[3], sizeof (ARM_MEMORY_REGION_DESCRIPTOR));
++    }
++  }
+ 
+   *VirtualMemoryMap = VirtualMemoryTable;
+ }
+diff --git a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.inf b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.inf
+index 6acad8b..e6d2a63 100644
+--- a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.inf
++++ b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoLib.inf
+@@ -34,6 +34,7 @@
+ 
+ [Guids]
+   gArmVirtSystemMemorySizeGuid
++  gHellVMArmVirtExtraMemoryGuid   ## CONSUMES
+ 
+ [Pcd]
+   gArmTokenSpaceGuid.PcdFvBaseAddress
+diff --git a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLib.inf b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLib.inf
+index da957cf..942e4da 100644
+--- a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLib.inf
++++ b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLib.inf
+@@ -37,6 +37,7 @@
+ 
+ [Guids]
+   gArmVirtSystemMemorySizeGuid
++  gHellVMArmVirtExtraMemoryGuid   ## PRODUCES and CONSUMES
+ 
+ [Pcd]
+   gArmTokenSpaceGuid.PcdSystemMemorySize
+diff --git a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLibConstructor.c b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLibConstructor.c
+index 1bcc2e2..490b2a1 100644
+--- a/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLibConstructor.c
++++ b/ArmVirtPkg/Library/QemuVirtMemInfoLib/QemuVirtMemInfoPeiLibConstructor.c
+@@ -12,23 +12,39 @@
+ #include <Library/HobLib.h>
+ #include <libfdt.h>
+ 
++//
++// HellVM: 额外 RAM 区(不同于 PcdSystemMemoryBase 的第二个 /memory@ 节点)
++// 数据格式, 放在 gHellVMArmVirtExtraMemoryGuid HOB 里交给 MemoryPeim 注册
++//
++typedef struct {
++  UINT64    Base;
++  UINT64    Size;
++} HELLVM_EXTRA_MEMORY_HOB;
++
++extern EFI_GUID  gHellVMArmVirtExtraMemoryGuid;
++
+ RETURN_STATUS
+ EFIAPI
+ QemuVirtMemInfoPeiLibConstructor (
+   VOID
+   )
+ {
+-  VOID          *DeviceTreeBase;
+-  INT32         Node, Prev;
+-  UINT64        NewBase, CurBase;
+-  UINT64        NewSize, CurSize;
+-  CONST CHAR8   *Type;
+-  INT32         Len;
+-  CONST UINT64  *RegProp;
+-  VOID          *Hob;
+-
+-  NewBase = 0;
+-  NewSize = 0;
++  VOID                     *DeviceTreeBase;
++  INT32                    Node, Prev;
++  UINT64                   NewBase, CurBase;
++  UINT64                   NewSize, CurSize;
++  CONST CHAR8              *Type;
++  INT32                    Len;
++  CONST UINT64             *RegProp;
++  VOID                     *Hob;
++  UINT64                   ExpectedBase;
++  HELLVM_EXTRA_MEMORY_HOB  ExtraMem;
++
++  NewBase      = 0;
++  NewSize      = 0;
++  ExpectedBase = FixedPcdGet64 (PcdSystemMemoryBase);
++  ExtraMem.Base = 0;
++  ExtraMem.Size = 0;
+ 
+   DeviceTreeBase = (VOID *)(UINTN)PcdGet64 (PcdDeviceTreeInitialBaseAddress);
+   ASSERT (DeviceTreeBase != NULL);
+@@ -39,7 +55,10 @@ QemuVirtMemInfoPeiLibConstructor (
+   ASSERT (fdt_check_header (DeviceTreeBase) == 0);
+ 
+   //
+-  // Look for the lowest memory node
++  // HellVM 改动:之前这里按 "地址最低" 选主 RAM, 导致额外低地址 RAM 节点
++  // (位于 0x10000000) 被选中, 与 PcdSystemMemoryBase (0x40000000) 不匹配触发 ASSERT。
++  // 现在改成:找到 Base == PcdSystemMemoryBase 的节点当主 RAM;
++  // 其它 /memory 节点收集到 ExtraMem, 交由 MemoryPeim 注册为额外 EFI_RESOURCE_SYSTEM_MEMORY。
+   //
+   for (Prev = 0; ; Prev = Node) {
+     Node = fdt_next_node (DeviceTreeBase, Prev, NULL);
+@@ -69,9 +88,21 @@ QemuVirtMemInfoPeiLibConstructor (
+           CurBase + CurSize - 1
+           ));
+ 
+-        if ((NewBase > CurBase) || (NewBase == 0)) {
++        if (CurBase == ExpectedBase) {
++          // 主 RAM 区
+           NewBase = CurBase;
+           NewSize = CurSize;
++        } else if (ExtraMem.Size == 0) {
++          // 第一个非主 RAM 节点:存为额外 RAM(目前只支持 1 个额外节点)
++          ExtraMem.Base = CurBase;
++          ExtraMem.Size = CurSize;
++          DEBUG ((
++            DEBUG_INFO,
++            "%a: HellVM extra RAM @ 0x%lx - 0x%lx\n",
++            __func__,
++            CurBase,
++            CurBase + CurSize - 1
++            ));
+         }
+       } else {
+         DEBUG ((
+@@ -86,7 +117,7 @@ QemuVirtMemInfoPeiLibConstructor (
+   //
+   // Make sure the start of DRAM matches our expectation
+   //
+-  ASSERT (FixedPcdGet64 (PcdSystemMemoryBase) == NewBase);
++  ASSERT (ExpectedBase == NewBase);
+ 
+   Hob = BuildGuidDataHob (
+           &gArmVirtSystemMemorySizeGuid,
+@@ -95,6 +126,18 @@ QemuVirtMemInfoPeiLibConstructor (
+           );
+   ASSERT (Hob != NULL);
+ 
++  //
++  // HellVM: 若发现额外 RAM 节点, 存一个 HOB 给 MemoryPeim 消费
++  //
++  if (ExtraMem.Size != 0) {
++    Hob = BuildGuidDataHob (
++            &gHellVMArmVirtExtraMemoryGuid,
++            &ExtraMem,
++            sizeof ExtraMem
++            );
++    ASSERT (Hob != NULL);
++  }
++
+   //
+   // We need to make sure that the machine we are running on has at least
+   // 128 MB of memory configured, and is currently executing this binary from
+diff --git a/BaseTools/Source/C/Makefiles/header.makefile b/BaseTools/Source/C/Makefiles/header.makefile
+index d369908..75094cf 100644
+--- a/BaseTools/Source/C/Makefiles/header.makefile
++++ b/BaseTools/Source/C/Makefiles/header.makefile
+@@ -93,7 +93,7 @@ BUILD_OPTFLAGS = -O2 $(EXTRA_OPTFLAGS)
+ ifeq ($(DARWIN),Darwin)
+ # assume clang or clang compatible flags on OS X
+ CFLAGS = -MD -fshort-wchar -fno-strict-aliasing -Wall -Werror \
+--Wno-deprecated-declarations -Wno-self-assign -Wno-unused-result -nostdlib -g
++-Wno-deprecated-declarations -Wno-self-assign -Wno-unused-result -Wno-macro-redefined -nostdlib -g
+ else
+ ifneq ($(CLANG),)
+ CFLAGS = -MD -fshort-wchar -fno-strict-aliasing -fwrapv \
+-- 
+2.50.1 (Apple Git-155)
+
