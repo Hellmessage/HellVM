@@ -160,6 +160,102 @@ struct VMController {
         return bundle
     }
 
+    /// 从现有磁盘镜像导入创建 VM (OpenWrt / cloud image 等已装好的系统)
+    ///
+    /// 与 create() 的差异:
+    ///   - 不创建空盘, 也不挂 ISO, 直接把 image 转成 qcow2 当启动盘
+    ///   - 支持 .img / .raw / .qcow2 以及 .gz / .xz 压缩格式 (见 DiskManager.importImage)
+    ///   - 可选 expandToGB 扩容到目标大小
+    ///   - boot.bootFromDiskOnly 默认 true (镜像已是装好的系统, 不需要挂 ISO)
+    ///
+    /// 失败时自动删除已创建的 bundle, 保持原子性 —— 不留半坏 VM。
+    static func createFromImage(
+        name: String,
+        architecture: VMArchitecture,
+        osType: GuestOSType = .linux,
+        cpu: Int,
+        memoryMB: UInt64,
+        imagePath: String,
+        expandToGB: UInt64?,
+        graphical: Bool = true,
+        networkMode: NetworkConfig.Mode = .user,
+        bridgedInterface: String? = nil
+    ) async throws -> VMBundle {
+        // 名称校验
+        guard !name.isEmpty, !name.contains("/"), !name.contains("\0") else {
+            throw VMError.invalidConfig("VM 名称不合法:\(name)")
+        }
+
+        // 镜像校验
+        let imageURL = URL(fileURLWithPath: imagePath).standardized.resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: imageURL.path) else {
+            throw VMError.invalidConfig("镜像文件不存在:\(imageURL.path)")
+        }
+
+        // bundle 位置
+        let libURL = VMBundle.defaultLibraryURL
+        try FileManager.default.createDirectory(at: libURL, withIntermediateDirectories: true)
+        let bundleURL = libURL.appendingPathComponent("\(name).hellvm")
+        if FileManager.default.fileExists(atPath: bundleURL.path) {
+            throw VMError.invalidConfig("同名 VM 已存在:\(name)")
+        }
+
+        // 构造配置: 使用 OS 默认 (Windows 关 virtio-gpu / 启 TPM, 等),
+        // isoPath=nil 且 bootFromDiskOnly=true → QEMU 启动直接走硬盘
+        let disk = DiskConfig(relativePath: "disks/main.qcow2",
+                              sizeGB: expandToGB ?? 1,  // 临时占位, 导入后用实际大小覆盖
+                              format: .qcow2)
+        var (display, boot, nic) = VMConfig.defaults(for: osType,
+                                                     graphical: graphical,
+                                                     isoPath: nil)
+        boot.bootFromDiskOnly = true  // 从镜像导入 → 直接从硬盘启动, 不挂 ISO
+        let config = VMConfig(
+            name: name,
+            architecture: architecture,
+            osType: osType,
+            cpuCount: cpu,
+            memoryMB: memoryMB,
+            disks: [disk],
+            networks: [NetworkConfig(mode: networkMode,
+                                     macAddress: NetworkConfig.generateRandomMAC(),
+                                     bridgedInterface: bridgedInterface,
+                                     deviceModel: nic)],
+            display: display,
+            boot: boot
+        )
+        let bundle = try VMBundle.create(at: bundleURL, config: config)
+
+        // 原子性: 转换/扩容失败就把 bundle 整个删掉, 避免残留半坏 VM
+        let paths = try QEMUPaths.discover()
+        let disks = DiskManager(qemuImgPath: paths.qemuImg)
+        do {
+            try await disks.importImage(
+                from: imageURL,
+                to: bundle.resolve(disk.relativePath),
+                expandToGB: expandToGB
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: bundleURL)
+            throw error
+        }
+
+        // 导入成功后, 把实际磁盘容量写回 config.json (从 qemu-img info 拿真值)
+        do {
+            let info = try await disks.info(at: bundle.resolve(disk.relativePath))
+            let actualGB = max(UInt64(1), info.virtualSizeBytes / (1024 * 1024 * 1024))
+            var cfg = try bundle.loadConfig()
+            if !cfg.disks.isEmpty {
+                cfg.disks[0].sizeGB = actualGB
+                try bundle.saveConfig(cfg)
+            }
+        } catch {
+            // 拿不到 info 不致命, config 里的 sizeGB 只是显示用
+            log.warn(.backend, "读取导入后磁盘大小失败: \(error.localizedDescription)")
+        }
+
+        return bundle
+    }
+
     // MARK: - 配置保存(VM 必须停机)
 
     /// 更新 VM 配置。要求 VM 已停止,写回 config.json 并刷新 store。
