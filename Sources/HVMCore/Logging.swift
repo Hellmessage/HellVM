@@ -131,6 +131,13 @@ public final class Logger: @unchecked Sendable {
     private var _fileEnabled = true
 
     // --- sinks ---
+    // 所有 sink 访问(write / rotate / 切换) 都被调度到 flushQueue 串行执行,
+    // 把 IO 从调用线程抽走。好处:
+    //   - QEMU 高频 stdout/stderr (每秒几十行) 不再阻塞主/worker 线程
+    //   - 日志滚动 (rename + mkdir) 也在后台, 不卡 UI
+    // 代价: 进程崩溃时尾部 pending 日志会丢 (等价于 stdio line-buffered, 可接受)
+    private let flushQueue = DispatchQueue(label: "hellvm.logger.flush", qos: .utility)
+    // 以下 sink 字段只在 flushQueue 上下文访问, 不需要额外 lock.
     private var globalSink: RotatingFileSink?
     private var activeVMSink: RotatingFileSink?
     public private(set) var activeVMBundleURL: URL?
@@ -141,8 +148,9 @@ public final class Logger: @unchecked Sendable {
     }()
 
     public var activeVMLogURL: URL? {
+        // 从 activeVMBundleURL 推算, 避免跨 queue 访问 activeVMSink
         lock.lock(); defer { lock.unlock() }
-        return activeVMSink?.fileURL
+        return activeVMBundleURL?.appendingPathComponent("logs/hellvm.log")
     }
 
     public static let maxBytes = 10 * 1024 * 1024
@@ -176,15 +184,23 @@ public final class Logger: @unchecked Sendable {
         set {
             lock.lock()
             _fileEnabled = newValue
-            if newValue {
-                if globalSink == nil {
-                    globalSink = RotatingFileSink(fileURL: globalLogURL, maxBytes: Self.maxBytes)
-                }
-            } else {
-                globalSink?.close(); globalSink = nil
-                activeVMSink?.close(); activeVMSink = nil
-            }
+            let activeBundle = activeVMBundleURL
             lock.unlock()
+            // sink 切换异步跑在 flushQueue, 确保与 write 串行
+            flushQueue.async { [self] in
+                if newValue {
+                    if globalSink == nil {
+                        globalSink = RotatingFileSink(fileURL: globalLogURL, maxBytes: Self.maxBytes)
+                    }
+                    if activeVMSink == nil, let url = activeBundle {
+                        let logURL = url.appendingPathComponent("logs/hellvm.log")
+                        activeVMSink = RotatingFileSink(fileURL: logURL, maxBytes: Self.maxBytes)
+                    }
+                } else {
+                    globalSink?.close();   globalSink = nil
+                    activeVMSink?.close(); activeVMSink = nil
+                }
+            }
             saveToDefaults()
         }
     }
@@ -218,14 +234,18 @@ public final class Logger: @unchecked Sendable {
         if activeVMBundleURL == bundleURL {
             lock.unlock(); return
         }
-        activeVMSink?.close()
-        activeVMSink = nil
         activeVMBundleURL = bundleURL
-        if let url = bundleURL, _fileEnabled {
-            let logURL = url.appendingPathComponent("logs/hellvm.log")
-            activeVMSink = RotatingFileSink(fileURL: logURL, maxBytes: Self.maxBytes)
-        }
+        let fileEn = _fileEnabled
         lock.unlock()
+        // sink 切换异步: 排在 pending writes 之后, 不会写到半关闭 handle
+        flushQueue.async { [self] in
+            activeVMSink?.close()
+            activeVMSink = nil
+            if let url = bundleURL, fileEn {
+                let logURL = url.appendingPathComponent("logs/hellvm.log")
+                activeVMSink = RotatingFileSink(fileURL: logURL, maxBytes: Self.maxBytes)
+            }
+        }
     }
 
     // MARK: - 日志入口
@@ -263,17 +283,20 @@ public final class Logger: @unchecked Sendable {
     }()
 
     private func emit(_ line: String) {
-        // stderr
+        // stderr 同步输出 (调试用, 低频且需立即可见)
         if stderrEnabled {
             FileHandle.standardError.write(Data(line.utf8))
         }
-        // file sinks
-        lock.lock()
-        let g = globalSink
-        let v = activeVMSink
-        lock.unlock()
-        g?.write(line)
-        v?.write(line)
+        // file sinks 异步写 —— 调用者只付入队开销, 真实 IO 在 flushQueue
+        flushQueue.async { [self] in
+            globalSink?.write(line)
+            activeVMSink?.write(line)
+        }
+    }
+
+    /// 等待当前排队的日志写完 (测试 / 优雅关机用)
+    public func flush() {
+        flushQueue.sync { /* barrier */ }
     }
 
     // MARK: - 便利方法

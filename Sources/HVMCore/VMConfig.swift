@@ -55,8 +55,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         self.id           = try c.decode(UUID.self,           forKey: .id)
         self.name         = try c.decode(String.self,         forKey: .name)
         self.architecture = try c.decode(VMArchitecture.self, forKey: .architecture)
-        /* 兼容旧 config(无 osType 字段): 默认 .other, 保持旧行为 */
-        self.osType       = try c.decodeIfPresent(GuestOSType.self, forKey: .osType) ?? .other
+        self.osType       = try c.decodeOr(GuestOSType.self, forKey: .osType, default: .other)
         self.cpuCount     = try c.decode(Int.self,            forKey: .cpuCount)
         self.memoryMB     = try c.decode(UInt64.self,         forKey: .memoryMB)
         self.disks        = try c.decode([DiskConfig].self,   forKey: .disks)
@@ -187,10 +186,8 @@ public struct NetworkConfig: Codable, Sendable {
         self.macAddress       = try c.decodeIfPresent(String.self, forKey: .macAddress)
         self.socketVmnetPath  = try c.decodeIfPresent(String.self, forKey: .socketVmnetPath)
         self.bridgedInterface = try c.decodeIfPresent(String.self, forKey: .bridgedInterface)
-        /* 兼容旧 config(无 deviceModel 字段): 默认 virtio, 保持现有行为 */
-        self.deviceModel      = try c.decodeIfPresent(NICModel.self, forKey: .deviceModel) ?? .virtio
-        /* 兼容旧 config(无 enabled 字段): 默认 true */
-        self.enabled          = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.deviceModel      = try c.decodeOr(NICModel.self, forKey: .deviceModel, default: .virtio)
+        self.enabled          = try c.decodeOr(Bool.self, forKey: .enabled, default: true)
     }
 
     /// QEMU 侧稳定 ID —— 热插拔要求添加/删除时 ID 一致. 用 MAC 去冒号做后缀,
@@ -274,8 +271,7 @@ public struct DisplayConfig: Codable, Sendable, Equatable {
         self.width     = try c.decode(Int.self, forKey: .width)
         self.height    = try c.decode(Int.self, forKey: .height)
         self.enabled   = try c.decode(Bool.self, forKey: .enabled)
-        /* 兼容旧 config(无 virtioGpu 字段): 默认 true */
-        self.virtioGpu = try c.decodeIfPresent(Bool.self, forKey: .virtioGpu) ?? true
+        self.virtioGpu = try c.decodeOr(Bool.self, forKey: .virtioGpu, default: true)
     }
 }
 
@@ -359,23 +355,17 @@ public struct BootConfig: Codable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.isoPath       = try c.decodeIfPresent(String.self, forKey: .isoPath)
-        self.kernelPath    = try c.decodeIfPresent(String.self, forKey: .kernelPath)
-        self.initrdPath    = try c.decodeIfPresent(String.self, forKey: .initrdPath)
-        self.kernelCmdline = try c.decodeIfPresent(String.self, forKey: .kernelCmdline)
-        self.efi           = try c.decodeIfPresent(Bool.self,   forKey: .efi)       ?? true
-        // 兼容旧 config(无 graphical 字段): 默认 true
-        self.graphical     = try c.decodeIfPresent(Bool.self,   forKey: .graphical) ?? true
-        // 兼容旧 config(无 tpm 字段): 默认 false
-        self.tpm           = try c.decodeIfPresent(Bool.self,   forKey: .tpm)       ?? false
-        // 兼容旧 config(无 serialDebug 字段): 默认 false
-        self.serialDebug   = try c.decodeIfPresent(Bool.self,   forKey: .serialDebug) ?? false
-        // 兼容旧 config(无 bypassWin11Checks 字段): 默认 false
-        self.bypassWin11Checks = try c.decodeIfPresent(Bool.self, forKey: .bypassWin11Checks) ?? false
-        // 兼容旧 config(无 autoInstallVirtioWin 字段): 默认 false
-        self.autoInstallVirtioWin = try c.decodeIfPresent(Bool.self, forKey: .autoInstallVirtioWin) ?? false
-        // 兼容旧 config(无 bootFromDiskOnly 字段): 默认 false
-        self.bootFromDiskOnly = try c.decodeIfPresent(Bool.self, forKey: .bootFromDiskOnly) ?? false
+        self.isoPath              = try c.decodeIfPresent(String.self, forKey: .isoPath)
+        self.kernelPath           = try c.decodeIfPresent(String.self, forKey: .kernelPath)
+        self.initrdPath           = try c.decodeIfPresent(String.self, forKey: .initrdPath)
+        self.kernelCmdline        = try c.decodeIfPresent(String.self, forKey: .kernelCmdline)
+        self.efi                  = try c.decodeOr(Bool.self, forKey: .efi,                  default: true)
+        self.graphical            = try c.decodeOr(Bool.self, forKey: .graphical,            default: true)
+        self.tpm                  = try c.decodeOr(Bool.self, forKey: .tpm,                  default: false)
+        self.serialDebug          = try c.decodeOr(Bool.self, forKey: .serialDebug,          default: false)
+        self.bypassWin11Checks    = try c.decodeOr(Bool.self, forKey: .bypassWin11Checks,    default: false)
+        self.autoInstallVirtioWin = try c.decodeOr(Bool.self, forKey: .autoInstallVirtioWin, default: false)
+        self.bootFromDiskOnly     = try c.decodeOr(Bool.self, forKey: .bootFromDiskOnly,     default: false)
     }
 }
 
@@ -421,5 +411,17 @@ extension VMConfig {
             let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical)
             return (disp, boot, .virtio)
         }
+    }
+}
+
+// MARK: - Decoding 小工具
+
+extension KeyedDecodingContainer {
+    /// 可选字段解码, 缺失/null → 返回 defaultValue.
+    ///
+    /// 用于保持对旧 config.json 的向前兼容 —— 新增字段时不需要写迁移脚本,
+    /// 旧文件里没有的字段就取默认值. 比 `decodeIfPresent(...) ?? X` 意图更明确。
+    func decodeOr<T: Decodable>(_ type: T.Type, forKey key: Key, default defaultValue: T) throws -> T {
+        try decodeIfPresent(type, forKey: key) ?? defaultValue
     }
 }
