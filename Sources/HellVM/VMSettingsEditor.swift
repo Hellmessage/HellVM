@@ -33,6 +33,14 @@ struct VMSettingsEditor: View {
     /// 安装/卸载后 bump 一下, 强制 vmnetDaemonPanel 重读 socket 状态
     @State private var vmnetRefreshToken: UInt64 = 0
 
+    /// 多网卡卡片折叠状态 —— 记录已展开的 NIC 下标. 默认只展开 NIC 0.
+    @State private var expandedNICs: Set<Int> = [0]
+
+    /// 每个 NIC 的模式下拉展开状态 (inline 而非系统 Menu, 为了和暗色主题一致)
+    @State private var openModeMenus: Set<Int> = []
+    /// 每个 NIC 的桥接接口下拉展开状态
+    @State private var openIfaceMenus: Set<Int> = []
+
     // virtio-win.iso 下载状态
     @StateObject private var virtioWin = VirtioWinManager.shared
 
@@ -348,60 +356,185 @@ struct VMSettingsEditor: View {
     private var networkSection: some View {
         section(title: "网络") {
             if readOnly {
-                let net = item.config.networks.first
-                keyValue("模式", value: net.map { displayName(of: $0.mode) } ?? "无")
-                if let nic = net?.deviceModel {
-                    keyValue("NIC 型号", value: nic.rawValue)
-                }
-                if let s = net?.effectiveSocketPath {
-                    keyValue("socket", value: s, mono: true)
-                }
-                if let iface = net?.bridgedInterface, !iface.isEmpty {
-                    keyValue("桥接网卡", value: iface, mono: true)
-                }
-                if let mac = net?.macAddress, !mac.isEmpty {
-                    keyValue("MAC", value: mac, mono: true)
+                let nets = item.config.networks
+                if nets.isEmpty {
+                    keyValue("网卡", value: "无")
+                } else {
+                    ForEach(nets.indices, id: \.self) { idx in
+                        let net = nets[idx]
+                        keyValue("NIC \(idx)", value: "\(displayName(of: net.mode))  ·  \(net.deviceModel.rawValue)")
+                        if let iface = net.bridgedInterface, !iface.isEmpty {
+                            keyValue("  桥接网卡", value: iface, mono: true)
+                        }
+                        if let mac = net.macAddress, !mac.isEmpty {
+                            keyValue("  MAC", value: mac, mono: true)
+                        }
+                    }
                 }
             } else {
-                networkModePicker
-                nicModelPicker
-                if case .some(let m) = draft.networks.first?.mode,
-                   m == .vmnetShared || m == .vmnetHost || m == .vmnetBridged {
-                    networkVmnetOptions
+                ForEach(draft.networks.indices, id: \.self) { idx in
+                    nicCard(at: idx)
                 }
-                networkMacField
+                HStack(spacing: 8) {
+                    SecondaryButton(title: "添加网卡", systemImage: "plus") { addNIC() }
+                    Text("多网卡允许同一 VM 同时用不同网络(例: shared 上网 + bridged 暴露服务)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                    Spacer()
+                }
                 vmnetDaemonPanel
             }
         }
     }
 
-    private var networkModePicker: some View {
-        let current: NetworkConfig.Mode = draft.networks.first?.mode ?? .user
+    /// 单块 NIC 的折叠卡片 —— 头部单行可点击展开/折叠
+    @ViewBuilder
+    private func nicCard(at idx: Int) -> some View {
+        if idx < draft.networks.count {
+            let expanded = expandedNICs.contains(idx)
+            VStack(alignment: .leading, spacing: 0) {
+                // 头部: 点击整行切换展开
+                Button(action: { toggleNICExpanded(idx) }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Theme.textTertiary)
+                            .frame(width: 10)
+                        Image(systemName: "network")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.accent)
+                        Text("NIC \(idx)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Theme.textPrimary)
+                        Text(nicSummary(at: idx))
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textSecondary)
+                            .lineLimit(1)
+                        Spacer()
+                        Button(action: { removeNIC(at: idx) }) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.danger)
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(RoundedRectangle(cornerRadius: 6).fill(Theme.danger.opacity(0.10)))
+                        }
+                        .buttonStyle(.plain)
+                        .help("删除此网卡")
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if expanded {
+                    Rectangle().fill(Theme.divider).frame(height: 1)
+                    VStack(alignment: .leading, spacing: 10) {
+                        networkModeMenu(at: idx)
+                        nicModelPicker(at: idx)
+                        let mode = draft.networks[idx].mode
+                        if mode == .vmnetBridged {
+                            networkVmnetOptions(at: idx)
+                        }
+                        networkMacField(at: idx)
+                    }
+                    .padding(12)
+                }
+            }
+            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.surface))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.divider, lineWidth: 1))
+        }
+    }
+
+    /// 折叠状态下的一行摘要: 模式 · NIC 型号 · MAC 尾
+    private func nicSummary(at idx: Int) -> String {
+        let net = draft.networks[idx]
+        var parts: [String] = [displayName(of: net.mode)]
+        if net.mode == .vmnetBridged, let iface = net.bridgedInterface, !iface.isEmpty {
+            parts[0] += "(\(iface))"
+        }
+        parts.append(net.deviceModel.rawValue)
+        if let mac = net.macAddress, mac.count >= 8 {
+            parts.append("…\(mac.suffix(8))")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func toggleNICExpanded(_ idx: Int) {
+        if expandedNICs.contains(idx) {
+            expandedNICs.remove(idx)
+        } else {
+            expandedNICs.insert(idx)
+        }
+    }
+
+    /// 自绘模式下拉 —— 触发是单行, 点击展开 5 个选项, 全部 Theme 调色和 NIC/桥接
+    /// picker 保持视觉一致, 不走系统 Menu 的浅色弹出
+    private func networkModeMenu(at idx: Int) -> some View {
+        let current = draft.networks[idx].mode
+        let isOpen = openModeMenus.contains(idx)
         return VStack(alignment: .leading, spacing: 6) {
             FieldLabel("模式")
-            VStack(spacing: 6) {
-                netModeRow(.user,          title: "user (NAT)",       subtitle: "QEMU 内置, 零依赖, 不支持 ICMP/ping", current: current)
-                netModeRow(.vmnetShared,   title: "vmnet · shared",   subtitle: "NAT + DHCP (socket_vmnet 默认模式)", current: current)
-                netModeRow(.vmnetHost,     title: "vmnet · host-only",subtitle: "仅宿主机互通, 无外网",                current: current)
-                netModeRow(.vmnetBridged,  title: "vmnet · bridged",  subtitle: "真二层桥接, 获取同局域网 IP",          current: current)
-                netModeRow(.none,          title: "无网络",            subtitle: "-nic none, 完全禁用",                 current: current)
+            // 触发行
+            Button(action: { toggleModeMenu(idx) }) {
+                HStack {
+                    Image(systemName: modeIcon(current))
+                        .foregroundStyle(modeColor(current))
+                        .font(.system(size: 12))
+                    Text(displayName(of: current))
+                        .foregroundStyle(Theme.textPrimary)
+                        .font(.system(size: 12, weight: .medium))
+                    Text(modeSubtitle(current))
+                        .foregroundStyle(Theme.textTertiary)
+                        .font(.system(size: 10))
+                    Spacer()
+                    Image(systemName: isOpen ? "chevron.up" : "chevron.down")
+                        .foregroundStyle(Theme.textTertiary)
+                        .font(.system(size: 10))
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .stroke(isOpen ? Theme.accent.opacity(0.4) : Color.clear, lineWidth: 1))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            // 展开后的选项列表
+            if isOpen {
+                VStack(spacing: 4) {
+                    modeOption(.user,         title: "user (NAT)",        subtitle: "QEMU 内置, 零依赖, 不支持 ICMP/ping", current: current, idx: idx)
+                    modeOption(.vmnetShared,  title: "vmnet · shared",    subtitle: "NAT + DHCP (socket_vmnet 默认模式)", current: current, idx: idx)
+                    modeOption(.vmnetHost,    title: "vmnet · host-only", subtitle: "仅宿主机互通, 无外网",                current: current, idx: idx)
+                    modeOption(.vmnetBridged, title: "vmnet · bridged",   subtitle: "真二层桥接, 获取同局域网 IP",          current: current, idx: idx)
+                    Rectangle().fill(Theme.divider).frame(height: 1).padding(.vertical, 2)
+                    modeOption(.none,         title: "暂时禁用",           subtitle: "保留配置, 启动时不挂这块 NIC",         current: current, idx: idx)
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surface))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.divider, lineWidth: 1))
             }
         }
     }
 
-    private func netModeRow(_ mode: NetworkConfig.Mode,
-                            title: String,
-                            subtitle: String,
-                            current: NetworkConfig.Mode) -> some View {
+    /// 单个模式选项行 —— 选中时 accent 竖条 + 背景高亮
+    private func modeOption(_ mode: NetworkConfig.Mode,
+                            title: String, subtitle: String,
+                            current: NetworkConfig.Mode, idx: Int) -> some View {
         let selected = current == mode
-        return Button(action: { setMode(mode) }) {
+        return Button(action: {
+            setMode(mode, at: idx)
+            openModeMenus.remove(idx)
+        }) {
             HStack(spacing: 10) {
-                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                    .font(.system(size: 14))
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 13))
                     .foregroundStyle(selected ? Theme.accent : Theme.textTertiary)
-                VStack(alignment: .leading, spacing: 2) {
+                Image(systemName: modeIcon(mode))
+                    .font(.system(size: 11))
+                    .foregroundStyle(selected ? modeColor(mode) : Theme.textTertiary)
+                    .frame(width: 14)
+                VStack(alignment: .leading, spacing: 1) {
                     Text(title)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 12, weight: selected ? .semibold : .regular))
                         .foregroundStyle(selected ? Theme.textPrimary : Theme.textSecondary)
                     Text(subtitle)
                         .font(.system(size: 10))
@@ -409,55 +542,145 @@ struct VMSettingsEditor: View {
                 }
                 Spacer()
             }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .background(RoundedRectangle(cornerRadius: 7)
-                .fill(selected ? Theme.accent.opacity(0.08) : Theme.surfaceElevated))
-            .overlay(RoundedRectangle(cornerRadius: 7)
-                .stroke(selected ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1))
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(selected ? Theme.accent.opacity(0.10) : Color.clear))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
+    private func toggleModeMenu(_ idx: Int) {
+        if openModeMenus.contains(idx) {
+            openModeMenus.remove(idx)
+        } else {
+            openModeMenus.insert(idx)
+        }
+    }
+
+    private func modeIcon(_ m: NetworkConfig.Mode) -> String {
+        switch m {
+        case .user:         return "network"
+        case .vmnetShared:  return "shared.with.you"
+        case .vmnetHost:    return "house"
+        case .vmnetBridged: return "antenna.radiowaves.left.and.right"
+        case .none:         return "pause.circle"
+        }
+    }
+
+    private func modeColor(_ m: NetworkConfig.Mode) -> Color {
+        m == .none ? Theme.textTertiary : Theme.accent
+    }
+
+    private func modeSubtitle(_ m: NetworkConfig.Mode) -> String {
+        switch m {
+        case .user:         return "零依赖, 不支持 ICMP"
+        case .vmnetShared:  return "默认模式"
+        case .vmnetHost:    return "仅宿主机互通"
+        case .vmnetBridged: return "真二层桥接"
+        case .none:         return "不挂载"
+        }
+    }
+
     @ViewBuilder
-    private var networkVmnetOptions: some View {
-        let mode = draft.networks.first?.mode ?? .user
+    private func networkVmnetOptions(at idx: Int) -> some View {
+        let mode = draft.networks[idx].mode
         VStack(alignment: .leading, spacing: 8) {
             if mode == .vmnetBridged {
                 FieldLabel("桥接网卡")
-                bridgedInterfacePicker
+                bridgedInterfacePicker(at: idx)
             }
         }
     }
 
-    private var bridgedInterfacePicker: some View {
+    private func bridgedInterfacePicker(at idx: Int) -> some View {
         let ifaces = HostNetworkInterfaces.list()
-        let current = draft.networks.first?.bridgedInterface ?? HostNetworkInterfaces.recommendedDefault()
-        return Menu {
-            ForEach(ifaces, id: \.id) { iface in
-                Button(iface.displayLabel) {
-                    updateFirstNet { $0.bridgedInterface = iface.name }
+        let current = draft.networks[idx].bridgedInterface ?? HostNetworkInterfaces.recommendedDefault()
+        let isOpen = openIfaceMenus.contains(idx)
+        return VStack(alignment: .leading, spacing: 4) {
+            Button(action: { toggleIfaceMenu(idx) }) {
+                HStack {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .foregroundStyle(Theme.accent)
+                        .font(.system(size: 12))
+                    Text(labelFor(iface: current, among: ifaces))
+                        .foregroundStyle(Theme.textPrimary)
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Image(systemName: isOpen ? "chevron.up" : "chevron.down")
+                        .foregroundStyle(Theme.textTertiary)
+                        .font(.system(size: 10))
                 }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .stroke(isOpen ? Theme.accent.opacity(0.4) : Color.clear, lineWidth: 1))
+                .contentShape(Rectangle())
             }
-            if ifaces.isEmpty {
-                Button("(扫描不到接口)") {}.disabled(true)
+            .buttonStyle(.plain)
+            if isOpen {
+                VStack(spacing: 2) {
+                    if ifaces.isEmpty {
+                        Text("(扫描不到可桥接接口)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textTertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                    } else {
+                        ForEach(ifaces, id: \.id) { iface in
+                            ifaceOption(iface, current: current, idx: idx)
+                        }
+                    }
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surface))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.divider, lineWidth: 1))
             }
-        } label: {
-            HStack {
-                Image(systemName: "antenna.radiowaves.left.and.right")
-                    .foregroundStyle(Theme.textSecondary)
-                Text(labelFor(iface: current, among: ifaces))
-                    .foregroundStyle(Theme.textPrimary)
-                Spacer()
-                Image(systemName: "chevron.down")
-                    .foregroundStyle(Theme.textTertiary)
-                    .font(.system(size: 10))
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated))
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+    }
+
+    private func ifaceOption(_ iface: HostNetworkInterface,
+                             current: String, idx: Int) -> some View {
+        let selected = iface.name == current
+        return Button(action: {
+            updateNet(at: idx) { $0.bridgedInterface = iface.name }
+            openIfaceMenus.remove(idx)
+        }) {
+            HStack(spacing: 8) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(selected ? Theme.accent : Theme.textTertiary)
+                Circle()
+                    .fill(iface.isActive ? Theme.success : Theme.textTertiary)
+                    .frame(width: 6, height: 6)
+                Text(iface.name)
+                    .font(.system(size: 12, weight: selected ? .semibold : .regular, design: .monospaced))
+                    .foregroundStyle(selected ? Theme.textPrimary : Theme.textSecondary)
+                if let ip = iface.ipv4 {
+                    Text(ip)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                } else {
+                    Text("(未连接)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(selected ? Theme.accent.opacity(0.10) : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func toggleIfaceMenu(_ idx: Int) {
+        if openIfaceMenus.contains(idx) {
+            openIfaceMenus.remove(idx)
+        } else {
+            openIfaceMenus.insert(idx)
+        }
     }
 
     private func labelFor(iface name: String, among ifaces: [HostNetworkInterface]) -> String {
@@ -466,21 +689,21 @@ struct VMSettingsEditor: View {
     }
 
     /// NIC 设备型号选择(virtio / e1000e / rtl8139)
-    private var nicModelPicker: some View {
-        let current = draft.networks.first?.deviceModel ?? .virtio
+    private func nicModelPicker(at idx: Int) -> some View {
+        let current = draft.networks[idx].deviceModel
         return VStack(alignment: .leading, spacing: 6) {
             FieldLabel("NIC 型号")
             HStack(spacing: 6) {
-                nicChip(.virtio,  title: "virtio",  subtitle: "Linux 最快", current: current)
-                nicChip(.e1000e,  title: "e1000e",  subtitle: "Win 开箱",   current: current)
-                nicChip(.rtl8139, title: "rtl8139", subtitle: "老系统兜底", current: current)
+                nicChip(.virtio,  title: "virtio",  subtitle: "Linux 最快", current: current, idx: idx)
+                nicChip(.e1000e,  title: "e1000e",  subtitle: "Win 开箱",   current: current, idx: idx)
+                nicChip(.rtl8139, title: "rtl8139", subtitle: "老系统兜底", current: current, idx: idx)
             }
         }
     }
 
-    private func nicChip(_ m: NICModel, title: String, subtitle: String, current: NICModel) -> some View {
+    private func nicChip(_ m: NICModel, title: String, subtitle: String, current: NICModel, idx: Int) -> some View {
         let selected = current == m
-        return Button(action: { updateFirstNet { $0.deviceModel = m } }) {
+        return Button(action: { updateNet(at: idx) { $0.deviceModel = m } }) {
             VStack(spacing: 3) {
                 Text(title)
                     .font(.system(size: 12, weight: .semibold))
@@ -500,46 +723,51 @@ struct VMSettingsEditor: View {
     }
 
     /// MAC 地址字段 + 重新生成按钮
-    private var networkMacField: some View {
+    private func networkMacField(at idx: Int) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             FieldLabel("MAC 地址")
             HStack(spacing: 8) {
                 StyledTextField(
                     placeholder: "52:54:00:xx:xx:xx",
                     text: Binding(
-                        get: { draft.networks.first?.macAddress ?? "" },
-                        set: { v in updateFirstNet { $0.macAddress = v.isEmpty ? nil : v } }
+                        get: { draft.networks[idx].macAddress ?? "" },
+                        set: { v in updateNet(at: idx) { $0.macAddress = v.isEmpty ? nil : v } }
                     ),
                     monospaced: true
                 )
                 SecondaryButton(title: "重新生成", systemImage: "arrow.clockwise") {
-                    updateFirstNet { $0.macAddress = NetworkConfig.generateRandomMAC() }
+                    updateNet(at: idx) { $0.macAddress = NetworkConfig.generateRandomMAC() }
                 }
             }
         }
     }
 
-    /// vmnet daemon 状态面板: 状态行 + 安装 / 卸载按钮
+    /// vmnet daemon 状态面板: 跨全部 NIC 展示(任一走 vmnet 就显示),
+    /// 列所有缺失的 socket 状态, 一键安装/卸载
     @ViewBuilder
     private var vmnetDaemonPanel: some View {
-        let mode = draft.networks.first?.mode ?? .user
-        if mode == .vmnetShared || mode == .vmnetHost || mode == .vmnetBridged {
+        let vmnetNets = draft.networks.filter {
+            $0.mode == .vmnetShared || $0.mode == .vmnetHost || $0.mode == .vmnetBridged
+        }
+        if !vmnetNets.isEmpty {
             let sockets = VMnetSupervisor.presentSockets()
-            let draftNet = draft.networks.first ?? NetworkConfig()
-            let st = VMnetSupervisor.status(for: draftNet)
+            let missing = vmnetNets.compactMap { net -> String? in
+                let st = VMnetSupervisor.status(for: net)
+                return st.socketExists ? nil : (st.socketPath ?? "?")
+            }
             VStack(alignment: .leading, spacing: 6) {
                 FieldLabel("vmnet daemon")
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: st.socketExists ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                    Image(systemName: missing.isEmpty ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                         .font(.system(size: 11))
-                        .foregroundStyle(st.socketExists ? Theme.success : Theme.warning)
+                        .foregroundStyle(missing.isEmpty ? Theme.success : Theme.warning)
                     VStack(alignment: .leading, spacing: 3) {
-                        if st.socketExists {
-                            Text("当前模式 socket 已就绪: \(st.socketPath ?? "-")")
+                        if missing.isEmpty {
+                            Text("所有 NIC 需要的 socket 均已就绪")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Theme.textSecondary)
                         } else {
-                            Text("当前模式 socket 不存在: \(st.socketPath ?? "-")")
+                            Text("缺失 socket: \(missing.joined(separator: ", "))")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Theme.textPrimary.opacity(0.9))
                         }
@@ -581,7 +809,12 @@ struct VMSettingsEditor: View {
         vmnetError = nil
         defer { vmnetBusy = false }
         do {
-            let extra = (draft.networks.first?.bridgedInterface).map { [$0] } ?? []
+            // 收集当前 draft 里所有 bridged NIC 用到的接口, 一起安装 daemon
+            let extra = draft.networks.compactMap { net -> String? in
+                guard net.mode == .vmnetBridged,
+                      let i = net.bridgedInterface, !i.isEmpty else { return nil }
+                return i
+            }
             try await VMnetSupervisor.installAllDaemons(extraBridgedInterfaces: extra)
             // 装完后 socket 会在 1-2 秒后出现, 触发一次视图刷新
             vmnetRefreshToken &+= 1
@@ -903,24 +1136,43 @@ struct VMSettingsEditor: View {
         }
     }
 
-    private func setMode(_ m: NetworkConfig.Mode) {
-        if draft.networks.isEmpty {
-            draft.networks = [NetworkConfig(mode: m)]
-        } else {
-            draft.networks[0].mode = m
-            // 切到非 vmnet* 模式时清掉无关字段
-            if m == .user || m == .none {
-                draft.networks[0].socketVmnetPath = nil
-                draft.networks[0].bridgedInterface = nil
-            }
+    private func setMode(_ m: NetworkConfig.Mode, at idx: Int) {
+        guard idx < draft.networks.count else { return }
+        draft.networks[idx].mode = m
+        // 切到非 vmnet* 模式时清掉 vmnet 相关字段, 避免残留路径
+        if m == .user || m == .none {
+            draft.networks[idx].socketVmnetPath = nil
+            draft.networks[idx].bridgedInterface = nil
         }
     }
 
-    private func updateFirstNet(_ mutate: (inout NetworkConfig) -> Void) {
-        if draft.networks.isEmpty {
-            draft.networks = [NetworkConfig(mode: .user)]
+    private func updateNet(at idx: Int, _ mutate: (inout NetworkConfig) -> Void) {
+        guard idx < draft.networks.count else { return }
+        mutate(&draft.networks[idx])
+    }
+
+    /// 新增一块 NIC: 默认 user 模式 + osType 对应 NIC model + 随机 MAC
+    private func addNIC() {
+        let (_, _, nic) = VMConfig.defaults(for: draft.osType)
+        draft.networks.append(NetworkConfig(
+            mode: .user,
+            macAddress: NetworkConfig.generateRandomMAC(),
+            deviceModel: nic
+        ))
+        // 新加的 NIC 自动展开, 方便用户立即编辑
+        expandedNICs.insert(draft.networks.count - 1)
+    }
+
+    /// 删除指定 NIC, 同步收尾展开集合(被删索引移除, 大于它的索引往前挪 1)
+    private func removeNIC(at idx: Int) {
+        guard idx < draft.networks.count else { return }
+        draft.networks.remove(at: idx)
+        var newSet: Set<Int> = []
+        for e in expandedNICs {
+            if e < idx { newSet.insert(e) }
+            else if e > idx { newSet.insert(e - 1) }
         }
-        mutate(&draft.networks[0])
+        expandedNICs = newSet
     }
 
     private func displayName(of m: NetworkConfig.Mode) -> String {

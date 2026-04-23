@@ -656,35 +656,40 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     }
 
     /// 根据 NetworkConfig 列表产出 `-netdev` / `-device` / `-nic` 参数。
-    /// 目前仅消费第一块网卡(多网卡 P6+);空数组或 .none 均视作禁用网络。
+    ///
+    /// 支持多网卡: 每个 NetworkConfig 生成独立的 netdev (id=net0/net1/...) + 对应的
+    /// virtio-net-pci/e1000e/rtl8139 PCI device。.none 模式的条目被跳过但保留位置,
+    /// 这样用户在 Settings 里暂时关掉某块网卡不影响其他网卡的序号/MAC。
+    ///
+    /// 空数组 / 全部 .none → `-nic none` 禁用自动兜底 NIC(QEMU 不加这行会隐式塞一张 user NAT)
     private func buildNetArgs(_ networks: [NetworkConfig]) -> [String] {
-        guard let net = networks.first, net.mode != .none else {
-            // 禁用全部自动网卡(QEMU 不加 -nic none 时会隐式兜底一张 user)
+        // 过滤启用的 NIC(但保留原始索引, 确保 id=netN 稳定, MAC 不串位置)
+        let active = networks.enumerated().filter { $0.element.mode != .none }
+        guard !active.isEmpty else {
             return ["-nic", "none"]
         }
 
-        let netdevID = "net0"
-        // 按配置选 NIC 型号: virtio-net-pci / e1000e / rtl8139
-        // Windows 默认用 e1000e 开箱即有驱动; Linux 用 virtio 性能最好
-        var deviceOpts = "\(net.deviceModel.qemuDeviceName),netdev=\(netdevID)"
-        if let mac = net.macAddress, !mac.isEmpty {
-            deviceOpts += ",mac=\(mac)"
-        }
-
         var out: [String] = []
-        switch net.mode {
-        case .user:
-            out += ["-netdev", "user,id=\(netdevID)"]
-            out += ["-device", deviceOpts]
-        case .vmnetShared, .vmnetHost, .vmnetBridged:
-            // socket_vmnet 约定:QEMU 以 unix stream 连 helper socket, helper
-            // 把以太网帧转进 vmnet.framework。helper 模式(shared/host/bridged)
-            // 由 daemon 启动参数决定, 这里只负责指向对应 socket。
-            let sock = net.effectiveSocketPath ?? "/var/run/socket_vmnet"
-            out += ["-netdev", "stream,id=\(netdevID),addr.type=unix,addr.path=\(sock)"]
-            out += ["-device", deviceOpts]
-        case .none:
-            break   // 已在 guard 里处理
+        for (idx, net) in active {
+            let netdevID = "net\(idx)"
+            var deviceOpts = "\(net.deviceModel.qemuDeviceName),netdev=\(netdevID)"
+            if let mac = net.macAddress, !mac.isEmpty {
+                deviceOpts += ",mac=\(mac)"
+            }
+            switch net.mode {
+            case .user:
+                out += ["-netdev", "user,id=\(netdevID)"]
+                out += ["-device", deviceOpts]
+            case .vmnetShared, .vmnetHost, .vmnetBridged:
+                // socket_vmnet 约定: QEMU 以 unix stream 连 helper socket, helper 把
+                // 以太网帧转进 vmnet.framework。每个 NIC 独立连自己的 socket,
+                // 允许同一 VM 跨多个 vmnet 模式(例: 一张 shared 上网 + 一张 bridged 暴露服务)。
+                let sock = net.effectiveSocketPath ?? "/var/run/socket_vmnet"
+                out += ["-netdev", "stream,id=\(netdevID),addr.type=unix,addr.path=\(sock)"]
+                out += ["-device", deviceOpts]
+            case .none:
+                continue
+            }
         }
         return out
     }
