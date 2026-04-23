@@ -509,7 +509,17 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         args += ["-qmp", "unix:\(bundle.qmpInputSocketURL.path),server=on,wait=off"]
 
         // machine / 加速 / cpu / smp / 内存
-        args += ["-machine", "virt,accel=hvf"]
+        //
+        // hellvm-lowram=on: 仅 Windows 11 ARM64 guest 开, 在 0x10000000 挂一小块 RAM
+        // 骗 bootmgr 的硬编码内存假设. 要求配套打过 patch 的 EDK2 (patches/edk2/
+        // 0001-ArmVirtPkg-extra-RAM-region-for-Win11-compat.patch). 没装 patched EDK2
+        // 但开了这个选项 → EDK2 PEI ASSERT, 见 patch 0004 里的长注释.
+        // 非 Windows (Linux/macOS/other) 不传这个选项 → stock EDK2 正常工作.
+        var machineOpts = "virt,accel=hvf"
+        if config.osType == .windows {
+            machineOpts += ",hellvm-lowram=on"
+        }
+        args += ["-machine", machineOpts]
         args += ["-cpu", "host"]
         args += ["-smp", String(config.cpuCount)]
         args += ["-m", "\(config.memoryMB)M"]

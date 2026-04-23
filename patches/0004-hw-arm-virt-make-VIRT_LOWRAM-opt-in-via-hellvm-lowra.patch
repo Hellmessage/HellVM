@@ -1,0 +1,126 @@
+From e36c1383900b9f9718bba339494cd757668983c3 Mon Sep 17 00:00:00 2001
+From: HellVM Build <build@hellvm.local>
+Date: Thu, 23 Apr 2026 17:30:48 +0800
+Subject: [PATCH] hw/arm/virt: make VIRT_LOWRAM opt-in via hellvm-lowram
+ machine property
+
+patch 0002 unconditionally adds a low-address RAM region at 0x10000000 to
+emulate Win11 ARM64 bootmgr's x86-hardcoded memory assumptions. This requires
+a patched EDK2 (QemuVirtMemInfoPeiLibConstructor picks PcdSystemMemoryBase
+instead of the lowest DTB memory node). With stock EDK2 the new /memory@10000000
+node causes an ASSERT at PEI init, killing Linux/BSD guests.
+
+Solution: gate both the RAM region and bootinfo.extra_ram_base on a new
+hellvm-lowram bool property (default false). Swift QEMUBackend passes
+hellvm-lowram=on only for Windows VMs.
+
+HellVM patch 0004.
+---
+ hw/arm/virt.c         | 52 +++++++++++++++++++++++++++++++------------
+ include/hw/arm/virt.h |  4 ++++
+ 2 files changed, 42 insertions(+), 14 deletions(-)
+
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index 5db826a..6c95032 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -2453,14 +2453,16 @@ static void machvirt_init(MachineState *machine)
+                                 machine->ram);
+ 
+     /*
+-     * HellVM: 在 0x10000000 挂一小块 RAM(VIRT_LOWRAM),用于兼容 Win11 ARM64 bootmgr。
+-     * Windows ARM64 的 bootmgfw.efi 里保留了 x86 UEFI 的内存布局硬编码假设,
+-     * 会对 0x10000000 附近的内存调 ConvertPages/SetMemoryAttributes。
+-     * vanilla virt machine 这里是 PCIe MMIO, 操作失败 -> bootmgr 超时退出。
+-     * 挂一小块 RAM 上去后 bootmgr 的内存操作能成功,正常进入 WinPE。
+-     * Linux/BSD 不依赖这个区域,有这块 RAM 对它们无副作用。
++     * HellVM: 仅当 hellvm_lowram=on 时, 在 0x10000000 挂一小块 RAM (VIRT_LOWRAM)
++     * 兼容 Win11 ARM64 bootmgr (bootmgfw.efi 对 0x10000000 附近调
++     * ConvertPages/SetMemoryAttributes, 原 PCIe MMIO 会失败).
++     *
++     * 默认关闭, 因为它要求配套打过补丁的 EDK2 (改 QemuVirtMemInfoPeiLibConstructor,
++     * 用 PcdSystemMemoryBase 选主 RAM). stock EDK2 拿到 0x10000000 当主 RAM 会
++     * ASSERT 挂死, 导致 Linux/BSD 等 guest 全部启动失败.
++     * 由 Swift 侧 QEMUBackend 给 Windows VM 加 -machine virt,hellvm-lowram=on.
+      */
+-    {
++    if (vms->hellvm_lowram) {
+         MemoryRegion *lowram = g_new(MemoryRegion, 1);
+         memory_region_init_ram(lowram, NULL, "virt.lowram",
+                                vms->memmap[VIRT_LOWRAM].size, &error_fatal);
+@@ -2570,14 +2572,13 @@ static void machvirt_init(MachineState *machine)
+     vms->bootinfo.board_id = -1;
+     vms->bootinfo.loader_start = vms->memmap[VIRT_MEM].base;
+     /*
+-     * HellVM: 把 VIRT_LOWRAM 宣告为第二个 /memory 节点。
+-     * 搭配我们 patch 过的 EDK2 (QemuVirtMemInfoPeiLibConstructor):
+-     *   - 按 PcdSystemMemoryBase 选主 RAM, 避免原来 "取最低地址" 触发的 ASSERT
+-     *   - 额外 /memory 节点存新 GUID HOB, MemoryPeim 把它也注册为 EFI_RESOURCE_SYSTEM_MEMORY
+-     * 这样 Win11 bootmgr 在 0x10000000 附近的 ConvertPages/SetMemoryAttributes 能成功。
++     * HellVM: 仅当 hellvm_lowram=on 时把 VIRT_LOWRAM 作为第二个 /memory 节点广播.
++     * 搭配打过补丁的 EDK2, stock EDK2 会取最低地址并 ASSERT.
+      */
+-    vms->bootinfo.extra_ram_base = vms->memmap[VIRT_LOWRAM].base;
+-    vms->bootinfo.extra_ram_size = vms->memmap[VIRT_LOWRAM].size;
++    if (vms->hellvm_lowram) {
++        vms->bootinfo.extra_ram_base = vms->memmap[VIRT_LOWRAM].base;
++        vms->bootinfo.extra_ram_size = vms->memmap[VIRT_LOWRAM].size;
++    }
+     vms->bootinfo.get_dtb = machvirt_dtb;
+     vms->bootinfo.skip_dtb_autoload = true;
+     vms->bootinfo.firmware_loaded = firmware_loaded;
+@@ -2749,6 +2750,19 @@ static void virt_set_dtb_randomness(Object *obj, bool value, Error **errp)
+     vms->dtb_randomness = value;
+ }
+ 
++/* HellVM: hellvm-lowram property getter/setter */
++static bool virt_get_hellvm_lowram(Object *obj, Error **errp)
++{
++    VirtMachineState *vms = VIRT_MACHINE(obj);
++    return vms->hellvm_lowram;
++}
++
++static void virt_set_hellvm_lowram(Object *obj, bool value, Error **errp)
++{
++    VirtMachineState *vms = VIRT_MACHINE(obj);
++    vms->hellvm_lowram = value;
++}
++
+ static char *virt_get_oem_id(Object *obj, Error **errp)
+ {
+     VirtMachineState *vms = VIRT_MACHINE(obj);
+@@ -3475,6 +3489,16 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
+     object_class_property_set_description(oc, "dtb-kaslr-seed",
+                                           "Deprecated synonym of dtb-randomness");
+ 
++    /* HellVM: opt-in 低地址 RAM 孔 (0x10000000, 16MB), 仅 Windows 11 ARM64 VM 开
++     * 要求配套 EDK2 patch; stock EDK2 打开这个会 ASSERT 挂死 */
++    object_class_property_add_bool(oc, "hellvm-lowram",
++                                   virt_get_hellvm_lowram,
++                                   virt_set_hellvm_lowram);
++    object_class_property_set_description(oc, "hellvm-lowram",
++                                          "Set on to add a small low-address RAM hole "
++                                          "at 0x10000000 for Win11 ARM64 bootmgr compat "
++                                          "(requires patched EDK2)");
++
+     object_class_property_add_str(oc, "x-oem-id",
+                                   virt_get_oem_id,
+                                   virt_set_oem_id);
+diff --git a/include/hw/arm/virt.h b/include/hw/arm/virt.h
+index c8d0f1f..d4c0733 100644
+--- a/include/hw/arm/virt.h
++++ b/include/hw/arm/virt.h
+@@ -154,6 +154,10 @@ struct VirtMachineState {
+     bool ras;
+     bool mte;
+     bool dtb_randomness;
++    /* HellVM: 是否在 0x10000000 挂一小块 RAM (VIRT_LOWRAM) 骗 Win11 bootmgr。
++     * 默认 false —— 不动原生 virt 内存布局, 让 stock EDK2 正常启动。
++     * Windows 11 VM 专门通过 -machine virt,hellvm-lowram=on 启用。 */
++    bool hellvm_lowram;
+     bool second_ns_uart_present;
+     OnOffAuto acpi;
+     VirtGICType gic_version;
+-- 
+2.50.1 (Apple Git-155)
+

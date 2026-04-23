@@ -1,0 +1,199 @@
+From 5089bd052b9f4e3d441d2c47b4eaec620f5b325d Mon Sep 17 00:00:00 2001
+From: HellVM Build <build@hellvm.local>
+Date: Thu, 23 Apr 2026 17:43:55 +0800
+Subject: [PATCH] iosurface: fix multi-console active_con thrash with 1s idle
+ cooldown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bug: virtio-gpu-pci + ramfb dual-console setups would thrash active_con
+between the two consoles on every dpy_gfx_update/switch, causing iosurface
+client to see surface resolution flipping 800x600 <-> 1280x800 at refresh
+rate and guest display flickering visibly.
+
+Previous active_con logic:
+- dpy_gfx_switch: non-active console was rejected (correct)
+- dpy_gfx_update: ANY update on a non-active console immediately stole
+  active_con and re-ran iosurface_switch (wrong) — leading to per-frame
+  thrashing when both consoles had live writers.
+
+Fix: track last-update wall time per DCL (dcl_last_update_ns) and gate
+cross-console takeover on active_con being idle for >= 1 second
+(STALE_THRESHOLD_NS). Steady state: whichever console writes pixels first
+keeps active; other consoles do not steal mid-frame; only a genuinely
+silent active yields to another active console. Also tag switch logs with
+console index for diagnostics.
+
+HellVM patch 0005.
+---
+ ui/iosurface.m | 116 +++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 92 insertions(+), 24 deletions(-)
+
+diff --git a/ui/iosurface.m b/ui/iosurface.m
+index ee99862..c57be22 100644
+--- a/ui/iosurface.m
++++ b/ui/iosurface.m
+@@ -21,6 +21,7 @@
+ #include "qemu/error-report.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/module.h"
++#include "qemu/timer.h"
+ #include "qapi/error.h"
+ #include "ui/console.h"
+ #include "ui/surface.h"
+@@ -106,6 +107,17 @@ typedef struct __attribute__((packed)) {
+  * 的 update 被忽略, 避免多 console 内容混画产生重影 (see 文件尾 dcls[] 说明) */
+ static QemuConsole *active_con;
+ 
++/* 每个 DCL 最后一次 update 的单调时间戳(纳秒). 用于"最近活跃 console 优先 +
++ * 1 秒静默让出"策略: 在 iosurface_update/switch 里比对, 如果 active_con 静默超过
++ * STALE_THRESHOLD_NS 而另一 console 正在推像素, 就把 active 让给活跃者;
++ * 若 active 依然活跃则非 active 的事件一律忽略, 避免双写导致分辨率反复抖动。*/
++#define STALE_THRESHOLD_NS  1000000000LL   /* 1 秒 */
++static int64_t dcl_last_update_ns[4 /* MAX_DCLS */];
++
++/* 返回给定 DCL 在 dcls[] 中的下标, 找不到返回 -1 */
++static int find_dcl_index(DisplayChangeListener *dcl);
++static int find_dcl_index_by_con(QemuConsole *con);
++
+ static _Atomic uint64_t update_seq;
+ 
+ /* guest HID 键盘 LED 状态(由 qemu_add_led_event_handler 回调更新)
+@@ -484,19 +496,40 @@ static void iosurface_switch(DisplayChangeListener *dcl,
+         return;
+     }
+ 
+-    /* 多 console 支持:
+-     * 只有 "active_con 自己的 surface 换了大小" 才进 alloc + switch 流程, 因为
+-     * 这通常是用户主动 resize 造成的, guest 驱动会很快重绘。
+-     * 其它 console 的 switch(通常是 guest 驱动重设 scanout, 新 surface 还没填像素)
+-     * 不立即切 active_con, 否则会瞬间把用户正在看的 console 切到一块全黑 surface。
+-     * active_con 的真正切换发生在 iosurface_update 里(有像素写入时)。 */
+-    if (active_con != NULL && active_con != dcl->con) {
+-        /* 另一个 console 的 switch: 不抢 active. 像素暂时不同步, 等它有 update 时再接管 */
+-        return;
++    /* 多 console 策略 (HellVM 修正): "最近活跃者优先 + 1 秒静默让出".
++     *
++     * - active_con == NULL → 任何非 placeholder 的 switch 都认领 active.
++     * - 同 console 的后续 switch → 直接放行 (guest 自身 resize/mode change).
++     * - 不同 console 的 switch → 只有当 active_con 已经静默超过 STALE_THRESHOLD_NS
++     *   (1 秒, 以 dcl_last_update_ns 为准) 才让出. 否则忽略, 避免双写抖动。
++     *
++     * 典型场景: virtio-gpu-pci (console[0]) + ramfb (console[1]) 双 console,
++     * Linux 启动时两边轮流写像素 → 本来会反复切 1280x800 ↔ 800x600 导致抖.
++     * 加入 1 秒冷却后: 先手拿到 active 的 console 连续推像素期间, 另一 console
++     * 的事件被忽略; 只有当 active_con 真的停了 1 秒以上, 才允许切换源头。 */
++    {
++        int idx = find_dcl_index(dcl);
++        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++        if (active_con == NULL) {
++            active_con = dcl->con;
++        } else if (active_con != dcl->con) {
++            int active_idx = find_dcl_index_by_con(active_con);
++            int64_t active_idle = (active_idx >= 0)
++                ? (now - dcl_last_update_ns[active_idx]) : INT64_MAX;
++            if (active_idle >= STALE_THRESHOLD_NS) {
++                info_report("[iosurface] active_con stale %lldms, switching console",
++                            (long long)(active_idle / 1000000));
++                active_con = dcl->con;
++            } else {
++                return;   /* active 还活跃, 本次非 active 的 switch 忽略 */
++            }
++        }
++        if (idx >= 0) {
++            dcl_last_update_ns[idx] = now;   /* switch 也算一次活跃 */
++        }
+     }
+ 
+-    active_con = dcl->con;
+-
+     int new_fd = -1;
+     uint8_t *new_pixels = NULL;
+     size_t new_size = 0;
+@@ -530,7 +563,8 @@ static void iosurface_switch(DisplayChangeListener *dcl,
+     }
+     pthread_mutex_unlock(&state_mtx);
+ 
+-    info_report("[iosurface] switch %ux%u stride=%u shmfd=%d", w, h,
++    info_report("[iosurface] switch console[%d] %ux%u stride=%u shmfd=%d",
++                find_dcl_index(dcl), w, h,
+                 current_stride, current_shm_fd);
+ }
+ 
+@@ -546,18 +580,34 @@ static void iosurface_update(DisplayChangeListener *dcl,
+         return;
+     }
+ 
+-    /* 多 console 策略: 如果 active_con 还没定, 或这是第一个真正写像素的 console,
+-     * 就让它接管 active. 但另一个 console 的 dangling switch (resize 后空 surface,
+-     * 但没 update) 不会抢 active_con —— 避免拖动窗口被切到全黑 surface。 */
+-    if (active_con == NULL) {
+-        active_con = dcl->con;
+-    } else if (dcl->con != active_con) {
+-        /* 另一个 console 真的来 update 像素了, 认为用户想切显示源头 */
+-        active_con = dcl->con;
+-        /* 落入下方 switch 逻辑——需要 alloc 新 shmfb 匹配这个 console 的尺寸 */
+-        DisplaySurface *s = qemu_console_surface(active_con);
+-        if (s) {
+-            iosurface_switch(dcl, s);
++    /* 多 console 策略 (HellVM 修正): 和 iosurface_switch 统一用"最近活跃者优先 +
++     * 1 秒静默让出". 活跃 console 连续推像素期间, 非 active 的 update 被忽略;
++     * 只有当 active_con 静默 ≥ 1 秒且另一 console 正在推像素, 才让出。*/
++    {
++        int idx = find_dcl_index(dcl);
++        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++        if (active_con == NULL) {
++            active_con = dcl->con;
++        } else if (dcl->con != active_con) {
++            int active_idx = find_dcl_index_by_con(active_con);
++            int64_t active_idle = (active_idx >= 0)
++                ? (now - dcl_last_update_ns[active_idx]) : INT64_MAX;
++            if (active_idle >= STALE_THRESHOLD_NS) {
++                info_report("[iosurface] active_con stale %lldms (update), switching",
++                            (long long)(active_idle / 1000000));
++                active_con = dcl->con;
++                /* 切到新 console, 按它当前的 surface 重 alloc shmfb */
++                DisplaySurface *s = qemu_console_surface(active_con);
++                if (s && !surface_is_placeholder(s)) {
++                    iosurface_switch(dcl, s);
++                }
++            } else {
++                return;
++            }
++        }
++        if (idx >= 0) {
++            dcl_last_update_ns[idx] = now;
+         }
+     }
+ 
+@@ -662,6 +712,24 @@ struct __attribute__((packed)) {
+ static int dcl_count = 0;
+ /* active_con 声明在文件顶部, 见 state 全局变量块旁; 这里只是为了文字记录 */
+ 
++/* 在 dcls[] 里按指针查 dcl 的下标 */
++static int find_dcl_index(DisplayChangeListener *dcl)
++{
++    for (int i = 0; i < dcl_count; i++) {
++        if (&dcls[i] == dcl) return i;
++    }
++    return -1;
++}
++
++/* 按 QemuConsole * 查 dcl 的下标(用于从 active_con 反查其最后 update 时间) */
++static int find_dcl_index_by_con(QemuConsole *con)
++{
++    for (int i = 0; i < dcl_count; i++) {
++        if (dcls[i].con == con) return i;
++    }
++    return -1;
++}
++
+ /* ---------- LED 回调 (guest HID output report 触发) ---------- */
+ 
+ static void iosurface_leds_updated(void *opaque, int ledstate)
+-- 
+2.50.1 (Apple Git-155)
+
