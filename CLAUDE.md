@@ -44,6 +44,18 @@
   3. 确认文件名有序号前缀(`0003-...`),保证 apply 顺序稳定
   4. 重跑 `make build` 验证 patch 能干净 apply 且编译通过
 
+## 调试/诊断工作方式约束 **必须遵守**
+
+- **禁止使用 osascript / AppleScript UI scripting 模拟 GUI 点击**(如点主 App 按钮、
+  选 VM、切 tab 等)。这种做法脆弱、依赖屏幕坐标和辅助功能权限,不可复现。
+- 需要**启动/停止 VM** 时: 走 `hellvm` 命令行或 `hvmdbg`,不要靠 HellVM GUI。
+- 需要**在 guest 里做任何操作**(看桌面、点按钮、键入命令、查设备管理器等):
+  走 `hvmdbg` 子命令(`screenshot` / `click` / `key` / `type` / `qmp` 等)。
+- 若 `hvmdbg` 没有所需子命令或能力,**立即扩展 `hvmdbg` 补齐**,不要退回用
+  osascript 或手动 GUI。补完后必须 `make build` 验证。
+- `hvmdbg` 扩展原则: **零新协议实现**,复用 `HVMDisplay` / `HVMBackendQEMU` 已暴露
+  的公开类型(`DisplayChannel` / `InputForwarder` / `QMPClient` / `VDAgentChannel`)。
+
 ## 诊断工具
 
 ### EDK2 / bootmgr / kernel 串口日志(排查启动失败用)

@@ -122,11 +122,24 @@ enum WindowsUnattend {
         var commands: [String] = []
 
         if autoInstallVirtioWin {
-            /* 枚举 C..Z 盘符, 遇到第一个有 virtio-win-gt-arm64.msi 的就装它.
-             * msiexec /quiet /norestart 静默安装, 不弹 UAC 也不重启.
-             * 日志写 C:\hellvm-viowin.log 便于用户排查. */
+            /* ARM64 Windows: virtio-win.iso **不包含** virtio-win-gt-arm64.msi
+             * (只提供 x64 / x86 两版 MSI), ARM64 驱动走 inf 分发:
+             *   D:\NetKVM\w11\ARM64\netkvm.inf
+             *   D:\viostor\w11\ARM64\viostor.inf
+             *   D:\viogpudo\w11\ARM64\viogpudo.inf
+             *   ...
+             * 所以 autoInstall ARM64 用 pnputil 两步:
+             *   1. certutil 把 Red Hat 代码签名证书先装进 TrustedPublisher,
+             *      否则带 RH 签名的 inf 因证书链不受信任被拒。
+             *   2. pnputil /add-driver <root>\ /subdirs /install 递归扫所有 inf,
+             *      pnputil 按 OS 架构过滤, 只装 ARM64 那份, 同时 match 到 PCI 设备。
+             *
+             * 盘符探测: `%D:\NetKVM` 目录是否存在 —— 比 MSI 名字稳定,
+             * 不受 virtio-win 版本迭代影响。
+             *
+             * AutoUnattend XML 里 `&` 必须 escape 成 `&amp;` (cmd 的 & 多命令分隔符)。*/
             commands.append(
-                "cmd /c for %D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %D:\\virtio-win-gt-arm64.msi start /wait msiexec /i %D:\\virtio-win-gt-arm64.msi /quiet /norestart /L*v C:\\hellvm-viowin.log")
+                "cmd /c for %D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %D:\\NetKVM (certutil -addstore -f TrustedPublisher %D:\\cert\\*.cer &amp; pnputil /add-driver %D:\\ /subdirs /install)")
         }
         if autoInstallSpiceTools {
             /* spice-guest-tools-latest.exe 是 NSIS installer, /S 大写表示 Silent mode,

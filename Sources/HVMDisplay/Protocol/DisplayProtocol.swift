@@ -95,6 +95,10 @@ public final class SharedFramebuffer: @unchecked Sendable {
 
     public var byteCount: Int { size }
 
+    /// 只读访问 shared memory 裸指针. 给外部 probe 工具按 BGRA 像素拷贝/编码用.
+    /// 使用者必须保证不超出 byteCount 范围, 且在 SharedFramebuffer 活着期间访问。
+    public var rawPointer: UnsafeRawPointer { UnsafeRawPointer(pointer) }
+
     public func dispose() {
         log.debug(.display, "SharedFramebuffer dispose fd=\(shmFD) size=\(size)")
         munmap(pointer, size)

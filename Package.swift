@@ -14,6 +14,8 @@ let package = Package(
         .executable(name: "HellVM", targets: ["HellVM"]),
         // 命令行工具
         .executable(name: "hellvm", targets: ["HellVMCLI"]),
+        // 调试探针 CLI (screenshot / qmp / 键鼠注入等)
+        .executable(name: "hvmdbg", targets: ["HVMProbe"]),
         // 核心库
         .library(name: "HVMCore", targets: ["HVMCore"]),
         .library(name: "HVMBundle", targets: ["HVMBundle"]),
@@ -68,6 +70,18 @@ let package = Package(
             name: "HellVMCLI",
             dependencies: [
                 "HVMCore", "HVMBundle", "HVMStorage", "HVMBackendQEMU",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
+        ),
+
+        // 调试探针 CLI —— 通过 HellVM 既有的 socket 协议
+        // (iosurface / qmp / qmp-input / spice-vdagent) 做端到端诊断:
+        // 抓 framebuffer 成 PNG、发任意 QMP、注入键鼠事件、触发 vdagent resize 等.
+        // 零新协议实现, 全部复用现有模块的公开类型。
+        .executableTarget(
+            name: "HVMProbe",
+            dependencies: [
+                "HVMCore", "HVMBundle", "HVMBackendQEMU", "HVMDisplay",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
