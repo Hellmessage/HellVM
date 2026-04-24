@@ -109,7 +109,10 @@ cd "$BUILD"
 #   - 启用 slirp(用户态网络)
 #   - 禁用所有显示后端(P4 接入自定义 IOSurface 后端)
 #   - 禁用文档生成(省时间)
-#   - 禁用 guest-agent / bsd-user / linux-user(不需要)
+#   - guest-agent 这里是 QEMU 自带的 qemu-ga 工具(host 侧)构建开关, 我们实际
+#     用的是 guest 里运行的 qemu-guest-agent + host 侧 chardev 通道, 所以 host
+#     上不需要编 qemu-ga。保持 --disable-guest-agent, 不影响 chardev 通道功能。
+#     HellVM 通过 virtio-serial org.qemu.guest_agent.0 + QGAClient 和 guest 通信。
 "$SRC/configure" \
     --prefix="$PREFIX" \
     --target-list="$QEMU_TARGETS" \

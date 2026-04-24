@@ -303,6 +303,42 @@ struct DisplayArgsBuilder {
     }
 }
 
+// MARK: - ⑩b QEMU Guest Agent (qga)
+
+/// QEMU Guest Agent 桥接: host 通过 unix socket 向 guest 内的 qemu-guest-agent
+/// 发 JSON-RPC (guest-ping / guest-exec / guest-file-read / guest-shutdown 等),
+/// 用来跑任意命令、读文件、同步时间、查询 fsinfo、抓剪贴板 (外挂 powershell/xclip)。
+///
+/// 通道: virtio-serial port name="org.qemu.guest_agent.0" (qga 默认监听的名字).
+/// chardev: unix socket server, Swift 侧 QGAClient 作为客户端连入, VM 关机前保持。
+///
+/// 两种模式的 virtio-serial 控制器来源:
+///   - 图形模式: 复用 DisplayArgsBuilder 创建的 virtioserial0 bus
+///   - 非图形模式: 自己建一个 qga_vserial bus
+/// 这样图形/非图形 guest (headless Linux 也能跑 qga) 都能用。
+struct GuestAgentArgsBuilder {
+    let config: VMConfig
+    let bundle: VMBundle
+
+    func build() -> [String] {
+        var out: [String] = []
+        let busID: String
+        if config.boot.graphical {
+            // 复用 DisplayArgsBuilder 的 virtioserial0
+            busID = "virtioserial0.0"
+        } else {
+            // 非图形模式独立 bus, 避免侵入 DisplayArgsBuilder
+            out += ["-device", "virtio-serial-pci,id=qga_vserial"]
+            busID = "qga_vserial.0"
+        }
+        out += ["-chardev",
+                "socket,id=qga_chr,path=\(bundle.qgaSocketURL.path),server=on,wait=off"]
+        out += ["-device",
+                "virtserialport,bus=\(busID),chardev=qga_chr,name=org.qemu.guest_agent.0"]
+        return out
+    }
+}
+
 // MARK: - ⑪ 网络 (多 NIC + 热插拔友好)
 
 /// 每个启用的 NetworkConfig 生成独立的 netdev/device.

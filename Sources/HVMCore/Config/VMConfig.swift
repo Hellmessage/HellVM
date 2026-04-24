@@ -189,6 +189,19 @@ public struct NetworkConfig: Codable, Sendable {
         self.enabled = enabled
     }
 
+    /// 对 vmnetBridged 模式, 推导实际使用的桥接接口名。
+    /// `bridgedInterface` 为空时 fallback 到 "en0"(历史行为)。
+    /// 非 bridged 模式返回 nil。
+    ///
+    /// 这个属性被 `effectiveSocketPath`(给启动/状态检测用)和 VMnetSupervisor
+    /// 的 daemon 安装逻辑共用, 两端口径一致 —— 避免出现"UI 显示缺 bridged.en0
+    /// 但安装脚本又跳过这张空接口的卡"的 bug。
+    public var effectiveBridgedInterface: String? {
+        guard mode == .vmnetBridged else { return nil }
+        if let i = bridgedInterface, !i.isEmpty { return i }
+        return "en0"
+    }
+
     /// 推导实际使用的 socket 路径(vmnet* 模式): 用户显式填 socketVmnetPath 优先,
     /// 否则走 SocketPaths 集中的标准约定。
     public var effectiveSocketPath: String? {
@@ -197,7 +210,7 @@ public struct NetworkConfig: Codable, Sendable {
         case .vmnetShared:  return SocketPaths.vmnetShared
         case .vmnetHost:    return SocketPaths.vmnetHost
         case .vmnetBridged:
-            let iface = (bridgedInterface?.isEmpty == false) ? bridgedInterface! : "en0"
+            let iface = effectiveBridgedInterface ?? "en0"
             return SocketPaths.vmnetBridged(interface: iface)
         case .user, .none:  return nil
         }

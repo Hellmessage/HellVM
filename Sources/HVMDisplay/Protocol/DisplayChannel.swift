@@ -67,8 +67,10 @@ public final class DisplayChannel: @unchecked Sendable {
 
         try sendHello()
 
-        readTask = Task.detached(priority: .userInitiated) { [weak self] in
-            self?.runReadLoop()
+        // readTask 持 fd 快照, 循环内用局部 fd + self.sockFD 双重校验,
+        // 避免 close() 之后 int 值被 kernel 分给新 socket 时 recv 读错位。
+        readTask = Task.detached(priority: .userInitiated) { [weak self, localFD = fd] in
+            self?.runReadLoop(localFD: localFD)
         }
     }
 
@@ -138,7 +140,7 @@ public final class DisplayChannel: @unchecked Sendable {
 
     // MARK: - 读循环
 
-    private func runReadLoop() {
+    private func runReadLoop(localFD: Int32) {
         var accum = [UInt8]()
         accum.reserveCapacity(64 * 1024)
         var pendingFD: Int32 = -1
@@ -146,10 +148,12 @@ public final class DisplayChannel: @unchecked Sendable {
         let recvBufSize = 64 * 1024
         var recvBuf = [UInt8](repeating: 0, count: recvBufSize)
 
-        while !Task.isCancelled && sockFD >= 0 {
+        // sockFD 在 close() 里会被改成 -1, 一旦不匹配 localFD 就说明已关,
+        // 立即退出 loop, 避免旧 int 被 kernel 复用后读到陌生 socket 的数据。
+        while !Task.isCancelled && sockFD == localFD {
             var fd: Int32 = -1
             let n = recvBuf.withUnsafeMutableBufferPointer { p -> ssize_t in
-                hvm_recvmsg_with_fd(sockFD, p.baseAddress, p.count, &fd)
+                hvm_recvmsg_with_fd(localFD, p.baseAddress, p.count, &fd)
             }
             if n == 0 {
                 emitDisconnect("EOF")
@@ -210,7 +214,22 @@ public final class DisplayChannel: @unchecked Sendable {
             _ = payload.withUnsafeBufferPointer { src in
                 memcpy(&p, src.baseAddress!, MemoryLayout<SurfacePayload>.size)
             }
-            let size = Int(p.stride) * Int(p.height)
+            // 合理性检查 + 溢出防御: UInt32*UInt32 在 Int 乘法里可能溢出,
+            // 先用 UInt64 算完再判断。上限 8192x8192@8bpp = 512MB 充分覆盖
+            // 未来高分屏场景, 超过就视为错乱或恶意, 关 fd 丢消息。
+            let maxDim: UInt32 = 8192
+            let maxStride: UInt32 = 8192 * 8
+            let size64 = UInt64(p.stride) * UInt64(p.height)
+            guard p.width > 0, p.width <= maxDim,
+                  p.height > 0, p.height <= maxDim,
+                  p.stride > 0, p.stride <= maxStride,
+                  size64 > 0, size64 <= UInt64(512 * 1024 * 1024) else {
+                log.warn(.display,
+                    "SURFACE 参数超限/非法 \(p.width)x\(p.height) stride=\(p.stride), 丢弃")
+                Darwin.close(fd)
+                return
+            }
+            let size = Int(size64)
             guard let ptr = mmap(nil, size, PROT_READ, MAP_SHARED, fd, 0),
                   ptr != MAP_FAILED else {
                 Darwin.close(fd)
@@ -244,6 +263,12 @@ public final class DisplayChannel: @unchecked Sendable {
                 memcpy(&hotY, src.baseAddress! + 4,  4)
                 memcpy(&w,    src.baseAddress! + 8,  4)
                 memcpy(&h,    src.baseAddress! + 12, 4)
+            }
+            // cursor 合理尺寸最大 256x256; 1024 已经极度宽松。防止 w*h*4 溢出。
+            let maxCursorDim: UInt32 = 1024
+            guard w > 0, w <= maxCursorDim, h > 0, h <= maxCursorDim else {
+                log.warn(.display, "cursor 尺寸超限 \(w)x\(h), 丢弃")
+                return
             }
             let pixelBytes = Int(w) * Int(h) * 4
             guard payload.count == 16 + pixelBytes else { return }

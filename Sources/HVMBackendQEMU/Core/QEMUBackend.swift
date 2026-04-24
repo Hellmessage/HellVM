@@ -40,7 +40,9 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     // MARK: - 生命周期(GUI 异步模式用)
 
     public func start() async throws {
-        try ensureState(.stopped, action: "start")
+        // 允许从 .stopped 或 .error 重试启动: .error 是上一次启动失败的终态,
+        // 用户看到错误提示后点"重启"应该能直接再来, 不需要额外 reset 操作。
+        try ensureStateIn([.stopped, .error], action: "start")
         setState(.starting)
 
         let efiVars: URL
@@ -220,6 +222,12 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         }
     }
 
+    private func ensureStateIn(_ allowed: Set<VMState>, action: String) throws {
+        if !allowed.contains(state) {
+            throw VMError.startFailed("当前状态为 \(state),不能执行 \(action)")
+        }
+    }
+
     private func setState(_ new: VMState) {
         withStateLock { _state = new }
         stateContinuation.yield(new)
@@ -287,6 +295,9 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
                 FileManager.default.removeIfExists(url, label: label, category: .qemu)
             }
         ).build()
+        // qga 必须在 DisplayArgsBuilder 之后: 图形模式下它复用 virtioserial0 bus,
+        // 这个 bus 是 DisplayArgsBuilder 创建的, 顺序不能倒。
+        args += GuestAgentArgsBuilder(config: config, bundle: bundle).build()
 
         return args
     }

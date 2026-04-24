@@ -66,11 +66,9 @@ extension VMSettingsNetworkSection {
         vmnetError = nil
         defer { vmnetBusy = false }
         do {
-            let extra = draft.networks.compactMap { net -> String? in
-                guard net.mode == .vmnetBridged,
-                      let i = net.bridgedInterface, !i.isEmpty else { return nil }
-                return i
-            }
+            // 用 effectiveBridgedInterface 保证与 UI 缺失提示(effectiveSocketPath)
+            // 的口径一致 — 空的 bridgedInterface 会 fallback 到 "en0", 不会被跳过。
+            let extra = draft.networks.compactMap { $0.effectiveBridgedInterface }
             try await VMnetSupervisor.installAllDaemons(extraBridgedInterfaces: extra)
             vmnetRefreshToken &+= 1
         } catch {

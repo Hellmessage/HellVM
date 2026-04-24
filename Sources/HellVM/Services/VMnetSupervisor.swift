@@ -77,8 +77,10 @@ public enum VMnetSupervisor {
         for b in items {
             do {
                 let cfg = try b.loadConfig()
-                for net in cfg.networks where net.mode == .vmnetBridged {
-                    if let iface = net.bridgedInterface, !iface.isEmpty {
+                for net in cfg.networks {
+                    // 用 effectiveBridgedInterface 保证与 UI 检测 (effectiveSocketPath)
+                    // 口径一致: 空接口 fallback 到 "en0", 不会被跳过。
+                    if let iface = net.effectiveBridgedInterface {
                         bridgedSet.insert(iface)
                     }
                 }

@@ -2,18 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Hypervisor.framework 加速(HVF)—— 自签/ad-hoc 可用,无需 Apple Team ID -->
     <key>com.apple.security.hypervisor</key>
-    <true/>
-
-    <!-- QEMU TCG(软件模拟)需要 JIT -->
-    <key>com.apple.security.cs.allow-jit</key>
-    <true/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-
-    <!-- 关闭库校验,让 QEMU 加载自编译的第三方动态库 -->
-    <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
 </dict>
 </plist>

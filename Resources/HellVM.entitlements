@@ -10,6 +10,17 @@
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
 
+    <!-- 关闭库校验.
+         App 用 posix_spawn 启动 bundle 里的 qemu-system-*. 父进程开了
+         hardened runtime, kernel 会对 child 做 library validation 校验
+         team identifier. 我们用 "Hell Dev" ad-hoc 身份, TeamIdentifier=not
+         set, parent/child CDHash 不同 -> kernel 视为不同签名者 ->
+         posix_spawn 返回 EPERM "Operation not permitted"。加这条让父进程
+         明确放弃 child 的签名校验, 匹配 QEMU 自己 (qemu.entitlements)
+         的声明。ad-hoc 签名下没这条就起不了 QEMU 子进程。 -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
     <!--
       以下为虚拟化相关受限 entitlement,在 macOS 上需要 Apple Developer
       配置文件才能随 ad-hoc 签名的 App 一起使用,否则 AMFI 会在启动时

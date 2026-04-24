@@ -19,7 +19,10 @@ private typealias QMPInputEvent = [String: Any]
 public final class InputForwarder: @unchecked Sendable {
     private let qmp = QMPClient()
 
-    /// VM 画面像素尺寸, 供 abs 坐标归一化; updateViewSize() 更新
+    /// VM 画面像素尺寸, 供 abs 坐标归一化; updateViewSize() 更新.
+    /// 锁保护: 主线程在 MTKView resize 时写, 后台 flushLoop/absEvents 读,
+    /// 无锁直读会在窗口缩放的同时出现"拿到不匹配的 w/h"导致鼠标跳一下。
+    private let viewSizeLock = NSLock()
     private var viewWidth: Int = 1
     private var viewHeight: Int = 1
 
@@ -74,8 +77,10 @@ public final class InputForwarder: @unchecked Sendable {
 
     /// MTKView 尺寸变化时调, 用于坐标归一化
     public func updateViewSize(width: Int, height: Int) {
+        viewSizeLock.lock()
         viewWidth = max(width, 1)
         viewHeight = max(height, 1)
+        viewSizeLock.unlock()
     }
 
     // MARK: - 键盘
@@ -226,8 +231,13 @@ public final class InputForwarder: @unchecked Sendable {
 
     /// view 坐标(左下原点)  →  QEMU abs(0..32767, 左上原点)
     private func absEvents(x: Double, y: Double) -> [QMPInputEvent]? {
-        let nx = Int32(clamp((x / Double(viewWidth)) * 32767.0, 0, 32767))
-        let ny = Int32(clamp(((Double(viewHeight) - y) / Double(viewHeight)) * 32767.0, 0, 32767))
+        // snapshot w/h 后再计算, 避免和 updateViewSize 交错拿到半新半旧值
+        viewSizeLock.lock()
+        let w = Double(viewWidth)
+        let h = Double(viewHeight)
+        viewSizeLock.unlock()
+        let nx = Int32(clamp((x / w) * 32767.0, 0, 32767))
+        let ny = Int32(clamp(((h - y) / h) * 32767.0, 0, 32767))
         if nx == lastAbsX && ny == lastAbsY { return nil }
         lastAbsX = nx
         lastAbsY = ny

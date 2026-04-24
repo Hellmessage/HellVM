@@ -46,9 +46,17 @@ public struct VMBundle: Sendable {
     /// 运行时 spice-vdagent 桥接 socket
     /// QEMU 侧: virtio-serial port name="com.redhat.spice.0" → chardev socket
     /// Swift 侧: 作为客户端连入, 给 Windows 里的 spice-vdagent 发 MONITORS_CONFIG
-    /// 等消息, 用于驱动 Windows guest 自动 resize。
+    /// 等消息, 用于驱动 Windows guest 自动 resize 和抓取 guest→host 剪贴板。
     /// Linux guest 若装了 spice-vdagent 同样走这条路。
     public var spiceAgentSocketURL: URL { url.appendingPathComponent("vdagent.sock") }
+
+    /// 运行时 QEMU guest agent (qga) socket
+    /// QEMU 侧: virtio-serial port name="org.qemu.guest_agent.0" → chardev socket
+    /// Swift 侧: 作为客户端连入, 向 guest 内的 qemu-guest-agent 发 JSON-RPC
+    /// (guest-ping / guest-exec / guest-file-read 等), 用于跑命令、读文件、
+    /// 抓剪贴板(powershell Get-Clipboard / xclip)等。
+    /// guest 侧要装 qemu-guest-agent: Linux apt/yum, Windows 来自 virtio-win.iso。
+    public var qgaSocketURL: URL { url.appendingPathComponent("qga.sock") }
 
     /// swtpm 状态持久化目录(TPM NVRAM / PCR 等需要持久化)
     public var tpmStateDirURL: URL { url.appendingPathComponent("tpm") }
@@ -87,6 +95,7 @@ public struct VMBundle: Sendable {
         try? fm.removeItem(at: qmpInputSocketURL)
         try? fm.removeItem(at: iosurfaceSocketURL)
         try? fm.removeItem(at: spiceAgentSocketURL)
+        try? fm.removeItem(at: qgaSocketURL)
     }
 
     /// bundle 内相对路径 → 绝对 URL

@@ -13,7 +13,10 @@
 //   key            —— 按一次键(支持组合 "ctrl+alt+del")
 //   type           —— 键入字符串
 //   vdagent-resize —— 通过 spice-vdagent 让 Windows guest 改分辨率
+//   clipboard      —— 抓 guest 剪贴板文本 (走 vdagent, 被动等 guest 复制)
+//   qga            —— QEMU Guest Agent 通道 (主动 pull: 跑命令/读文件/抓剪贴板)
 //   nic-swap       —— 程序化重现 "切 NIC model" 热插拔
+//   help           —— 分类概览 + 单个子命令详细帮助 (含示例)
 //
 // 所有命令参数 <vm> 接受:
 //   - bundle 名字(自动 resolve 到 ~/Library/Application Support/HellVM/VMs/<name>.hellvm)
@@ -41,7 +44,10 @@ struct HVMDebug: AsyncParsableCommand {
             KeyCmd.self,
             TypeCmd.self,
             VDAgentResizeCmd.self,
+            ClipboardCmd.self,
+            QGACmd.self,
             NICSwapCmd.self,
+            HelpCmd.self,
         ]
     )
 }

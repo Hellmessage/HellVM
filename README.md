@@ -13,7 +13,8 @@
 - **socket_vmnet 网络** — shared / host-only / bridged 三模式，osascript 一次授权装齐 launchd daemon。
 - **多 NIC 热插拔** — 同一 VM 同时挂多块网卡（例：shared 上网 + bridged 暴露服务），运行时改网络走 QMP device_add/device_del，无需重启 VM。
 - **磁盘导入** — 支持 `.img / .raw / .qcow2` 及 `.gz / .xz` 压缩镜像直接转为启动盘，适配 OpenWrt / cloud-init 场景。
-- **CLI + GUI** — SwiftUI 主 App 交互式操作，`hellvm` 命令行做脚本化管理。
+- **Guest → Host 剪贴板** — spice-vdagent 通道接剪贴板协议，guest 里 Ctrl+C 的文本直接流到 host，零 OCR 零截图。同时通过 QEMU guest agent 支持主动 pull 当前剪贴板 / 跑任意命令 / 读任意文件。
+- **CLI + GUI + 调试探针** — SwiftUI 主 App 交互式操作，`hellvm` 命令行做脚本化管理，`hvmdbg` 调试探针支持截图 / 键鼠注入 / QMP / VDAgent / QGA，CI 与 AI 自动化友好。
 
 ## 系统要求
 
@@ -64,13 +65,24 @@ Sources/
 ├── HVMBackendQEMU/         QEMU 后端
 │   ├── Core/               QEMUBackend / QEMUPaths / QEMUArgBuilders
 │   ├── Process/            SpawnedProcess (posix_spawn + pg) / SwtpmSupervisor
-│   └── Control/            QMPClient / NICHotplug / WindowsUnattend
-├── HVMDisplay/             iosurface 显示后端客户端
+│   └── Control/            QMPClient / QGAClient / NICHotplug / WindowsUnattend
+├── HVMDisplay/             iosurface 显示后端客户端 + spice-vdagent 通道
 │   ├── C/                  recvmsg + SCM_RIGHTS 的 C 辅助
-│   ├── Protocol/           DisplayChannel / DisplayProtocol
+│   ├── Protocol/           DisplayChannel / VDAgentChannel (resize + guest→host 剪贴板)
 │   └── View/               Metal 渲染 + 键鼠转发
 ├── HVMDisplayC/            (逻辑 target, 物理位于 HVMDisplay/C)
-└── HellVMCLI/              ArgumentParser 命令行
+├── HellVMCLI/              ArgumentParser 命令行 (hellvm)
+└── HVMProbe/               调试探针 CLI (hvmdbg)
+    ├── HVMDebug.swift      @main + 子命令注册
+    ├── LifecycleCmd.swift  start / stop
+    ├── ScreenshotCmd.swift 抓 guest framebuffer 成 PNG
+    ├── QMPCmd.swift        发任意 QMP 命令
+    ├── InputCmd.swift      move / click / scroll / key / type
+    ├── VDAgentCmd.swift    vdagent-resize (触发 Windows 动态分辨率)
+    ├── ClipboardCmd.swift  clipboard get / watch (抓 guest 剪贴板文本)
+    ├── QGACmd.swift        qga ping / exec / read / clipboard (QEMU guest agent)
+    ├── NICSwapCmd.swift    nic-swap (NIC 模型热切换)
+    └── VMLocator.swift     VM 名字 / bundle 路径解析
 
 scripts/                    构建脚本 (install-deps / build-qemu / build-edk2 / bundle ...)
 patches/                    QEMU + EDK2 补丁(构建时 git am 应用)
@@ -129,6 +141,82 @@ FirstLogonCommands 只在首次 OOBE 跑一次,对已装好的 Windows 不生效
 
 Linux guest 若装了 `spice-vdagent` 包也会走这条路。未装时 virtio-serial 握手不会完成,不影响主画面和键鼠。
 
+## 调试探针 hvmdbg
+
+`hvmdbg` 是一个 CLI 工具,走 HellVM 既有的 socket 协议(iosurface / QMP / qmp-input / spice-vdagent / qga)做端到端观察和操作,让脚本和 AI 不依赖 GUI 就能控制 guest。设计原则:零新协议实现,全部复用 `HVMDisplay` / `HVMBackendQEMU` 的公开类型。
+
+编译到 `build/hvmdbg`:
+
+```bash
+make hvmdbg
+```
+
+参数 `<vm>` 接受 bundle 名字(如 `Windows11`,从 `~/Library/Application Support/HellVM/VMs/` 查找)或绝对路径。
+
+```bash
+hvmdbg start <vm>                         # 启动 VM (走 QEMUBackend,带 swtpm)
+hvmdbg stop <vm>                          # QMP system_powerdown
+
+hvmdbg screenshot <vm> -o out.png         # 抓当前 guest framebuffer
+hvmdbg qmp <vm> query-status              # 发任意 QMP 命令
+hvmdbg pci-tree <vm>                      # query-pci 语法糖
+
+hvmdbg move <vm> 800 400                  # 鼠标绝对移动 (guest 像素坐标)
+hvmdbg click <vm> 800 400                 # 点击
+hvmdbg scroll <vm> 0 -120                 # 滚轮
+hvmdbg key <vm> ctrl+alt+del              # 按一次键 (支持组合)
+hvmdbg type <vm> "hello world"            # 键入字符串
+
+hvmdbg vdagent-resize <vm> 1920x1080      # 驱动 Windows guest 改分辨率
+hvmdbg nic-swap <vm> virtio               # NIC 模型运行时热切换
+
+hvmdbg clipboard watch <vm>               # 持续监听 guest 复制 (Ctrl+C 退出)
+hvmdbg clipboard get <vm> --copy          # 阻塞等一次复制, 同步到 host 剪贴板
+
+hvmdbg qga ping <vm>                      # 探活 guest-agent
+hvmdbg qga exec <vm> /bin/ls -- -la /tmp  # 在 guest 里跑命令
+hvmdbg qga read <vm> /etc/os-release      # 读 guest 文件到 stdout
+hvmdbg qga clipboard <vm> --os windows    # 主动 pull guest 当前剪贴板
+```
+
+## Guest → Host 剪贴板
+
+两条独立通道,按场景选:
+
+### 方案 A — spice-vdagent 通道(被动、事件驱动)
+
+guest 里 Ctrl+C 时 `spice-vdagent` 服务主动发 `CLIPBOARD_GRAB`,HellVM 回 `CLIPBOARD_REQUEST(UTF8_TEXT)`,拿到数据后写 stdout / 同步 host 剪贴板。
+
+- **前置**:guest 里装 spice-guest-tools(Windows)或 spice-vdagent 包(Linux)。HellVM 新建 Win11 VM 向导会自动下载并装进 Autounattend ISO,开箱即用。
+- **走法**:
+  ```bash
+  hvmdbg clipboard watch <vm> --copy      # 长监听, 每次 guest 复制都同步到 host 剪贴板
+  hvmdbg clipboard get <vm> --copy        # 阻塞一次, 拿到就退出
+  ```
+- **优点**:体验像真·剪贴板,guest 里 Ctrl+C → host 立刻能 Cmd+V。
+- **限制**:只响应 guest 主动复制,不能"主动 pull 当前内容";只支持 UTF-8 文本。
+
+### 方案 C — QEMU Guest Agent 通道(主动、命令式)
+
+host 通过 `<bundle>/qga.sock` 向 guest 内 `qemu-guest-agent` 发 JSON-RPC。通道名 `org.qemu.guest_agent.0`,图形和非图形模式都挂。
+
+- **前置**:guest 里装 `qemu-guest-agent`:
+  - Linux:`apt install qemu-guest-agent` / `dnf install qemu-guest-agent`,启动 systemd 服务
+  - Windows:`virtio-win.iso` 里的 `qemu-ga-x86_64.msi` / `qemu-ga-arm64.msi`(HellVM 自动挂载该 ISO)
+- **走法**:
+  ```bash
+  hvmdbg qga ping <vm>                             # 确认 agent 活着
+  hvmdbg qga clipboard <vm> --os windows --copy    # pull 当前 Windows 剪贴板
+  hvmdbg qga clipboard <vm> --os linux             # 走 wl-paste 或 xclip
+  hvmdbg qga exec <vm> powershell.exe -- \
+      -NoProfile -Command "Get-ComputerInfo"       # 跑任意命令
+  hvmdbg qga read <vm> C:/Windows/setupact.log     # 拉 guest 文件
+  ```
+- **优点**:随时 pull,不用等 guest 主动复制;能跑任意命令、读任意文件,是万能通道。
+- **限制**:guest 里必须装 agent 且服务运行;QGA 不是"剪贴板事件订阅",要抓更新得自己轮询。
+
+两套并存,可以都用:vdagent 管"实时剪贴板体验",qga 管"脚本化/CI 场景"。
+
 ## 诊断
 
 ### 运行日志
@@ -149,11 +237,14 @@ VMConfig `boot.serialDebug: true` 打开时，guest 串口重定向到 `<bundle>
 ## 构建命令
 
 ```bash
-make build        # 编译 .app (含 QEMU 首次编译)
-make cli          # 编译命令行 hellvm
-make run          # build + open
-make clean        # 清理 .app / hellvm / .build
-make distclean    # 深度清理（含 Vendor/qemu，下次重编 QEMU）
+make build           # 编译 .app + hvmdbg (含 QEMU 首次编译)
+make cli             # 编译命令行 hellvm
+make hvmdbg          # 仅编译调试探针
+make run             # build + open
+make install         # 用户级安装 (~/Applications + ~/.local/bin/{hellvm,hvmdbg})
+make install-system  # 系统级安装 (/Applications + /usr/local/bin,需 sudo)
+make clean           # 清理 .app / hellvm / .build
+make distclean       # 深度清理（含 Vendor/qemu，下次重编 QEMU）
 ```
 
 ## 开发约束

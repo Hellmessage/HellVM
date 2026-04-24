@@ -193,12 +193,20 @@ for d in "$FRAMEWORKS"/*.dylib; do
     codesign --force --sign "$SIGN_ID" --options runtime "$d" 2>&1 | sed 's/^/    /'
 done
 
-# 7b. QEMU 二进制(带 hypervisor + JIT entitlements)
+# 7b. QEMU 二进制(只带 hypervisor entitlement, **故意不启用 hardened runtime**)
+#
+# macOS 26 (Tahoe) 下 /Applications 里 hardened-runtime 的子二进制会被 amfid
+# 严格校验证书链, "Hell Dev" 自签证书无 Team ID 会被判为 "adhoc signed or
+# signed by an unknown certificate chain", 父 App posix_spawn 直接 EPERM
+# (Operation not permitted)。
+#
+# 解决: QEMU 不启用 hardened runtime。amfid 就不再做证书链 trust 校验,
+# hypervisor entitlement 不需要 hardened runtime 即可生效。
+# 细节见 Resources/qemu.entitlements 里的注释。
 for b in "$RES_QEMU/bin/"qemu-*; do
     [ -f "$b" ] || continue
     codesign --force --sign "$SIGN_ID" \
         --entitlements "$QEMU_ENTITLEMENTS" \
-        --options runtime \
         "$b" 2>&1 | sed 's/^/    /'
 done
 
@@ -212,6 +220,16 @@ codesign --force --sign "$SIGN_ID" \
 echo "==> 验证"
 codesign --verify --deep --strict "$APP_DIR" 2>&1 | sed 's/^/    /' || echo "    (verify 警告可忽略)"
 codesign -dv "$APP_DIR" 2>&1 | grep -E "Authority|Identifier|Signature" | sed 's/^/    /'
+
+# ---------- 9. 注入签名证书到 System keychain (首次会弹 admin 密码) ----------
+# 仅自签身份 (目前只 "Hell Dev") 需要这一步; Developer ID 已经是 Apple 根
+# 签发, amfid 天然放行, 不用也不应该往 System trust 里塞它。
+# 详见 scripts/trust-signing-cert.sh 头注释。
+if is_self_signed_identity "$SIGN_ID"; then
+    bash "$ROOT/scripts/trust-signing-cert.sh"
+else
+    echo "==> 使用 Apple 根签发身份 ($SIGN_ID), 跳过 System keychain trust 注入"
+fi
 
 APP_SIZE=$(du -sh "$APP_DIR" | awk '{print $1}')
 echo "==> 完成: $APP_DIR ($APP_SIZE)"

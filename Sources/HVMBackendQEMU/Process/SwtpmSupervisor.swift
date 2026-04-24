@@ -3,10 +3,13 @@
 // 设计:
 // - swtpm 先起, 自己当 process-group leader; QEMU 后 spawn 时 joinPGID 加入同 pg.
 //   这样 stop(force:true) 只需 killpg 一次就能原子清掉 swtpm+QEMU 两者, 不会留孤儿。
-// - `--ctrl ...,terminate` 让 swtpm 在 QEMU 断开 control socket 时自退出, 正常路径
-//   不依赖显式 SIGTERM。terminate() 只是双保险 / 异常清理。
-// - start() 同步阻塞最多 3 秒等 socket 文件出现, 出不来说明 swtpm 挂了。
+// - swtpm 的 `,terminate` 选项**故意不加**: 该选项会让 swtpm 在 control socket
+//   连接关闭时立即自退, 与 start() 里的 canConnect() 探测(连上立刻 close)冲突 ——
+//   swtpm 误把探测当成 "QEMU 断开" 自退, 于是 socket 消失, 随后 QEMU 真正连接时
+//   ENOENT 启动失败。改为不带 terminate, swtpm 生命周期全由 killpg 原子清理。
+// - start() 同步阻塞最多 3 秒等 socket 可被 connect, 出不来或进程先死说明 swtpm 挂了。
 import Foundation
+import Darwin
 import HVMCore
 import HVMBundle
 
@@ -48,7 +51,7 @@ final class SwtpmSupervisor: @unchecked Sendable {
         let swtpmArgs = [
             "socket",
             "--tpmstate", "dir=\(stateDir.path)",
-            "--ctrl", "type=unixio,path=\(sockURL.path),terminate",
+            "--ctrl", "type=unixio,path=\(sockURL.path)",
             "--tpm2",
             "--flags", "startup-clear",
             "--log", "level=5,file=\(logFile.path)",
@@ -74,22 +77,61 @@ final class SwtpmSupervisor: @unchecked Sendable {
         self.spawned = spawned
         lock.unlock()
 
-        // 等 swtpm 监听的 unix socket 出现, 超时说明进程挂了
+        // 等 swtpm 监听的 unix socket 能被真正 connect.
+        // 仅检查文件存在不够: 文件可能是前一个 swtpm 残留, 或进程刚创建完 socket
+        // 但还没 listen, 这时 QEMU 尝试连会 ECONNREFUSED 启动失败, 日志又不清晰。
+        // 这里主动 connect 一下, 能连上才算真就绪。同时每轮先检查进程存活,
+        // 进程已死就立即抛错, 不等满超时。
         let timeoutMs = 3_000
         let pollMs: UInt32 = 100
         for _ in 0..<(timeoutMs / Int(pollMs)) {
-            if fm.fileExists(atPath: sockURL.path) {
-                log.info(.qemu, "[swtpm] 已启动, pid=\(spawned.pid) socket=\(sockURL.path) state=\(stateDir.path)")
+            if !spawned.isRunning {
+                let pid = spawned.pid
+                self.terminate()
+                throw VMError.startFailed(
+                    "swtpm 进程 pid=\(pid) 启动后立即退出, 请检查 \(logFile.path)")
+            }
+            if fm.fileExists(atPath: sockURL.path),
+               Self.canConnect(socketPath: sockURL.path) {
+                log.info(.qemu, "[swtpm] 已就绪, pid=\(spawned.pid) socket=\(sockURL.path) state=\(stateDir.path)")
                 return sockURL.path
             }
             usleep(pollMs * 1_000)
         }
         terminate()
-        throw VMError.startFailed("swtpm 启动 \(timeoutMs)ms 内未产生 socket, 请检查 \(logFile.path)")
+        throw VMError.startFailed("swtpm 启动 \(timeoutMs)ms 内 socket 仍不可连, 请检查 \(logFile.path)")
     }
 
-    /// 幂等终止 swtpm. 正常路径上 QEMU 退出时 `,terminate` 会让 swtpm 自退,
-    /// 这里只是双保险和异常路径清理。
+    /// 尝试 connect 指定 unix socket 一下, 立刻断开. 仅用于"活性探测",
+    /// 不读写数据。连得上说明对端(swtpm)已经 listen 并 accept 了。
+    private static func canConnect(socketPath: String) -> Bool {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let maxPath = MemoryLayout.size(ofValue: addr.sun_path)
+        guard socketPath.utf8.count < maxPath else { return false }
+        _ = withUnsafeMutablePointer(to: &addr.sun_path) { sunPathPtr in
+            sunPathPtr.withMemoryRebound(to: CChar.self, capacity: maxPath) { cptr in
+                socketPath.withCString { src in
+                    strlcpy(cptr, src, maxPath)
+                }
+            }
+        }
+        let rc = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return rc == 0
+    }
+
+    /// 幂等终止 swtpm.
+    /// 因为我们不再带 `,terminate` 标志 (见文件头注释), swtpm 不会随
+    /// control 断开自退, 必须显式 kill。实测 swtpm 对 SIGTERM 响应慢或
+    /// 会忽略, 所以 SIGTERM 等 500ms 仍存活则 SIGKILL 兜底, 保证不残留孤儿。
     func terminate() {
         let proc: SpawnedProcess? = {
             lock.lock(); defer { lock.unlock() }
@@ -99,6 +141,14 @@ final class SwtpmSupervisor: @unchecked Sendable {
         }()
         guard let proc, proc.isRunning else { return }
         proc.sendSignal(SIGTERM)
+        for _ in 0..<10 {  // 最多等 500ms
+            if !proc.isRunning { return }
+            usleep(50_000)
+        }
+        if proc.isRunning {
+            log.warn(.qemu, "[swtpm] SIGTERM 后 500ms 未退, SIGKILL 兜底 pid=\(proc.pid)")
+            proc.sendSignal(SIGKILL)
+        }
     }
 
     // MARK: - 内部

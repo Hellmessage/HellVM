@@ -59,7 +59,11 @@ public enum NICHotplug {
         case .vmnetShared, .vmnetHost, .vmnetBridged:
             netdevArgs["type"] = "stream"
             let sock = net.effectiveSocketPath ?? SocketPaths.vmnetShared
-            netdevArgs["addr"] = ["type": "unix", "data": ["path": sock]]
+            // netdev-stream 用 SocketAddress(非 Legacy) flat union:
+            // discriminator `type` 和 variant 字段(unix 的 `path`)同级平铺。
+            // 写成 {"type":"unix","data":{...}} 是 Legacy 格式, QEMU 10.x 的
+            // NetdevStreamOptions.addr 不认, 会报 "Parameter 'addr.path' is missing"。
+            netdevArgs["addr"] = ["type": "unix", "path": sock]
         case .none:
             return   // 禁用的 NIC 不 attach
         }

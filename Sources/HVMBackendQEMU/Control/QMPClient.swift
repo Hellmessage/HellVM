@@ -45,14 +45,20 @@ public actor QMPClient {
     public func connect(socketPath: String) async throws {
         let fd = try Self.openUnixSocket(path: socketPath)
         self.socketFD = fd
-
-        // 读 greeting(必须丢弃,不是命令响应)
-        _ = try await readMessage()
-
-        self.connected = true
-
-        // 握手
-        _ = try await execute("qmp_capabilities")
+        // 握手任一步失败都要把 fd 关掉并复位, 否则调用方(比如在 catch 后
+        // 又尝试 execute)会用到已半死状态的 fd, 行为不确定.
+        do {
+            // 读 greeting(必须丢弃,不是命令响应)
+            _ = try await readMessage()
+            self.connected = true
+            _ = try await execute("qmp_capabilities")
+        } catch {
+            Darwin.close(fd)
+            self.socketFD = -1
+            self.connected = false
+            self.readBuffer.removeAll(keepingCapacity: false)
+            throw error
+        }
     }
 
     public func close() async {
@@ -124,6 +130,10 @@ public actor QMPClient {
         try await Self.blockingWrite(fd: socketFD, data: data)
     }
 
+    /// 单行 JSON 上限: QMP 正常响应只有几 KB, 10MB 足以覆盖极端 query-*
+    /// 返回大数组场景; 超过就视为协议错乱或攻击, 抛错防止 OOM.
+    private static let maxReadBufferBytes = 10 * 1024 * 1024
+
     private func readMessage() async throws -> [String: Any] {
         while true {
             // buffer 里有完整一行?
@@ -140,6 +150,10 @@ public actor QMPClient {
                 throw VMError.backendUnavailable("QMP 连接关闭")
             }
             readBuffer.append(chunk)
+            if readBuffer.count > Self.maxReadBufferBytes {
+                throw VMError.backendUnavailable(
+                    "QMP readBuffer 超过 \(Self.maxReadBufferBytes) bytes 仍未见换行, 协议可能错乱")
+            }
         }
     }
 

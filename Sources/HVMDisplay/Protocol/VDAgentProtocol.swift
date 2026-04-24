@@ -81,6 +81,28 @@ struct VDAgentMessageHeader {
     var size: UInt32
 }
 
+// MARK: - 剪贴板协议
+
+/// 剪贴板数据类型. 和 spice-protocol/vd_agent.h VD_AGENT_CLIPBOARD_* 对应。
+/// 当前 HellVM 只处理 UTF8_TEXT; 其它值保留定义, 收到时会被识别但交由上层丢弃。
+public enum VDAgentClipboardType: UInt32, Sendable {
+    case none      = 0
+    case utf8Text  = 1
+    case imagePNG  = 2
+    case imageBMP  = 3
+    case imageTIFF = 4
+    case imageJPG  = 5
+}
+
+/// 剪贴板 selection(只在 host/guest 双方都声明 clipboardSelection cap 时才出现)。
+/// HellVM 不声明该 cap, 协议上 GRAB/REQUEST/CLIPBOARD payload 不带 selection 字段,
+/// 代码里保留常量只为调试文档。
+enum VDAgentClipboardSelection: UInt8 {
+    case clipboard = 0   // 通用剪贴板(Windows/Linux 都有)
+    case primary   = 1   // Linux PRIMARY(鼠标选中)
+    case secondary = 2   // Linux SECONDARY
+}
+
 /// VD_AGENT_MONITORS_CONFIG payload (单显示器)
 struct VDAgentMonitorsConfigHeader {
     var numOfMonitors: UInt32

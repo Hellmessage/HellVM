@@ -18,10 +18,29 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 fi
 
 # ---------- 签名身份 ----------
-# 优先级: 环境变量 SIGN_IDENTITY > 本地 "Hell Dev" 证书 > ad-hoc "-"
+# 优先级:
+#   1. 环境变量 SIGN_IDENTITY (用户显式指定, 最高)
+#   2. Developer ID Application —— Apple 根签发, amfid 直接认证书链,
+#      不需要往 System keychain 注自签 root, 也方便走 notarization。
+#      身份串形如: Developer ID Application: NAME (TEAMID)
+#   3. 本地自签 "Hell Dev" —— 零环境构建的 fallback, 需配合
+#      scripts/trust-signing-cert.sh 注入 System trust
+#   4. ad-hoc "-" —— 最后兜底, amfid 基本不会放行带 restricted entitlement
+#      的二进制, 仅供开发时 dry-run 用
 resolve_sign_identity() {
     if [ -n "${SIGN_IDENTITY:-}" ]; then
         echo "$SIGN_IDENTITY"
+        return
+    fi
+    # Developer ID Application: 从 keychain 里提取第一条匹配
+    # `security find-identity -v -p codesigning` 输出格式:
+    #   1) <SHA1> "Developer ID Application: Name (TEAMID)"
+    local devid
+    devid=$(security find-identity -v -p codesigning 2>/dev/null \
+            | sed -nE 's/^[[:space:]]*[0-9]+\)[[:space:]]+[A-F0-9]+[[:space:]]+"(Developer ID Application:[^"]+)"$/\1/p' \
+            | head -1)
+    if [ -n "$devid" ]; then
+        echo "$devid"
         return
     fi
     if security find-identity -v -p codesigning 2>/dev/null | grep -q '"Hell Dev"'; then
@@ -29,6 +48,15 @@ resolve_sign_identity() {
         return
     fi
     echo "-"
+}
+
+# 判断一个 codesign 身份是否是本地自签 (需要 System keychain trust 注入)
+# 目前只 "Hell Dev" 一种自签身份; Developer ID / ad-hoc 都不需要。
+is_self_signed_identity() {
+    case "$1" in
+        "Hell Dev") return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # ---------- 日志 ----------
