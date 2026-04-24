@@ -251,6 +251,8 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
         var args: [String] = []
         args += ControlChannelArgsBuilder(bundle: bundle).build()
         args += MachineArgsBuilder(config: config).build()
+        // PCIe root ports 必须在后面所有 -device 之前定义, 否则 hot-plug target 不存在
+        args += PCIeRootPortsArgsBuilder().build()
         args += EFIArgsBuilder(config: config, paths: paths, efiVars: efiVars).build()
         args += MainDiskArgsBuilder(config: config, bundle: bundle).build()
         args += USBControllerArgsBuilder(config: config).build()

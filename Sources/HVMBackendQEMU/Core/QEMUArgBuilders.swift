@@ -43,13 +43,47 @@ struct MachineArgsBuilder {
         if config.osType == .windows {
             opts += ",hellvm-lowram=on"
         }
+        // 内存参数: 基础是 "-m <init>M". 当 maxMemoryMB 设定且大于 memoryMB,
+        // 追加 slots + maxmem 预留 DIMM 插槽, 给运行时 MemoryHotplug 热插用.
+        // slots 数量给 4 (够用; guest 侧 ACPI SRAT 对 ARM 支持稳定).
+        let memArg: String
+        if let maxMB = config.maxMemoryMB, maxMB > config.memoryMB {
+            memArg = "\(config.memoryMB)M,slots=4,maxmem=\(maxMB)M"
+        } else {
+            memArg = "\(config.memoryMB)M"
+        }
         return [
             "-machine", opts,
             "-cpu", "host",
             "-smp", String(config.cpuCount),
-            "-m", "\(config.memoryMB)M",
+            "-m", memArg,
         ]
     }
+}
+
+// MARK: - ②b PCIe Root Ports (预留热插槽位)
+
+/// ARM virt 机器的默认 PCIe root bus (`pcie.0`) 不支持 hot-plug.
+/// 启动时预定义 N 个 pcie-root-port, 每个能挂一块 hot-pluggable 设备 (virtio-net-pci,
+/// virtio-blk-pci 等). 运行时 QMP `device_add` 指定 `bus=rp_N` 来占用空闲的 root port.
+///
+/// root port 自带 PCIe native hotplug 能力, guest 内核收到 ACPI/PCIe hotplug 事件后
+/// 自动触发 probe 流程。 4 个槽位对日常"加一张 NIC / 加一块数据盘"够用, 多了用户可以
+/// 重启扩容。
+struct PCIeRootPortsArgsBuilder {
+    static let count = 4
+
+    func build() -> [String] {
+        var out: [String] = []
+        for i in 0..<Self.count {
+            // chassis 必须 >= 1 (chassis 0 保留); 每个 port 独占一个 chassis
+            out += ["-device", "pcie-root-port,id=rp\(i),chassis=\(i + 1)"]
+        }
+        return out
+    }
+
+    /// 派生第 i 个 root port 的 bus id, 供 DiskHotplug/NICHotplug 透传给 QMP device_add
+    public static func busID(index: Int) -> String { "rp\(index)" }
 }
 
 // MARK: - ③ EFI 固件
@@ -69,9 +103,11 @@ struct EFIArgsBuilder {
     }
 }
 
-// MARK: - ④ 主磁盘 (NVMe)
+// MARK: - ④ 主磁盘 (NVMe) + 数据盘 (virtio-blk-pci, 可热插拔)
 
-/// 所有 VMConfig.disks 挂成 NVMe (Windows 内建支持 + UTM 验证过能跑 Win11; Linux 也支持)
+/// disks[0] 挂成 NVMe 作为主启动盘 (Windows 内建支持 + UTM 验证过能跑 Win11).
+/// disks[1+] 挂成 virtio-blk-pci, ID 基于 UUID 稳定(DiskHotplug 用同样 ID).
+/// 非 enabled 的数据盘跳过; 主盘无视 enabled 始终挂载。
 struct MainDiskArgsBuilder {
     let config: VMConfig
     let bundle: VMBundle
@@ -80,11 +116,27 @@ struct MainDiskArgsBuilder {
         var out: [String] = []
         for (idx, disk) in config.disks.enumerated() {
             let path = bundle.resolve(disk.relativePath).path
-            let driveId = "hd\(idx)"
-            var driveOpts = "if=none,id=\(driveId),file=\(path),format=\(disk.format.rawValue)"
-            if disk.readOnly { driveOpts += ",readonly=on" }
-            out += ["-drive", driveOpts]
-            out += ["-device", "nvme,drive=\(driveId),serial=hellvm-\(driveId)"]
+            let isBoot = (idx == 0)
+            // 非主盘且被禁用, 跳过 (运行时可通过 QMP 热插拔上来)
+            if !isBoot && !disk.enabled { continue }
+
+            if isBoot {
+                let driveId = "hd0"
+                var driveOpts = "if=none,id=\(driveId),file=\(path),format=\(disk.format.rawValue)"
+                if disk.readOnly { driveOpts += ",readonly=on" }
+                out += ["-drive", driveOpts]
+                out += ["-device", "nvme,drive=\(driveId),serial=hellvm-\(driveId)"]
+            } else {
+                // 数据盘: ID 和 DiskHotplug 的常量一致, 方便运行时 detach/attach
+                let driveId  = "disk_\(disk.qemuStableSuffix)"
+                let deviceId = "data_\(disk.qemuStableSuffix)"
+                var driveOpts = "if=none,id=\(driveId),file=\(path),format=\(disk.format.rawValue)"
+                if disk.readOnly { driveOpts += ",readonly=on" }
+                out += ["-drive", driveOpts]
+                var devOpts = "virtio-blk-pci,drive=\(driveId),id=\(deviceId),serial=hellvm-\(disk.qemuStableSuffix)"
+                if disk.readOnly { devOpts += ",readonly=on" }
+                out += ["-device", devOpts]
+            }
         }
         return out
     }
@@ -114,16 +166,17 @@ struct BootMediaArgsBuilder {
         guard let isoPath = config.boot.isoPath, !config.boot.bootFromDiskOnly else {
             return []
         }
+        // drive/device ID 与 ISOHotplug 的常量对齐, 便于运行时 QMP 热插拔定位
         if config.boot.graphical {
             return [
-                "-drive", "if=none,id=cdrom0,media=cdrom,file=\(isoPath),readonly=on",
-                "-device", "usb-storage,drive=cdrom0,removable=true,bootindex=0,bus=usbbus.0",
+                "-drive", "if=none,id=\(ISOHotplug.driveID),media=cdrom,file=\(isoPath),readonly=on",
+                "-device", "usb-storage,drive=\(ISOHotplug.driveID),id=\(ISOHotplug.deviceID),removable=true,bootindex=0,bus=usbbus.0",
             ]
         } else {
             return [
-                "-drive", "if=none,id=cdrom0,media=cdrom,file=\(isoPath),readonly=on",
+                "-drive", "if=none,id=\(ISOHotplug.driveID),media=cdrom,file=\(isoPath),readonly=on",
                 "-device", "virtio-scsi-pci,id=scsi0",
-                "-device", "scsi-cd,drive=cdrom0,bootindex=1",
+                "-device", "scsi-cd,drive=\(ISOHotplug.driveID),id=\(ISOHotplug.deviceID),bootindex=1",
             ]
         }
     }

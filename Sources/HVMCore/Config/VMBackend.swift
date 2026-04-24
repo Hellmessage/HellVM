@@ -23,7 +23,10 @@ public protocol VMBackend: AnyObject {
 }
 
 /// VM 相关错误
-public enum VMError: Error, CustomStringConvertible {
+///
+/// 同时实现 `LocalizedError`, 让 Swift NSError 桥接时 `localizedDescription` 返回
+/// 中文描述而不是 "The operation couldn't be completed. (HVMCore.VMError error N.)".
+public enum VMError: Error, CustomStringConvertible, LocalizedError {
     case invalidConfig(String)
     case backendUnavailable(String)
     case startFailed(String)
@@ -43,4 +46,6 @@ public enum VMError: Error, CustomStringConvertible {
         case .notImplemented(let m):     return "尚未实现:\(m)"
         }
     }
+
+    public var errorDescription: String? { description }
 }

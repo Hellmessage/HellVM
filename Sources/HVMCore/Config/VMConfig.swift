@@ -8,7 +8,12 @@ public struct VMConfig: Codable, Sendable, Identifiable {
     public var architecture: VMArchitecture
     public var osType: GuestOSType
     public var cpuCount: Int
+    /// 开机初始内存 (MB). 运行时可通过 QMP 热插 DIMM 上调, 上限由 maxMemoryMB 决定.
     public var memoryMB: UInt64
+    /// 内存最大可扩到多少 MB —— 启动时决定 `-m X,slots=N,maxmem=Y` 的 Y.
+    /// nil / <= memoryMB 表示不预留热插槽位(省 guest 资源; 不支持内存热插).
+    /// 修改此字段需停机再启动才能生效, 不能热改。
+    public var maxMemoryMB: UInt64?
     public var disks: [DiskConfig]
     public var networks: [NetworkConfig]
     public var display: DisplayConfig
@@ -23,6 +28,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         osType: GuestOSType = .other,
         cpuCount: Int = 2,
         memoryMB: UInt64 = 2048,
+        maxMemoryMB: UInt64? = nil,
         disks: [DiskConfig] = [],
         networks: [NetworkConfig] = [.init(mode: .user)],
         display: DisplayConfig = .default,
@@ -36,6 +42,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         self.osType = osType
         self.cpuCount = cpuCount
         self.memoryMB = memoryMB
+        self.maxMemoryMB = maxMemoryMB
         self.disks = disks
         self.networks = networks
         self.display = display
@@ -46,7 +53,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case id, name, architecture, osType
-        case cpuCount, memoryMB, disks, networks
+        case cpuCount, memoryMB, maxMemoryMB, disks, networks
         case display, boot, createdAt, updatedAt
     }
 
@@ -58,6 +65,7 @@ public struct VMConfig: Codable, Sendable, Identifiable {
         self.osType       = try c.decodeOr(GuestOSType.self, forKey: .osType, default: .other)
         self.cpuCount     = try c.decode(Int.self,            forKey: .cpuCount)
         self.memoryMB     = try c.decode(UInt64.self,         forKey: .memoryMB)
+        self.maxMemoryMB  = try c.decodeIfPresent(UInt64.self, forKey: .maxMemoryMB)
         self.disks        = try c.decode([DiskConfig].self,   forKey: .disks)
         self.networks     = try c.decode([NetworkConfig].self, forKey: .networks)
         self.display      = try c.decode(DisplayConfig.self,  forKey: .display)
@@ -81,12 +89,18 @@ public enum GuestOSType: String, Codable, Sendable, CaseIterable {
 }
 
 /// 磁盘配置(路径相对于 bundle 根目录)
+///
+/// 第一个 disk (disks[0]) 作为主启动盘, 总是走 NVMe 挂载且 enabled 锁死 true.
+/// 第二块起是数据盘, 走 virtio-blk-pci, 支持运行时 QMP 热插拔。
 public struct DiskConfig: Codable, Sendable, Identifiable {
     public var id: UUID
     public var relativePath: String   // 例如 "disks/main.qcow2"
     public var sizeGB: UInt64
     public var format: Format
     public var readOnly: Bool
+    /// 是否启用 —— false 时启动不挂, 运行中可通过 QMP 热插拔 attach/detach.
+    /// 主盘(disks[0]) UI 里锁定为 true, 不允许禁用。
+    public var enabled: Bool
 
     public enum Format: String, Codable, Sendable {
         case qcow2
@@ -98,13 +112,35 @@ public struct DiskConfig: Codable, Sendable, Identifiable {
         relativePath: String,
         sizeGB: UInt64,
         format: Format = .qcow2,
-        readOnly: Bool = false
+        readOnly: Bool = false,
+        enabled: Bool = true
     ) {
         self.id = id
         self.relativePath = relativePath
         self.sizeGB = sizeGB
         self.format = format
         self.readOnly = readOnly
+        self.enabled = enabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, relativePath, sizeGB, format, readOnly, enabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.relativePath = try c.decode(String.self, forKey: .relativePath)
+        self.sizeGB = try c.decode(UInt64.self, forKey: .sizeGB)
+        self.format = try c.decode(Format.self, forKey: .format)
+        self.readOnly = try c.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false
+        // 兼容旧 config(无 enabled): 默认 true
+        self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    /// 派生 QMP 稳定后缀(uuid 首 8 字符), 给 blockdev-add/device_add 当 id 后缀
+    public var qemuStableSuffix: String {
+        String(id.uuidString.replacingOccurrences(of: "-", with: "").prefix(8).lowercased())
     }
 }
 

@@ -34,21 +34,24 @@ struct VMSettingsDisksSection: View {
                 }
             }
 
-            if !readOnly {
-                if addingDisk {
-                    addDiskForm
-                        .padding(.top, 6)
-                } else {
-                    HStack {
-                        SecondaryButton(title: "添加磁盘", systemImage: "plus", disabled: busy) {
-                            addingDisk = true
-                            newDiskSizeGB = 20
-                            newDiskFormat = .qcow2
-                        }
-                        Spacer()
+            // 运行中也允许加数据盘(热插拔), 停机时允许改动主盘以外的任何操作
+            if addingDisk {
+                addDiskForm.padding(.top, 6)
+            } else {
+                HStack {
+                    SecondaryButton(title: "添加磁盘", systemImage: "plus", disabled: busy) {
+                        addingDisk = true
+                        newDiskSizeGB = 20
+                        newDiskFormat = .qcow2
                     }
-                    .padding(.top, 4)
+                    if readOnly {
+                        Text("运行中: 新加为数据盘, QMP 热插拔生效; 主盘/resize/转格式需停机")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+                    Spacer()
                 }
+                .padding(.top, 4)
             }
         }
     }
@@ -56,25 +59,50 @@ struct VMSettingsDisksSection: View {
     // MARK: - 单块磁盘行
 
     private func diskRow(index: Int, disk: DiskConfig) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        // 主盘(#0): 任何时候都受 readOnly 控制(本质上需停机才能动主盘);
+        // 数据盘(#1+): 运行中可切 enabled / 删除 / 新增(QMP 热插拔), 但 resize/convert/move 仍需停机
+        let isMain = (index == 0)
+        let runtimeDataDisk = readOnly && !isMain
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .center, spacing: 10) {
-                Text(index == 0 ? "#0 BOOT" : "#\(index)")
+                Text(isMain ? "#0 BOOT" : "#\(index)")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(index == 0 ? Theme.accent : Theme.textTertiary)
+                    .foregroundStyle(isMain ? Theme.accent : Theme.textTertiary)
                     .frame(width: 66, alignment: .leading)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(disk.relativePath)
                         .font(Font2.mono)
                         .foregroundStyle(Theme.textPrimary)
                         .lineLimit(1).truncationMode(.middle)
-                    Text("\(disk.sizeGB) GB · \(disk.format.rawValue)\(disk.readOnly ? " · 只读" : "")")
+                    Text("\(disk.sizeGB) GB · \(disk.format.rawValue)\(disk.readOnly ? " · 只读" : "")\(disk.enabled || isMain ? "" : " · 已禁用")")
                         .font(.system(size: 10))
-                        .foregroundStyle(Theme.textTertiary)
+                        .foregroundStyle(disk.enabled || isMain ? Theme.textTertiary : Theme.warning)
                 }
                 Spacer(minLength: 8)
 
+                // 数据盘 enabled toggle —— 运行中即生效(走 QMP 热插拔)
+                if !isMain {
+                    Toggle("", isOn: Binding(
+                        get: { disk.enabled },
+                        set: { new in
+                            runTaskAsync {
+                                try await VMController.setDiskEnabled(
+                                    item, store: store, at: index, enabled: new)
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(busy)
+                }
+
+                // 操作按钮: 停机时全部可用; 运行中数据盘只显示删除
                 if !readOnly {
                     diskActions(index: index, disk: disk)
+                } else if runtimeDataDisk {
+                    VMIconButton(systemImage: "trash", tint: Theme.danger, disabled: busy) {
+                        removingIndex = (removingIndex == index) ? nil : index
+                    }
                 }
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
@@ -176,7 +204,7 @@ struct VMSettingsDisksSection: View {
                 removingIndex = nil
             }
             Button {
-                runTask { try VMController.removeDisk(item, store: store, at: index) }
+                runTaskAsync { try await VMController.removeDisk(item, store: store, at: index) }
                 removingIndex = nil
             } label: {
                 Text("删除")

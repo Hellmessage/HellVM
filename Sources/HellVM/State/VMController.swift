@@ -299,11 +299,43 @@ struct VMController {
         var cfg = original
         try mutate(&cfg)
         if running {
-            // 运行中只允许网络字段改动(走 QMP 热插拔); 其他字段保持不变, 否则拒绝
+            // 运行中允许的热插拔字段白名单:
+            //   - networks (整张)
+            //   - boot.isoPath / boot.bootFromDiskOnly
+            //   - disks[1+] 数据盘 (enabled / readOnly / 增删)
+            //   - memoryMB 可上调(不可下调, guest 不支持 offline-unplug)
+            // 主盘(disks[0])、CPU、maxMemoryMB、boot 其他字段、display 等均需停机。
+            //
+            // 策略: 把 hotSafe 里"允许改"的字段全部覆盖回 original 的值,
+            // 此时若 hotSafe 仍等于 original, 说明 draft 的非白名单字段没动, 放行。
             var hotSafe = cfg
-            hotSafe.networks = original.networks
+            hotSafe.networks              = original.networks
+            hotSafe.boot.isoPath          = original.boot.isoPath
+            hotSafe.boot.bootFromDiskOnly = original.boot.bootFromDiskOnly
+            // 内存热扩: 允许 memoryMB 增加(不超过 maxMemoryMB), 拒绝减少
+            if cfg.memoryMB != original.memoryMB {
+                if cfg.memoryMB < original.memoryMB {
+                    throw VMError.invalidConfig("运行中不支持缩小内存, 请停机调整")
+                }
+                if let maxMB = original.maxMemoryMB, cfg.memoryMB > maxMB {
+                    throw VMError.invalidConfig("内存超出预留上限 \(maxMB) MB, 请停机调大上限")
+                }
+                if original.maxMemoryMB == nil || (original.maxMemoryMB ?? 0) <= original.memoryMB {
+                    throw VMError.invalidConfig("启动时未预留热插槽位, 无法热加内存. 停机后设置 '最大可扩到'.")
+                }
+            }
+            hotSafe.memoryMB = original.memoryMB   // 让 equiv 比较忽略这一项
+            // 数据盘(1+)从 draft 换成 original, 保留主盘(index 0) 来自 hotSafe
+            // (主盘 draft 本身也不该动, 但若用户真改了, 下面 configsEquivalent 会揪出)
+            if !hotSafe.disks.isEmpty {
+                var rebuilt: [DiskConfig] = [hotSafe.disks[0]]
+                if original.disks.count > 1 {
+                    rebuilt.append(contentsOf: original.disks[1...])
+                }
+                hotSafe.disks = rebuilt
+            }
             if !configsEquivalent(hotSafe, original) {
-                throw VMError.invalidConfig("VM 运行中仅允许改网络, 其它字段请先停机")
+                throw VMError.invalidConfig("VM 运行中仅允许改网络 / ISO / 数据盘, 其它字段请先停机")
             }
         }
         try validate(cfg)
@@ -345,14 +377,15 @@ struct VMController {
 
     // MARK: - 多磁盘管理(VM 必须停机)
 
-    /// 新增一块磁盘,文件会落在 bundle 的 disks/ 下
+    /// 新增一块磁盘,文件会落在 bundle 的 disks/ 下.
+    /// VM 运行中新增的是"数据盘"(非主盘), 会通过 QMP 热插拔 attach 到 guest.
     @MainActor
     static func addDisk(_ item: VMListItem,
                         store: VMListStore,
                         sizeGB: UInt64,
                         format: DiskConfig.Format,
                         fileName: String? = nil) async throws {
-        try requireStoppedForDiskOp(item)
+        let running = item.bundle.isRunning()
         guard sizeGB >= 1 && sizeGB <= 8192 else {
             throw VMError.invalidConfig("磁盘大小需在 1-8192 GB 之间")
         }
@@ -381,29 +414,105 @@ struct VMController {
             at: fullURL, sizeGB: sizeGB, format: format
         )
 
-        try updateConfig(item, store: store) { cfg in
-            cfg.disks.append(DiskConfig(relativePath: rel, sizeGB: sizeGB, format: format))
+        let newDisk = DiskConfig(relativePath: rel, sizeGB: sizeGB, format: format)
+        try updateConfig(item, store: store, allowWhenRunning: running) { cfg in
+            cfg.disks.append(newDisk)
+        }
+
+        if running {
+            // 数据盘(index >= 1) QMP 热插拔 attach
+            await hotAttachDisk(bundle: item.bundle, disk: newDisk)
         }
     }
 
-    /// 删除磁盘(同时删文件)。要求至少保留一块磁盘
+    /// 删除磁盘(同时删文件)。主盘不可删; 数据盘运行中走 QMP detach
     @MainActor
     static func removeDisk(_ item: VMListItem,
                            store: VMListStore,
-                           at index: Int) throws {
-        try requireStoppedForDiskOp(item)
+                           at index: Int) async throws {
         try requireValidDiskIndex(index, in: item.config.disks)
         guard item.config.disks.count > 1 else {
             throw VMError.invalidConfig("至少保留一块磁盘")
         }
+        if index == 0 {
+            throw VMError.invalidConfig("主启动盘(#0)不可删除, 需停机并通过重建 VM 更换")
+        }
+        let running = item.bundle.isRunning()
         let target = item.config.disks[index]
         let url = item.bundle.resolve(target.relativePath)
 
-        try updateConfig(item, store: store) { cfg in
+        // 先 detach, 再改 config, 最后删文件 —— 避免 guest 仍在用时丢失访问
+        if running {
+            await hotDetachDisk(bundle: item.bundle, disk: target)
+        }
+        try updateConfig(item, store: store, allowWhenRunning: running) { cfg in
             cfg.disks.remove(at: index)
         }
-        // config 已写回, 再删文件(即使删文件失败, 配置已正确)
         try? FileManager.default.removeItem(at: url)
+    }
+
+    /// 切换数据盘启用状态 —— 运行中通过 QMP attach/detach 生效.
+    /// 主盘禁止调用(主盘 enabled 永远 true)。
+    @MainActor
+    static func setDiskEnabled(_ item: VMListItem,
+                               store: VMListStore,
+                               at index: Int,
+                               enabled: Bool) async throws {
+        try requireValidDiskIndex(index, in: item.config.disks)
+        if index == 0 {
+            throw VMError.invalidConfig("主启动盘(#0)不可禁用")
+        }
+        let running = item.bundle.isRunning()
+        let original = item.config.disks[index]
+        guard original.enabled != enabled else { return }
+
+        try updateConfig(item, store: store, allowWhenRunning: running) { cfg in
+            cfg.disks[index].enabled = enabled
+        }
+        if running {
+            if enabled {
+                await hotAttachDisk(bundle: item.bundle, disk: original)
+            } else {
+                await hotDetachDisk(bundle: item.bundle, disk: original)
+            }
+        }
+    }
+
+    @MainActor
+    private static func hotAttachDisk(bundle: VMBundle, disk: DiskConfig) async {
+        let path = bundle.resolve(disk.relativePath).path
+        let qmp = QMPClient()
+        do {
+            try await qmp.connect(socketPath: bundle.qmpSocketURL.path)
+        } catch {
+            log.warn(.backend, "hotplug attachDisk QMP 连接失败: \(error)")
+            return
+        }
+        defer { Task { await qmp.close() } }
+        do {
+            try await DiskHotplug.attach(disk, absolutePath: path, via: qmp)
+            log.info(.backend, "hotplug: attached disk \(disk.relativePath)")
+        } catch {
+            log.warn(.backend, "hotplug attachDisk 失败: \(error)")
+        }
+    }
+
+    @MainActor
+    private static func hotDetachDisk(bundle: VMBundle, disk: DiskConfig) async {
+        let qmp = QMPClient()
+        do {
+            try await qmp.connect(socketPath: bundle.qmpSocketURL.path)
+        } catch {
+            log.warn(.backend, "hotplug detachDisk QMP 连接失败: \(error)")
+            return
+        }
+        defer { Task { await qmp.close() } }
+        do {
+            try await DiskHotplug.detach(disk, via: qmp)
+            log.info(.backend, "hotplug: detached disk \(disk.relativePath)")
+        } catch {
+            log.warn(.backend, "hotplug detachDisk 失败: \(error)")
+        }
     }
 
     /// 扩容磁盘。qemu-img 只支持变大, 缩小不做(数据丢失风险)

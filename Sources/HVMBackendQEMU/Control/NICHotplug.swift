@@ -70,10 +70,20 @@ public enum NICHotplug {
             throw HotplugError.qmpFailed(command: "netdev_add", underlying: error)
         }
 
+        // ARM virt 的 pcie.0 不支持 hotplug, 必须绑到预留的 pcie-root-port
+        let port: String
+        do {
+            port = try await PCIeSlotAllocator.allocateFreePort(via: qmp)
+        } catch {
+            _ = try? await qmp.execute("netdev_del", arguments: ["id": netId])
+            throw HotplugError.qmpFailed(command: "allocate-pcie-slot", underlying: error)
+        }
+
         var devArgs: [String: Any] = [
             "driver": net.deviceModel.qemuDeviceName,
             "netdev": netId,
             "id": devId,
+            "bus": port,
         ]
         if let mac = net.macAddress, !mac.isEmpty {
             devArgs["mac"] = mac

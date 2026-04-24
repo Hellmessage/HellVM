@@ -65,6 +65,30 @@ public actor QMPClient {
 
     // MARK: - 命令
 
+    /// 执行一条 QMP 命令, 返回 return 字段原始类型 (可能是 [String:Any] / [[String:Any]] / Bool 等).
+    /// 不做类型断言, 调用方自行解读。适合 query-pci 等返回数组的命令。
+    @discardableResult
+    public func executeRaw(_ command: String, arguments: [String: Any] = [:]) async throws -> Any {
+        guard socketFD >= 0 else {
+            throw VMError.backendUnavailable("QMP 未连接")
+        }
+        var req: [String: Any] = ["execute": command]
+        if !arguments.isEmpty {
+            req["arguments"] = arguments
+        }
+        try await writeJSON(req)
+        while true {
+            let msg = try await readMessage()
+            if let err = msg["error"] as? [String: Any] {
+                let desc = err["desc"] as? String ?? "未知 QMP 错误"
+                throw VMError.backendUnavailable("QMP 命令 \(command) 失败:\(desc)")
+            }
+            if let ret = msg["return"] {
+                return ret
+            }
+        }
+    }
+
     /// 执行一条 QMP 命令,返回 return 字段(通常是 dict 或 nil)
     @discardableResult
     public func execute(_ command: String, arguments: [String: Any] = [:]) async throws -> [String: Any] {

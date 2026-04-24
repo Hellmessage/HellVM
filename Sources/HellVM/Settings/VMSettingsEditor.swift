@@ -32,10 +32,11 @@ struct VMSettingsEditor: View {
     private var readOnly: Bool { item.isRunning }
 
     private var dirty: Bool {
-        draft.cpuCount  != item.config.cpuCount  ||
-        draft.memoryMB  != item.config.memoryMB  ||
-        draft.boot      != item.config.boot      ||
-        draft.display   != item.config.display   ||
+        draft.cpuCount    != item.config.cpuCount    ||
+        draft.memoryMB    != item.config.memoryMB    ||
+        draft.maxMemoryMB != item.config.maxMemoryMB ||
+        draft.boot        != item.config.boot        ||
+        draft.display     != item.config.display     ||
         !vmSettingsNetworksEqual(draft.networks, item.config.networks)
     }
 
@@ -57,6 +58,8 @@ struct VMSettingsEditor: View {
                 VMSettingsDivider()
                 VMSettingsNetworkSection(draft: $draft, item: item)
                 VMSettingsDivider()
+                VMSettingsUSBSection(item: item)
+                VMSettingsDivider()
                 VMSettingsBootSection(item: item, draft: $draft, readOnly: readOnly)
 
                 // 运行中也显示 saveBar, 但只有网络脏(会热插拔)才有意义;
@@ -75,6 +78,9 @@ struct VMSettingsEditor: View {
             if readOnly {
                 VMSectionKV(label: "CPU 核心", value: "\(item.config.cpuCount)")
                 VMSectionKV(label: "内存",     value: "\(item.config.memoryMB) MB")
+                if let maxMB = item.config.maxMemoryMB, maxMB > item.config.memoryMB {
+                    VMSectionKV(label: "内存上限", value: "\(maxMB) MB")
+                }
             } else {
                 HStack(alignment: .top, spacing: 16) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -90,6 +96,23 @@ struct VMSettingsEditor: View {
                             get: { Int(draft.memoryMB) },
                             set: { draft.memoryMB = UInt64($0) }
                         ), unit: "MB", range: 128...262144, step: 512)
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        FieldLabel("内存上限 (热扩)")
+                        StepperCard(value: Binding(
+                            get: { Int(draft.maxMemoryMB ?? 0) },
+                            set: { v in draft.maxMemoryMB = v > 0 ? UInt64(v) : nil }
+                        ), unit: "MB", range: 0...524288, step: 1024)
+                    }
+                }
+                if (draft.maxMemoryMB ?? 0) > 0 && (draft.maxMemoryMB ?? 0) <= draft.memoryMB {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textTertiary)
+                        Text("内存上限 ≤ 当前内存 时视同未预留热插槽位, 运行中不能扩内存.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
                     }
                 }
             }
@@ -117,25 +140,38 @@ struct VMSettingsEditor: View {
                           systemImage: "checkmark.circle",
                           disabled: !dirty || busy) {
                 runTaskAsync {
-                    // 保存前快照旧 networks, 用于运行时热插拔 diff
+                    // 保存前快照旧字段, 用于运行时热插拔 diff
                     let oldNetworks = item.config.networks
+                    let oldBoot = item.config.boot
+                    let oldMemoryMB = item.config.memoryMB
                     let wasRunning = item.bundle.isRunning()
                     try VMController.updateConfig(
                         item, store: store,
-                        allowWhenRunning: wasRunning   // 运行中仅网络差异会通过校验
+                        allowWhenRunning: wasRunning
                     ) { cfg in
-                        // 运行中只允许改 networks. 其他字段即使赋值, 由于 readOnly
-                        // draft 仍等于原值, updateConfig 的 hot-safe 比对会放行.
-                        cfg.cpuCount  = draft.cpuCount
-                        cfg.memoryMB  = draft.memoryMB
-                        cfg.boot      = draft.boot
-                        cfg.display   = draft.display
-                        cfg.networks  = draft.networks
+                        cfg.cpuCount   = draft.cpuCount
+                        cfg.memoryMB   = draft.memoryMB
+                        cfg.maxMemoryMB = draft.maxMemoryMB
+                        cfg.boot       = draft.boot
+                        cfg.display    = draft.display
+                        cfg.networks   = draft.networks
                     }
                     if wasRunning {
                         if let err = await vmSettingsApplyNetworkHotplug(
                             item: item, old: oldNetworks, new: draft.networks) {
                             errorText = err
+                        }
+                        if let err = await vmSettingsApplyISOHotplug(
+                            item: item, old: oldBoot, new: draft.boot) {
+                            errorText = err
+                        }
+                        // 内存热扩 (只处理 > 原值的情况, updateConfig 已把非法情况拦下)
+                        if draft.memoryMB > oldMemoryMB {
+                            if let err = await vmSettingsApplyMemoryHotplug(
+                                item: item,
+                                additionalMB: draft.memoryMB - oldMemoryMB) {
+                                errorText = err
+                            }
                         }
                     }
                 }
