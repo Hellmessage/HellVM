@@ -191,13 +191,31 @@ public final class SpawnedProcess: @unchecked Sendable {
     private func startReading(lineHandler: @escaping (String, Bool) -> Void) {
         let outBuf = LineBufferPS()
         let errBuf = LineBufferPS()
+        // 用 Swift throws 版 API read(upToCount:) 替代老式 availableData.
+        // availableData 在 fd 关闭 / I/O 错时会 raise ObjC NSException,
+        // Swift 层 do/try/catch 抓不住 ObjC 异常 → 直达 terminate → abort 整个 App.
+        // race 场景: exit 时 readabilityHandler=nil 不是同步 barrier,
+        //   dispatch 队列里已调度的 handler 可能在 fd 被关后再进来读一次, 之前会炸。
+        // 改用 Swift throws API 后该场景只 throw CocoaError, catch 置 nil 即可。
         stdoutHandle.readabilityHandler = { h in
-            let data = h.availableData
+            let data: Data
+            do {
+                data = (try h.read(upToCount: 64 * 1024)) ?? Data()
+            } catch {
+                h.readabilityHandler = nil
+                return
+            }
             if data.isEmpty { h.readabilityHandler = nil; return }
             outBuf.append(data) { line in lineHandler(line, false) }
         }
         stderrHandle.readabilityHandler = { h in
-            let data = h.availableData
+            let data: Data
+            do {
+                data = (try h.read(upToCount: 64 * 1024)) ?? Data()
+            } catch {
+                h.readabilityHandler = nil
+                return
+            }
             if data.isEmpty { h.readabilityHandler = nil; return }
             errBuf.append(data) { line in lineHandler(line, true) }
         }
@@ -227,8 +245,12 @@ public final class SpawnedProcess: @unchecked Sendable {
             // 关 pipe fd (readabilityHandler 已自退)
             self.stdoutHandle.readabilityHandler = nil
             self.stderrHandle.readabilityHandler = nil
-            Darwin.close(self.stdoutReadFD)
-            Darwin.close(self.stderrReadFD)
+            // 用 FileHandle.close() 而不是 Darwin.close(raw fd):
+            // 前者让 FileHandle 内部标记 closed, 即便 in-flight readability handler
+            // 还在调 read(upToCount:) 也只会 throw Swift error(被闭包 catch 置 nil),
+            // 不会像 Darwin.close 后 availableData 那样 raise ObjC 异常。
+            try? self.stdoutHandle.close()
+            try? self.stderrHandle.close()
             src.cancel()
 
             handler?(code)

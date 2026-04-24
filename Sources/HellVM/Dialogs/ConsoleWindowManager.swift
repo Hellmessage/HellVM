@@ -49,8 +49,9 @@ final class ConsoleWindowManager: NSObject, NSWindowDelegate, ObservableObject {
         }
 
         let content = FramebufferView(
-            displaySocketPath: item.bundle.iosurfaceSocketURL.path,
-            inputSocketPath: item.bundle.qmpInputSocketURL.path
+            displaySocketPath:    item.bundle.iosurfaceSocketURL.path,
+            inputSocketPath:      item.bundle.qmpInputSocketURL.path,
+            spiceAgentSocketPath: item.bundle.spiceAgentSocketURL.path
         )
         .background(Color.black)
         .frame(minWidth: 640, minHeight: 480)

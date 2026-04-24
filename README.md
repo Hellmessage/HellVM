@@ -90,6 +90,45 @@ Vendor/                     首次 make build 自动拉的 qemu / edk2 源码
 - `0005-iosurface-fix-multi-console-active_con-thrash.patch` — 多 console 场景下 active_con 切换修复
 - `edk2/0001-ArmVirtPkg-extra-RAM-region-for-Win11-compat.patch` — EDK2 额外 RAM region
 
+## Windows guest 动态分辨率(spice-vdagent)
+
+拖动 HellVM 窗口时,HellVM 会同时通过两条通道请求 guest 改分辨率:
+
+- **iosurface `MSG_RESIZE_REQ` → `dpy_set_ui_info`** —— Linux guest 的 virtio-gpu
+  驱动收到后自动重建 scanout, 立即生效。
+- **virtio-serial `com.redhat.spice.0` + spice-vdagent 协议** —— Windows guest
+  的 `viogpudo.sys` 运行时不响应 `dpy_set_ui_info`, 需要 `spice-vdagent` 服务
+  收到 `VD_AGENT_MONITORS_CONFIG` 后主动调 `ChangeDisplaySettingsEx` 切分辨率。
+
+### 新建 Windows VM:自动安装(默认开)
+
+新建 Win11 VM 向导里会自动提示下载 `spice-guest-tools.exe`(约 30MB),缓存到全局:
+
+```
+~/Library/Application Support/HellVM/cache/spice-guest-tools.exe
+```
+
+下载源是 spice-space.org 官方 latest 直链,可用 `SPICE_GUEST_TOOLS_URL` env 覆盖(离线/国内镜像)。
+
+VM 设置里的 "**自动装 Spice 工具**" 开关默认开:
+
+- 启动 VM 时 HellVM 把 `spice-guest-tools.exe` 打进 `autounattend.iso` 根目录
+- Windows 装完进 OOBE,FirstLogonCommands 扫 C..Z 盘找这个 exe,跑 `/S` 静默装
+- 装完 spice-vdagent 服务自启,无需重启,下次拖窗口立即自动 resize
+
+ARM64 Windows 注意:`spice-guest-tools-latest.exe` 是 x86 NSIS installer,ARM64 Windows 通过 x86 emulation 能跑 user-mode 服务;驱动部分(virtio-serial)走 `virtio-win.iso` 里的 ARM64 包,**建议同时开启 `autoInstallVirtioWin`**。
+
+### 已装好的 Windows VM:手动安装
+
+FirstLogonCommands 只在首次 OOBE 跑一次,对已装好的 Windows 不生效。手动装一次:
+
+1. HellVM 里 Settings → 启动 → 打开 "自动装 Spice 工具" 触发下载
+2. 复制缓存里的 `~/Library/Application Support/HellVM/cache/spice-guest-tools.exe` 到 guest(共享目录、拖拽、或任意方式)
+3. 在 Windows 里管理员双击运行,或 PowerShell 里 `.\spice-guest-tools-latest.exe /S` 静默装
+4. 服务名 "Spice Agent" 自启,拖 HellVM 窗口即自动 resize
+
+Linux guest 若装了 `spice-vdagent` 包也会走这条路。未装时 virtio-serial 握手不会完成,不影响主画面和键鼠。
+
 ## 诊断
 
 ### 运行日志

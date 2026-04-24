@@ -254,14 +254,15 @@ struct DisplayArgsBuilder {
         var out: [String] = []
         if config.boot.graphical {
             if config.display.virtioGpu {
-                // Linux/Asahi 等: virtio-gpu-pci + ramfb 双 console, 能走 virtio-gpu 加速
+                // 主路径: virtio-gpu-pci + ramfb 双 console, 能走 virtio-gpu 加速。
+                // Linux/Asahi 原生支持; Win11 24H2 ARM64 实测在新 EDK2 下也稳定。
                 out += ["-device", "virtio-gpu-pci"]
                 out += ["-device", "ramfb"]
             } else {
-                // Windows: virtio-ramfb 融合设备(HellVM patch 0002+0003 port 自 UTM)
-                // 单 PCI 设备单 console, bootmgr 走 ramfb facet 不挂死, 装完 viogpudo
-                // 驱动后 scanout->resource_id != 0 自动切 virtio-gpu facet, 支持
-                // dpy_set_ui_info 动态分辨率。
+                // Fallback: virtio-ramfb 融合设备 (HellVM patch 0002+0003, port 自 UTM).
+                // 单 PCI 设备单 console, 最初是为早期 Win11 ISO 下 bootmgr 和双 console
+                // 不兼容而写的 workaround. 当前 Win11 24H2 ARM64 不再需要, 且实测
+                // 新 ISO 在此模式 PE 阶段会卡安装。代码保留作兼容老 ISO / 其它 fallback。
                 out += ["-device", "virtio-ramfb"]
             }
             out += ["-device", "usb-kbd,bus=usbbus.0"]
@@ -276,6 +277,22 @@ struct DisplayArgsBuilder {
             }
             out += ["-vga", "none"]
             out += ["-display", "iosurface,socket=\(bundle.iosurfaceSocketURL.path)"]
+
+            // spice-vdagent 桥接 —— 目的: Windows guest (装 spice-guest-tools 后)
+            // 运行时动态 resize。纯 dpy_set_ui_info 路径在 Linux guest 上能走通,
+            // 但 Windows virtio-gpu 驱动只在首次 boot 读 EDID 时 pick 分辨率,运行时
+            // 不响应后续 ui_info 变更。HellVM 在 iosurface 路径之外, 额外开一条
+            // virtio-serial chardev, Swift 侧按 spice-vdagent 协议发 MONITORS_CONFIG,
+            // Windows 里的 spice-vdagent 服务再调 ChangeDisplaySettingsEx 切分辨率。
+            //
+            // port name 必须是 "com.redhat.spice.0", spice-vdagent-win 只认这个名。
+            // chardev server=on,wait=off: QEMU 先起 listener, Swift 侧随时连入;
+            // VM 关机前一直保持。
+            out += ["-device", "virtio-serial-pci,id=virtioserial0"]
+            out += ["-chardev",
+                    "socket,id=vdagent,path=\(bundle.spiceAgentSocketURL.path),server=on,wait=off"]
+            out += ["-device",
+                    "virtserialport,bus=virtioserial0.0,chardev=vdagent,name=com.redhat.spice.0"]
         } else {
             // 非图形模式(-nographic): 适合无桌面服务器镜像/云 init
             // guest 串口直接写入 serial.log, 详情页 Console tab tail 显示
@@ -301,14 +318,31 @@ struct NetworkArgsBuilder {
         }
         guard !active.isEmpty else { return ["-nic", "none"] }
 
+        // ARM virt 的根 bus (pcie.0) 不支持热插拔, 挂在上面的设备 device_del 会失败
+        // "Bus 'pcie.0' does not support hotplugging". 为了让启动时加载的 NIC 也能
+        // 后续被运行时 detach / 改 model / 改 mode, 把每张网卡按 index 绑到一个
+        // PCIeRootPortsArgsBuilder 预留的 rp_N 上, 和 NICHotplug.attach 路径一致。
+        //
+        // 超过 rp 槽位总数(PCIeRootPortsArgsBuilder.count=4)的部分 fallback 到 pcie.0,
+        // 功能上还是能 work, 只是这几张无法热拔 / 运行时改参数。
+        let rpCount = PCIeRootPortsArgsBuilder.count
+
         var out: [String] = []
-        for (idx, net) in active {
-            let suffix = net.qemuStableSuffix ?? String(idx)
+        for (slotIdx, pair) in active.enumerated() {
+            let (_, net) = pair
+            let suffix = net.qemuStableSuffix ?? String(slotIdx)
             let netdevID = "net_\(suffix)"
             let deviceID = "nic_\(suffix)"
             var deviceOpts = "\(net.deviceModel.qemuDeviceName),netdev=\(netdevID),id=\(deviceID)"
             if let mac = net.macAddress, !mac.isEmpty {
                 deviceOpts += ",mac=\(mac)"
+            }
+            // 前 rpCount 张绑到 rp_N; 第 rpCount+1 张起无槽位, 落回 pcie.0
+            if slotIdx < rpCount {
+                deviceOpts += ",bus=\(PCIeRootPortsArgsBuilder.busID(index: slotIdx))"
+            } else {
+                log.warn(.qemu,
+                    "[network] NIC #\(slotIdx) 超过 pcie-root-port 槽位上限(\(rpCount)), 落到 pcie.0, 这张网卡无法热拔/运行时改参数")
             }
             switch net.mode {
             case .user:

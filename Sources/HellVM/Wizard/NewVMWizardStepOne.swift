@@ -5,6 +5,7 @@ import HVMCore
 struct NewVMWizardStepOne: View {
     @Binding var draft: VMConfigDraft
     @ObservedObject var virtioWin: VirtioWinManager
+    @StateObject private var spiceTools = SpiceToolsManager.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -13,6 +14,7 @@ struct NewVMWizardStepOne: View {
             osTypeHint
             if draft.config.osType == .windows {
                 virtioWinStatusRow
+                spiceToolsStatusRow
             }
         }
     }
@@ -76,7 +78,7 @@ struct NewVMWizardStepOne: View {
     private var osTypeHint: some View {
         switch draft.config.osType {
         case .windows:
-            infoHint("virtio-ramfb 融合 (bootmgr 不挂) · TPM 启用 · Win11 硬件检查绕过 · 默认 4核/4GB")
+            infoHint("virtio-GPU 加速 · TPM 启用 · Win11 硬件检查绕过 · 默认 4核/4GB")
         case .linux:
             infoHint("virtio-gpu 加速 · 默认 2核/2GB · 适合 Ubuntu/OpenWrt/Debian 等")
         case .macOS:
@@ -140,6 +142,56 @@ struct NewVMWizardStepOne: View {
                 }
             }
             if let p = virtioWin.downloadProgress {
+                ProgressView(value: p).progressViewStyle(.linear).tint(Theme.accent)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceElevated))
+    }
+
+    // MARK: - spice-guest-tools 状态
+
+    /// spice-guest-tools.exe 状态 + 下载按钮 (结构和 virtioWinStatusRow 镜像).
+    /// 装完 spice-vdagent 服务, Windows 拖 HellVM 窗口时会自动切分辨率。
+    @ViewBuilder
+    private var spiceToolsStatusRow: some View {
+        let status = SpiceToolsManager.status()
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: status.exists ? "checkmark.seal.fill"
+                      : (spiceTools.downloadProgress != nil ? "arrow.down.circle" : "arrow.up.left.and.arrow.down.right"))
+                    .font(.system(size: 11))
+                    .foregroundStyle(status.exists ? Theme.success : Theme.warning)
+                VStack(alignment: .leading, spacing: 2) {
+                    if status.exists {
+                        Text("spice-guest-tools 已就绪 (\(formatMB(status.sizeBytes)))")
+                            .font(.system(size: 11, weight: .medium))
+                    } else if let p = spiceTools.downloadProgress {
+                        Text(String(format: "正在下载 spice-guest-tools.exe … %.0f%%", p * 100))
+                            .font(.system(size: 11, weight: .medium))
+                    } else {
+                        Text("spice-guest-tools 未下载")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    Text("装完后 spice-vdagent 服务自启, 拖 HellVM 窗口 Windows 会自动改分辨率")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                    if let err = spiceTools.lastError {
+                        Text(err).font(.system(size: 10)).foregroundStyle(Theme.danger)
+                    }
+                }
+                Spacer()
+                if !status.exists && spiceTools.downloadProgress == nil {
+                    SecondaryButton(title: "下载", systemImage: "arrow.down.circle") {
+                        Task { try? await spiceTools.downloadIfNeeded() }
+                    }
+                } else if spiceTools.downloadProgress != nil {
+                    SecondaryButton(title: "取消", systemImage: "xmark.circle") {
+                        spiceTools.cancelDownload()
+                    }
+                }
+            }
+            if let p = spiceTools.downloadProgress {
                 ProgressView(value: p).progressViewStyle(.linear).tint(Theme.accent)
             }
         }

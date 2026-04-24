@@ -13,12 +13,27 @@ import HVMBundle
 enum WindowsUnattend {
 
     /// 确保 bundle 下有最新 AutoUnattend ISO (幂等):
-    /// - XML 未变 → 直接复用
-    /// - XML 变了 / ISO 缺失 → 重建 stage 目录 + hdiutil makehybrid
+    /// - XML 未变且 payload(spice-guest-tools.exe)存在性未变 → 直接复用
+    /// - 任一条件变化 → 重建 stage 目录 + hdiutil makehybrid
     ///
-    /// - Parameter autoInstallVirtioWin: true 时追加 oobeSystem pass, 首次登录自动装 virtio-win MSI
-    static func ensureISO(bundle: VMBundle, autoInstallVirtioWin: Bool) throws {
-        let xml = unattendXML(autoInstallVirtioWin: autoInstallVirtioWin)
+    /// - Parameters:
+    ///   - autoInstallVirtioWin: true 时 FirstLogonCommands 加 virtio-win MSI 静默装
+    ///   - autoInstallSpiceTools: true 且缓存里有 spice-guest-tools.exe 时, 打进 ISO 并在
+    ///     FirstLogonCommands 里 `/S` 静默装。缓存缺失会被当作 false 处理(fail-soft + 日志警告)。
+    static func ensureISO(bundle: VMBundle,
+                          autoInstallVirtioWin: Bool,
+                          autoInstallSpiceTools: Bool) throws {
+        // 判断是否真能带上 spice-guest-tools.exe: 缓存缺失时降级为 false, 免得 XML
+        // 里写了命令但光盘里找不到文件, guest 进 OOBE 会空转一段时间。
+        let spiceSrcURL = VMBundle.spiceToolsCacheURL
+        let spiceAvailable = autoInstallSpiceTools
+            && FileManager.default.fileExists(atPath: spiceSrcURL.path)
+        if autoInstallSpiceTools && !spiceAvailable {
+            log.warn(.qemu, "[autoInstallSpiceTools] 开关已开但缓存不存在, 跳过: \(spiceSrcURL.path)")
+        }
+
+        let xml = unattendXML(autoInstallVirtioWin: autoInstallVirtioWin,
+                              autoInstallSpiceTools: spiceAvailable)
         let stageDir = bundle.url.appendingPathComponent(".unattend-stage")
         /* 文件名三份都写: 不同版本 Windows Setup 对大小写的要求不统一.
          * - Autounattend.xml (A 大写, MS docs 官方)
@@ -27,15 +42,18 @@ enum WindowsUnattend {
         let canonicalURL = stageDir.appendingPathComponent("Autounattend.xml")
         let lowerURL = stageDir.appendingPathComponent("autounattend.xml")
         let shortURL = stageDir.appendingPathComponent("unattend.xml")
+        let spiceStageURL = stageDir.appendingPathComponent("spice-guest-tools.exe")
         let isoURL = bundle.unattendIsoURL
 
         let fm = FileManager.default
 
-        // 如果 ISO 已存在且 XML 内容未变, 直接用
+        // 幂等: 如果 ISO 存在, XML 未变, 且 spice 载荷的存在性也对得上, 就复用
+        let spiceAlreadyStaged = fm.fileExists(atPath: spiceStageURL.path)
         if fm.fileExists(atPath: isoURL.path),
            fm.fileExists(atPath: canonicalURL.path),
            let existing = try? String(contentsOf: canonicalURL, encoding: .utf8),
-           existing == xml {
+           existing == xml,
+           spiceAlreadyStaged == spiceAvailable {
             return
         }
 
@@ -45,6 +63,10 @@ enum WindowsUnattend {
         try xml.write(to: canonicalURL, atomically: true, encoding: .utf8)
         try xml.write(to: lowerURL, atomically: true, encoding: .utf8)
         try xml.write(to: shortURL, atomically: true, encoding: .utf8)
+        if spiceAvailable {
+            try fm.copyItem(at: spiceSrcURL, to: spiceStageURL)
+            log.info(.qemu, "[autoInstallSpiceTools] 已把 spice-guest-tools.exe 放入 unattend stage")
+        }
 
         // 用 macOS 自带的 hdiutil makehybrid 打 ISO9660+UDF 混合(Win 两层都能读)
         fm.removeIfExists(isoURL, label: "旧 unattend ISO", category: .qemu)
@@ -79,9 +101,12 @@ enum WindowsUnattend {
     ///   跑 5 个 reg add, 写 HKLM\SYSTEM\Setup\LabConfig 下的 Bypass*Check DWORD=1。
     ///   这些值会让 Setup 的硬件检查模块跳过 TPM/SB/RAM/CPU/存储。
     ///
-    /// oobeSystem pass (当 autoInstallVirtioWin=true 时才加):
-    ///   FirstLogonCommands 在 OOBE 完成后首次登录时跑, 扫所有盘符找 virtio-win-gt-arm64.msi
-    ///   静默安装. 装完 NetKVM / viostor / viogpudo / qemu-ga 等驱动。
+    /// oobeSystem pass (当至少一个 autoInstall* 为 true 时才加):
+    ///   FirstLogonCommands 在 OOBE 完成后首次登录时跑, 扫所有盘符找对应 payload
+    ///   - virtio-win-gt-arm64.msi  → 静默装 NetKVM / viostor / viogpudo / qemu-ga 驱动
+    ///   - spice-guest-tools.exe     → NSIS /S 静默装 spice-vdagent 服务(给 resize 用)
+    ///   两个命令互相独立, 任一开关单独开都能跑; 都开时按顺序执行(virtio-win 先装,
+    ///   确保 vioserial 驱动就位后再装 spice-vdagent, 避免服务启动时找不到 virtio-serial 通道)。
     ///
     /// 该 XML 和 Microsoft 官方 unattend schema 兼容,Setup 自动扫描移动介质根目录.
     ///
@@ -89,28 +114,48 @@ enum WindowsUnattend {
     /// - 命令无引号, `/f` 放末尾(与 Microsoft docs 示例保持一致)
     /// - DWORD 值用 `0x1` 十六进制(某些 Setup 版本对十进制不识别)
     /// - 第一条先显式 create LabConfig 节, 避免并行 reg add 在 key 不存在时失败
-    static func unattendXML(autoInstallVirtioWin: Bool) -> String {
-        var oobeBlock = ""
+    static func unattendXML(autoInstallVirtioWin: Bool,
+                            autoInstallSpiceTools: Bool) -> String {
+        /* FirstLogonCommands 的 CommandLine 字段在 XML 里是字符串, 内部 cmd 要
+         * 处理变量 %D 和 > 转义. 用 ^ 转义也行, 但实测直接 %D 在 unattend 的
+         * CommandLine 正确识别; <> 则需用 &gt;/&lt;. 这里只用 %D, 安全. */
+        var commands: [String] = []
+
         if autoInstallVirtioWin {
-            /* FirstLogonCommands 的 CommandLine 字段在 XML 里是字符串, 内部 cmd 要
-             * 处理变量 %D 和 > 转义. 用 ^ 转义也行, 但实测直接 %D 在 unattend 的
-             * CommandLine 正确识别; <> 则需用 &gt;/&lt;. 这里只用 %D, 安全.
-             *
-             * 逻辑: 枚举 C..Z 盘符, 遇到第一个有 virtio-win-gt-arm64.msi 的就装它.
+            /* 枚举 C..Z 盘符, 遇到第一个有 virtio-win-gt-arm64.msi 的就装它.
              * msiexec /quiet /norestart 静默安装, 不弹 UAC 也不重启.
-             * 日志写 C:\hellvm-viowin.log 便于用户排查.
-             */
+             * 日志写 C:\hellvm-viowin.log 便于用户排查. */
+            commands.append(
+                "cmd /c for %D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %D:\\virtio-win-gt-arm64.msi start /wait msiexec /i %D:\\virtio-win-gt-arm64.msi /quiet /norestart /L*v C:\\hellvm-viowin.log")
+        }
+        if autoInstallSpiceTools {
+            /* spice-guest-tools-latest.exe 是 NSIS installer, /S 大写表示 Silent mode,
+             * /D=... 指定安装目录(NSIS 约定必须是最后一个参数, 无引号, 无转义).
+             * 装完 spice-vdagent 服务会自动起, Windows 此时就能响应 MONITORS_CONFIG。
+             * ARM64 Windows 通过 x86 emulation 跑 x86 NSIS installer, 社区验证 ok。 */
+            commands.append(
+                "cmd /c for %D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %D:\\spice-guest-tools.exe start /wait %D:\\spice-guest-tools.exe /S")
+        }
+
+        var oobeBlock = ""
+        if !commands.isEmpty {
+            var synchronousCommands = ""
+            for (idx, cmd) in commands.enumerated() {
+                synchronousCommands += """
+                    <SynchronousCommand wcm:action="add">
+                      <Order>\(idx + 1)</Order>
+                      <CommandLine>\(cmd)</CommandLine>
+                      <Description>HellVM auto-install payload #\(idx + 1)</Description>
+                      <RequiresUserInput>false</RequiresUserInput>
+                    </SynchronousCommand>
+
+                """
+            }
             oobeBlock = """
               <settings pass="oobeSystem">
                 <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
                   <FirstLogonCommands>
-                    <SynchronousCommand wcm:action="add">
-                      <Order>1</Order>
-                      <CommandLine>cmd /c for %D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %D:\\virtio-win-gt-arm64.msi start /wait msiexec /i %D:\\virtio-win-gt-arm64.msi /quiet /norestart /L*v C:\\hellvm-viowin.log</CommandLine>
-                      <Description>HellVM auto-install virtio-win drivers (NetKVM, viostor, viogpudo, qemu-ga)</Description>
-                      <RequiresUserInput>false</RequiresUserInput>
-                    </SynchronousCommand>
-                  </FirstLogonCommands>
+            \(synchronousCommands)      </FirstLogonCommands>
                 </component>
               </settings>
             """

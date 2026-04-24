@@ -76,4 +76,11 @@ final class VMListStore {
     func releaseBackend(for id: UUID) {
         liveBackends.removeValue(forKey: id)
     }
+
+    /// 获取当前 live backend(可用于 stop/powerCut 时复用 pg-kill 流程).
+    /// 返回 nil 意味着 VM 虽在运行但 backend 引用已丢(例如 app 重启后老 VM 仍跑),
+    /// 调用方应退回到 killpg(pidfile) 兜底路径.
+    func backend(for id: UUID) -> QEMUBackend? {
+        liveBackends[id]
+    }
 }

@@ -266,7 +266,8 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             do {
                 try WindowsUnattend.ensureISO(
                     bundle: bundle,
-                    autoInstallVirtioWin: config.boot.autoInstallVirtioWin
+                    autoInstallVirtioWin: config.boot.autoInstallVirtioWin,
+                    autoInstallSpiceTools: config.boot.autoInstallSpiceTools
                 )
                 args += UnattendISOArgsBuilder(bundle: bundle).build()
             } catch {

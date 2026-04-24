@@ -14,6 +14,7 @@
 
 import Foundation
 import Darwin
+import HVMCore
 import HVMDisplayC
 
 public final class DisplayChannel: @unchecked Sendable {
@@ -89,7 +90,10 @@ public final class DisplayChannel: @unchecked Sendable {
     /// 请求 guest 改分辨率。通过 QEMU 的 dpy_set_ui_info 推给 virtio-gpu 驱动,
     /// guest 内核响应后会重新分配 framebuffer, 触发新的 SURFACE 消息回传。
     public func requestResize(width: UInt32, height: UInt32) {
-        guard sockFD >= 0 else { return }
+        guard sockFD >= 0 else {
+            log.warn(.display, "requestResize drop: sockFD<0 (\(width)x\(height))")
+            return
+        }
         var header = MsgHeader(type: MessageType.resizeReq.rawValue,
                                payloadLen: UInt32(MemoryLayout<ResizeReqPayload>.size))
         var payload = ResizeReqPayload(width: width, height: height)
@@ -101,8 +105,14 @@ public final class DisplayChannel: @unchecked Sendable {
             memcpy(b.baseAddress! + MemoryLayout<MsgHeader>.size,
                    &payload, MemoryLayout<ResizeReqPayload>.size)
         }
-        _ = buf.withUnsafeBufferPointer { p in
+        let written = buf.withUnsafeBufferPointer { p in
             Darwin.send(sockFD, p.baseAddress, p.count, 0)
+        }
+        if written != total {
+            log.warn(.display,
+                "requestResize short send \(written)/\(total) errno=\(errno) (\(width)x\(height))")
+        } else {
+            log.debug(.display, "requestResize socket sent \(total)B (\(width)x\(height))")
         }
     }
 

@@ -93,6 +93,19 @@ final class FramebufferHostView: MTKView {
 
     override func layout() {
         super.layout()
+        emitGuestResize()
+    }
+
+    // SwiftUI NSViewRepresentable 下发尺寸走 setFrame/setFrameSize, 不一定会
+    // 触发 Auto Layout pass 调 layout(), 拖窗口 live resize 期间 layout()
+    // 经常一次都不调。这里覆盖 setFrameSize 保证每次尺寸变更都 emit 一次,
+    // layout() 保留作 AutoLayout 场景的兜底。
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        emitGuestResize()
+    }
+
+    private func emitGuestResize() {
         // abs 坐标归一化用 points 单位, 与 event.locationInWindow 一致,
         // 避免 Retina 下 point/pixel 比例错配导致 guest 光标只能到画面中点。
         let ptWidth  = Int(bounds.width)
@@ -103,6 +116,8 @@ final class FramebufferHostView: MTKView {
         let scale = window?.backingScaleFactor ?? 1.0
         let pxWidth  = Int(bounds.width  * scale)
         let pxHeight = Int(bounds.height * scale)
+        log.debug(.display,
+            "emitGuestResize pt=\(ptWidth)x\(ptHeight) scale=\(scale) px=\(pxWidth)x\(pxHeight)")
         onResize?(UInt32(max(pxWidth, 64)), UInt32(max(pxHeight, 64)))
     }
 

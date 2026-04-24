@@ -1,10 +1,14 @@
 // FramebufferView —— SwiftUI 包装 MTKView(自定义 FramebufferHostView) + Display/Input 通道
 //
 // 用法:
-//   FramebufferView(displaySocketPath: bundle.iosurfaceSocketURL.path,
-//                   inputSocketPath:   bundle.qmpInputSocketURL.path)
+//   FramebufferView(displaySocketPath:    bundle.iosurfaceSocketURL.path,
+//                   inputSocketPath:      bundle.qmpInputSocketURL.path,
+//                   spiceAgentSocketPath: bundle.spiceAgentSocketURL.path)
 //
-// 生命周期: onAppear 连接两个 socket, onDisappear 关闭; 连接失败周期重试。
+// 生命周期: onAppear 连接三个 socket, onDisappear 关闭; 连接失败周期重试。
+// iosurface + qmp-input 是核心渲染/输入通道; spice-vdagent 是可选, 给
+// Windows guest(装 spice-guest-tools 后)用来在 host 窗口 resize 时自动切分辨率。
+// 若 guest 没装 spice-vdagent, socket 连得上但握手永不完成, 不影响主画面。
 
 import SwiftUI
 import MetalKit
@@ -14,15 +18,18 @@ import ObjectiveC
 public struct FramebufferView: NSViewRepresentable {
     public let displaySocketPath: String
     public let inputSocketPath: String
+    public let spiceAgentSocketPath: String?
 
     public var retryInterval: TimeInterval = 0.3
 
     public init(displaySocketPath: String,
                 inputSocketPath: String,
+                spiceAgentSocketPath: String? = nil,
                 retryInterval: TimeInterval = 0.3) {
-        self.displaySocketPath = displaySocketPath
-        self.inputSocketPath   = inputSocketPath
-        self.retryInterval     = retryInterval
+        self.displaySocketPath    = displaySocketPath
+        self.inputSocketPath      = inputSocketPath
+        self.spiceAgentSocketPath = spiceAgentSocketPath
+        self.retryInterval        = retryInterval
     }
 
     public func makeNSView(context: Context) -> MTKView {
@@ -56,6 +63,7 @@ public struct FramebufferView: NSViewRepresentable {
 
             context.coordinator.start(displayPath: displaySocketPath,
                                       inputPath: inputSocketPath,
+                                      spiceAgentPath: spiceAgentSocketPath,
                                       retryInterval: retryInterval)
         } catch {
             log.error(.display, "renderer init failed: \(error)")
@@ -66,10 +74,12 @@ public struct FramebufferView: NSViewRepresentable {
 
     public func updateNSView(_ nsView: MTKView, context: Context) {
         if context.coordinator.currentDisplayPath != displaySocketPath
-            || context.coordinator.currentInputPath != inputSocketPath {
+            || context.coordinator.currentInputPath != inputSocketPath
+            || context.coordinator.currentSpiceAgentPath != spiceAgentSocketPath {
             context.coordinator.stop()
             context.coordinator.start(displayPath: displaySocketPath,
                                       inputPath: inputSocketPath,
+                                      spiceAgentPath: spiceAgentSocketPath,
                                       retryInterval: retryInterval)
         }
     }
@@ -84,16 +94,21 @@ public struct FramebufferView: NSViewRepresentable {
         var renderer: FramebufferRenderer?
         var forwarder: InputForwarder?
         var displayChannel: DisplayChannel?
+        var vdagentChannel: VDAgentChannel?
 
         var displayTask: Task<Void, Never>?
         var inputTask: Task<Void, Never>?
+        var vdagentTask: Task<Void, Never>?
         var currentDisplayPath: String?
         var currentInputPath: String?
+        var currentSpiceAgentPath: String?
 
-        func start(displayPath: String, inputPath: String, retryInterval: TimeInterval) {
+        func start(displayPath: String, inputPath: String,
+                   spiceAgentPath: String?, retryInterval: TimeInterval) {
             log.debug(.display, "Coordinator start \(ObjectIdentifier(self).hashValue)")
-            currentDisplayPath = displayPath
-            currentInputPath   = inputPath
+            currentDisplayPath    = displayPath
+            currentInputPath      = inputPath
+            currentSpiceAgentPath = spiceAgentPath
 
             displayTask = Task { [weak self] in
                 await self?.runDisplayLoop(path: displayPath, retry: retryInterval)
@@ -101,14 +116,22 @@ public struct FramebufferView: NSViewRepresentable {
             inputTask = Task { [weak self] in
                 await self?.runInputLoop(path: inputPath, retry: retryInterval)
             }
+            if let vdPath = spiceAgentPath {
+                vdagentTask = Task { [weak self] in
+                    await self?.runVDAgentLoop(path: vdPath, retry: retryInterval)
+                }
+            }
         }
 
         func stop() {
             log.debug(.display, "Coordinator stop \(ObjectIdentifier(self).hashValue)")
             displayTask?.cancel()
             inputTask?.cancel()
+            vdagentTask?.cancel()
             displayChannel?.close()
             displayChannel = nil
+            vdagentChannel?.close()
+            vdagentChannel = nil
 
             let fwd = forwarder
             Task { await fwd?.close() }
@@ -173,15 +196,29 @@ public struct FramebufferView: NSViewRepresentable {
 
         @MainActor
         func requestGuestResize(width: UInt32, height: UInt32) {
-            guard width >= 64, height >= 64 else { return }
-            if (width, height) == lastRequestedSize { return }
+            guard width >= 64, height >= 64 else {
+                log.debug(.display, "requestGuestResize skip: too small \(width)x\(height)")
+                return
+            }
+            if (width, height) == lastRequestedSize {
+                log.debug(.display, "requestGuestResize skip: dup \(width)x\(height)")
+                return
+            }
             resizeDebounce?.cancel()
             resizeDebounce = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 if Task.isCancelled { return }
-                guard let self, let ch = self.displayChannel else { return }
+                guard let self else { return }
                 self.lastRequestedSize = (width, height)
-                ch.requestResize(width: width, height: height)
+                log.info(.display, "requestGuestResize send \(width)x\(height)")
+                // 两路并发: iosurface 驱动 Linux/EDK2; vdagent 驱动 Windows
+                if let ch = self.displayChannel {
+                    ch.requestResize(width: width, height: height)
+                } else {
+                    log.debug(.display, "requestGuestResize: iosurface not ready yet")
+                }
+                // vdagent 未就绪也会自动缓存 pending, ready 时补发
+                self.vdagentChannel?.sendMonitorsConfig(width: width, height: height)
             }
         }
 
@@ -197,6 +234,27 @@ public struct FramebufferView: NSViewRepresentable {
                 do {
                     try await fwd.connect(socketPath: path)
                     // 连上了就不主动断, 等待 VM 停止 EOF 会 throw 到下一次 send
+                    return
+                } catch {
+                    try? await Task.sleep(nanoseconds: sleepNanos)
+                    continue
+                }
+            }
+        }
+
+        // MARK: - vdagent 循环(连 spice-vdagent bridge socket)
+        //
+        // 和 displayChannel 不同, vdagent 连上就长驻, 不做重连(VM 关机会 EOF)。
+        // guest 里 spice-vdagent 服务未启动时 QEMU 侧的 virtio-serial 写入会
+        // 被缓冲丢弃, 表现为"没握手", 我们 sendMonitorsConfig 会缓存 pending;
+        // 等 guest agent 起来握完手, pending 立刻发出。
+        private func runVDAgentLoop(path: String, retry: TimeInterval) async {
+            let sleepNanos = UInt64(retry * 1_000_000_000)
+            while !Task.isCancelled {
+                let ch = VDAgentChannel()
+                do {
+                    try ch.connect(socketPath: path)
+                    self.vdagentChannel = ch
                     return
                 } catch {
                     try? await Task.sleep(nanoseconds: sleepNanos)

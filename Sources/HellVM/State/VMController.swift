@@ -35,13 +35,28 @@ struct VMController {
         log.info(.backend, "start exit name=\(item.config.name)")
     }
 
-    /// 停止 VM —— QMP system_powerdown → 超时 SIGKILL
+    /// 停止 VM
+    /// - force=false(普通停止): QMP system_powerdown → 超时 SIGKILL, 走 pg-level
+    ///   信号保证 swtpm 也一并清掉
+    /// - force=true(断电): 直接 pg-level SIGKILL 整组, 等进程退出, 清 pid 文件,
+    ///   主动 refresh store 让 UI 立刻反映 stopped 状态
     @MainActor
     static func stop(_ item: VMListItem, store: VMListStore, force: Bool = false, timeout: TimeInterval = 30) async throws {
-        defer { store.releaseBackend(for: item.id) }
+        defer {
+            store.releaseBackend(for: item.id)
+            finalizeStopUI(item: item, store: store)
+        }
 
         if force {
-            try killPID(item.bundle, signal: SIGKILL)
+            // 断电: 优先走 backend.stop(force:true) —— 它已经实现 terminateProcessGroup
+            // + terminationHandler setState(.stopped), 最干净。
+            // fallback: 直接读 pid 文件 → getpgid → killpg, 覆盖 QEMU+swtpm 整组。
+            if let backend = store.backend(for: item.id) {
+                try? await backend.stop(force: true)
+            } else {
+                try killProcessGroup(item.bundle, signal: SIGKILL)
+            }
+            await waitForExit(bundle: item.bundle, timeout: 3)
             return
         }
 
@@ -50,7 +65,8 @@ struct VMController {
                 _ = try await qmp.execute("system_powerdown")
             }
         } catch {
-            try killPID(item.bundle, signal: SIGTERM)
+            // QMP 挂了, 退到 pg-level SIGTERM (覆盖 swtpm)
+            try? killProcessGroup(item.bundle, signal: SIGTERM)
         }
 
         let deadline = Date().addingTimeInterval(timeout)
@@ -58,7 +74,8 @@ struct VMController {
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         if item.bundle.isRunning() {
-            try killPID(item.bundle, signal: SIGKILL)
+            try killProcessGroup(item.bundle, signal: SIGKILL)
+            await waitForExit(bundle: item.bundle, timeout: 2)
         }
     }
 
@@ -66,18 +83,22 @@ struct VMController {
     /// - 不发 ACPI power button(跳过 guest 优雅关机流程, guest 看起来像瞬间断电)
     /// - 但通过 QMP `quit` 让 QEMU 进程**自己清理退出**(刷盘/关 fd/结 socket),
     ///   而不是被 SIGKILL 硬杀, 减少磁盘写入 race 损坏风险
-    /// - QMP 命令失败时 fallback 到 SIGTERM, 再不行才 SIGKILL
+    /// - QMP 命令失败时 fallback 到 pg-level SIGTERM, 再不行才 pg-level SIGKILL
+    ///   (pg-level 一次清 QEMU+swtpm 整组, 避免 TPM 启用时 swtpm 残留)
     @MainActor
     static func forceShutdown(_ item: VMListItem, store: VMListStore, timeout: TimeInterval = 5) async throws {
-        defer { store.releaseBackend(for: item.id) }
+        defer {
+            store.releaseBackend(for: item.id)
+            finalizeStopUI(item: item, store: store)
+        }
 
         do {
             try await QMPClient.withSession(socketPath: item.bundle.qmpSocketURL.path) { qmp in
                 _ = try await qmp.execute("quit")
             }
         } catch {
-            // QMP socket 已断或不响应, 退而求其次发 SIGTERM
-            try? killPID(item.bundle, signal: SIGTERM)
+            // QMP socket 已断或不响应, 退而求其次发 pg-level SIGTERM
+            try? killProcessGroup(item.bundle, signal: SIGTERM)
         }
 
         // 短等 QEMU 自退 —— quit/SIGTERM 都应在秒级生效
@@ -86,7 +107,8 @@ struct VMController {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         if item.bundle.isRunning() {
-            try killPID(item.bundle, signal: SIGKILL)
+            try killProcessGroup(item.bundle, signal: SIGKILL)
+            await waitForExit(bundle: item.bundle, timeout: 2)
         }
     }
 
@@ -613,6 +635,45 @@ struct VMController {
         if kill(pid, signal) != 0 && errno != ESRCH {
             throw VMError.stopFailed("kill(\(pid), \(signal)) 失败:\(String(cString: strerror(errno)))")
         }
+    }
+
+    /// 向 VM 所在 process group 发信号 —— 一次清掉 QEMU + swtpm(若启用 TPM).
+    /// 从 pid 文件读 QEMU pid, getpgid 拿到 pgid, 再 killpg 覆盖整组。
+    /// pid 为 pg leader 时 pgid == pid(没启 TPM), 等价于 killpg(pid, sig)。
+    private static func killProcessGroup(_ bundle: VMBundle, signal: Int32) throws {
+        guard let pid = bundle.readPID() else {
+            throw VMError.backendUnavailable("找不到 PID 文件")
+        }
+        let pgid = getpgid(pid)
+        // pid 进程已退出时 getpgid 返回 -1, errno=ESRCH, 此时退回单 pid kill 兜底
+        let target: pid_t = pgid > 0 ? pgid : pid
+        if killpg(target, signal) != 0 && errno != ESRCH {
+            throw VMError.stopFailed("killpg(\(target), \(signal)) 失败:\(String(cString: strerror(errno)))")
+        }
+    }
+
+    /// 轮询 `bundle.isRunning()` 直到进程真的退出或超时.
+    /// 避免 stop 函数返回后 UI 立刻 refresh 看到的 pid 还活着造成"已点停但仍 RUNNING"。
+    private static func waitForExit(bundle: VMBundle, timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline && bundle.isRunning() {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// 停止流程结束时的 UI 收尾(在 defer 里调):
+    /// 1. 清掉遗留 pid 文件 —— SIGKILL 不给 QEMU 机会自清, 不删掉的话下次若
+    ///    pid 被系统复用给其它进程, `bundle.isRunning()` 会误判 true, UI 永远
+    ///    显示 RUNNING。
+    /// 2. 主动触发 store.refresh(), 不等 2s polling tick, UI 立刻反映新状态.
+    @MainActor
+    private static func finalizeStopUI(item: VMListItem, store: VMListStore) {
+        // 只在进程真的不在了才删 pid 文件 —— 若还活着(stop 超时等异常场景),
+        // 保留 pid 让下次操作或 polling 继续感知, 不要误清。
+        if !item.bundle.isRunning() {
+            try? FileManager.default.removeItem(at: item.bundle.pidFileURL)
+        }
+        store.refresh()
     }
 }
 

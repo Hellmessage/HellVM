@@ -43,6 +43,13 @@ public struct VMBundle: Sendable {
     /// 运行时 iosurface display backend 的 unix socket(Swift 侧作为客户端连入)
     public var iosurfaceSocketURL: URL { url.appendingPathComponent("iosurface.sock") }
 
+    /// 运行时 spice-vdagent 桥接 socket
+    /// QEMU 侧: virtio-serial port name="com.redhat.spice.0" → chardev socket
+    /// Swift 侧: 作为客户端连入, 给 Windows 里的 spice-vdagent 发 MONITORS_CONFIG
+    /// 等消息, 用于驱动 Windows guest 自动 resize。
+    /// Linux guest 若装了 spice-vdagent 同样走这条路。
+    public var spiceAgentSocketURL: URL { url.appendingPathComponent("vdagent.sock") }
+
     /// swtpm 状态持久化目录(TPM NVRAM / PCR 等需要持久化)
     public var tpmStateDirURL: URL { url.appendingPathComponent("tpm") }
 
@@ -79,6 +86,7 @@ public struct VMBundle: Sendable {
         try? fm.removeItem(at: qmpSocketURL)
         try? fm.removeItem(at: qmpInputSocketURL)
         try? fm.removeItem(at: iosurfaceSocketURL)
+        try? fm.removeItem(at: spiceAgentSocketURL)
     }
 
     /// bundle 内相对路径 → 绝对 URL
@@ -106,6 +114,13 @@ public struct VMBundle: Sendable {
     /// virtio-win.iso 缓存路径(全局唯一, 多台 Windows VM 共享只读挂载)
     public static var virtioWinCacheURL: URL {
         cacheDirURL.appendingPathComponent("virtio-win.iso")
+    }
+
+    /// spice-guest-tools.exe 缓存路径(全局唯一, 所有 Windows VM 共享)
+    /// 装完 spice-vdagent 服务, 让 Windows guest 能响应 host 的 MONITORS_CONFIG
+    /// 做动态分辨率, 以及剪贴板/多显示器同步(未来扩展用)。
+    public static var spiceToolsCacheURL: URL {
+        cacheDirURL.appendingPathComponent("spice-guest-tools.exe")
     }
 
     // MARK: - 创建 / 读取 / 写入

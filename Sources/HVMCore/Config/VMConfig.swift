@@ -349,6 +349,21 @@ public struct BootConfig: Codable, Sendable, Equatable {
     /// 默认 false, Windows 模板建议开。
     public var autoInstallVirtioWin: Bool
 
+    /// 自动把 spice-guest-tools.exe 打进 AutoUnattend ISO, 首次登录时静默 NSIS
+    /// 安装(`/S`)。装完 spice-vdagent 服务就位, Windows guest 能响应 host 的
+    /// `VD_AGENT_MONITORS_CONFIG`, 在 HellVM 窗口拖拽 resize 时自动切分辨率。
+    ///
+    /// ARM64 Windows 注意: spice-guest-tools-latest.exe 是 x86 NSIS installer,
+    /// Windows 11 ARM64 通过 x86 emulation 可以跑; 驱动部分(virtio-serial)走
+    /// virtio-win.iso 里的 ARM64 包, 所以建议同时开启 autoInstallVirtioWin。
+    ///
+    /// 依赖:
+    /// - installer 存放在全局缓存 ~/Library/Application Support/HellVM/cache/spice-guest-tools.exe
+    /// - 启动前由 Swift 侧 SpiceToolsManager 确认存在(不存在则跳过且警告)
+    /// - 只对**新建 VM** 生效(通过 FirstLogonCommands); 已装好的 Windows 需手动装
+    /// 默认 false, Windows 模板建议开。
+    public var autoInstallSpiceTools: Bool
+
     /// 安装完成后切换到"仅硬盘启动"模式: 启动时跳过 isoPath 的挂载, 不再暴露安装盘
     /// 给 guest. EFI NVRAM 里的 grub/bootmgr Boot#### entry 已经由安装程序写好,
     /// BDS 直接走硬盘。半自动安装完成流程的关键开关:
@@ -369,6 +384,7 @@ public struct BootConfig: Codable, Sendable, Equatable {
         serialDebug: Bool = false,
         bypassWin11Checks: Bool = false,
         autoInstallVirtioWin: Bool = false,
+        autoInstallSpiceTools: Bool = false,
         bootFromDiskOnly: Bool = false
     ) {
         self.isoPath = isoPath
@@ -381,27 +397,29 @@ public struct BootConfig: Codable, Sendable, Equatable {
         self.serialDebug = serialDebug
         self.bypassWin11Checks = bypassWin11Checks
         self.autoInstallVirtioWin = autoInstallVirtioWin
+        self.autoInstallSpiceTools = autoInstallSpiceTools
         self.bootFromDiskOnly = bootFromDiskOnly
     }
 
     private enum CodingKeys: String, CodingKey {
         case isoPath, kernelPath, initrdPath, kernelCmdline, efi, graphical, tpm, serialDebug
-        case bypassWin11Checks, autoInstallVirtioWin, bootFromDiskOnly
+        case bypassWin11Checks, autoInstallVirtioWin, autoInstallSpiceTools, bootFromDiskOnly
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.isoPath              = try c.decodeIfPresent(String.self, forKey: .isoPath)
-        self.kernelPath           = try c.decodeIfPresent(String.self, forKey: .kernelPath)
-        self.initrdPath           = try c.decodeIfPresent(String.self, forKey: .initrdPath)
-        self.kernelCmdline        = try c.decodeIfPresent(String.self, forKey: .kernelCmdline)
-        self.efi                  = try c.decodeOr(Bool.self, forKey: .efi,                  default: true)
-        self.graphical            = try c.decodeOr(Bool.self, forKey: .graphical,            default: true)
-        self.tpm                  = try c.decodeOr(Bool.self, forKey: .tpm,                  default: false)
-        self.serialDebug          = try c.decodeOr(Bool.self, forKey: .serialDebug,          default: false)
-        self.bypassWin11Checks    = try c.decodeOr(Bool.self, forKey: .bypassWin11Checks,    default: false)
-        self.autoInstallVirtioWin = try c.decodeOr(Bool.self, forKey: .autoInstallVirtioWin, default: false)
-        self.bootFromDiskOnly     = try c.decodeOr(Bool.self, forKey: .bootFromDiskOnly,     default: false)
+        self.isoPath               = try c.decodeIfPresent(String.self, forKey: .isoPath)
+        self.kernelPath            = try c.decodeIfPresent(String.self, forKey: .kernelPath)
+        self.initrdPath            = try c.decodeIfPresent(String.self, forKey: .initrdPath)
+        self.kernelCmdline         = try c.decodeIfPresent(String.self, forKey: .kernelCmdline)
+        self.efi                   = try c.decodeOr(Bool.self, forKey: .efi,                   default: true)
+        self.graphical             = try c.decodeOr(Bool.self, forKey: .graphical,             default: true)
+        self.tpm                   = try c.decodeOr(Bool.self, forKey: .tpm,                   default: false)
+        self.serialDebug           = try c.decodeOr(Bool.self, forKey: .serialDebug,           default: false)
+        self.bypassWin11Checks     = try c.decodeOr(Bool.self, forKey: .bypassWin11Checks,     default: false)
+        self.autoInstallVirtioWin  = try c.decodeOr(Bool.self, forKey: .autoInstallVirtioWin,  default: false)
+        self.autoInstallSpiceTools = try c.decodeOr(Bool.self, forKey: .autoInstallSpiceTools, default: false)
+        self.bootFromDiskOnly      = try c.decodeOr(Bool.self, forKey: .bootFromDiskOnly,      default: false)
     }
 }
 
@@ -419,14 +437,22 @@ extension VMConfig {
     {
         switch osType {
         case .windows:
-            // Windows ARM64: bootmgr 不能和 virtio-gpu 共存, 需要 TPM 2.0 和 Win11 检查绕过.
-            // 网卡用 e1000e 开箱即可获得网络(Windows ARM 自带驱动), autoInstallVirtioWin
-            // 会在 FirstLogonCommands 静默装 virtio-win-gt-arm64.msi, 装完用户可切到 virtio-net.
+            // Windows ARM64: 需要 TPM 2.0 和 Win11 硬件检查绕过.
+            //
+            // GPU: 默认开启 virtio-GPU 加速 = virtio-gpu-pci + ramfb 双 console.
+            // 历史注释曾写"bootmgr 不能和 virtio-gpu 共存, 必须用 virtio-ramfb fusion",
+            // 但 Win11 24H2 ARM64 ISO + 当前 EDK2 实测双 console 反而稳; fusion 路径
+            // (patch 0002+0003) 在 PE 阶段观察到卡安装. 所以默认切到双 console, fusion
+            // 仍保留作为可选 fallback(用户在 Settings 关掉 "virtio-GPU 加速" 即可切回)。
+            //
+            // 网卡: e1000e 开箱即可获得网络(Windows ARM 自带驱动). autoInstallVirtioWin
+            // 在 FirstLogon 静默装 virtio-win-gt-arm64.msi, 装完用户可手动切到 virtio-net.
             let disp = DisplayConfig(width: width, height: height,
-                                     enabled: graphical, virtioGpu: false)
+                                     enabled: graphical, virtioGpu: true)
             let boot = BootConfig(isoPath: isoPath, efi: true, graphical: graphical,
                                   tpm: true, bypassWin11Checks: true,
-                                  autoInstallVirtioWin: true)
+                                  autoInstallVirtioWin: true,
+                                  autoInstallSpiceTools: true)
             return (disp, boot, .e1000e)
         case .linux:
             let disp = DisplayConfig(width: width, height: height,
