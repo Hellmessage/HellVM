@@ -122,6 +122,40 @@ public actor QMPClient {
         }
     }
 
+    // MARK: - 事件订阅
+
+    /// 阻塞读下一条 QEMU 异步事件, 丢弃中途的 return/error/greeting。
+    /// 调用方在独立 Task 里 while true 循环调用即可;连接关闭时抛
+    /// `backendUnavailable("QMP 连接关闭")`, 调用方用它作为退出信号。
+    ///
+    /// 用法:
+    ///   Task.detached { while !Task.isCancelled {
+    ///       let ev = try await qmp.nextEvent()
+    ///       // 处理 ev.name / ev.data
+    ///   }}
+    ///
+    /// 建议用独立 QMPClient 实例连 qmp-event.sock,不与命令通道 qmp.sock
+    /// 共用 —— 否则事件和 execute() 的响应会抢同一个 readBuffer 互相打断。
+    public func nextEvent() async throws -> (name: String, data: [String: Any], timestamp: Double?) {
+        guard socketFD >= 0 else {
+            throw VMError.backendUnavailable("QMP 未连接")
+        }
+        while true {
+            let msg = try await readMessage()
+            if let name = msg["event"] as? String {
+                let data = (msg["data"] as? [String: Any]) ?? [:]
+                let ts = (msg["timestamp"] as? [String: Any])
+                    .flatMap { t -> Double? in
+                        guard let sec = t["seconds"] as? Double,
+                              let usec = t["microseconds"] as? Double else { return nil }
+                        return sec + usec / 1_000_000
+                    }
+                return (name, data, ts)
+            }
+            // return / error / greeting 等非 event 消息丢弃, 继续等
+        }
+    }
+
     // MARK: - 底层 IO
 
     private func writeJSON(_ obj: [String: Any]) async throws {

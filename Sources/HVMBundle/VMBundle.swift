@@ -40,6 +40,12 @@ public struct VMBundle: Sendable {
     /// 运行时 QMP 输入专用 socket(键鼠注入独立通道, 避免与控制通道争抢)
     public var qmpInputSocketURL: URL { url.appendingPathComponent("qmp-input.sock") }
 
+    /// 运行时 QMP 事件订阅专用 socket
+    /// 用来长连接订阅 QEMU 异步事件(SHUTDOWN/POWERDOWN/RESET/...), 不发命令,
+    /// 避免与 qmp.sock 上的 request/response 交错互相打断。
+    /// 参考 QEMU doc: 每个 `-qmp` 指令建一个独立 server socket, 一对一 client。
+    public var qmpEventSocketURL: URL { url.appendingPathComponent("qmp-event.sock") }
+
     /// 运行时 iosurface display backend 的 unix socket(Swift 侧作为客户端连入)
     public var iosurfaceSocketURL: URL { url.appendingPathComponent("iosurface.sock") }
 
@@ -93,6 +99,7 @@ public struct VMBundle: Sendable {
         try? fm.removeItem(at: pidFileURL)
         try? fm.removeItem(at: qmpSocketURL)
         try? fm.removeItem(at: qmpInputSocketURL)
+        try? fm.removeItem(at: qmpEventSocketURL)
         try? fm.removeItem(at: iosurfaceSocketURL)
         try? fm.removeItem(at: spiceAgentSocketURL)
         try? fm.removeItem(at: qgaSocketURL)

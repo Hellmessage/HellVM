@@ -20,6 +20,14 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
     /// 这样 stop(force:true) 一次 killpg 就能原子清掉两者, 不会留孤儿.
     private let swtpm: SwtpmSupervisor
 
+    /// 长连接 QMP 事件订阅任务(连 qmp-event.sock, 监听 SHUTDOWN 等异步事件).
+    /// QEMU 退出或主动 stop 时会自动因 socket 断开而结束, 不需要显式 cancel。
+    private var eventSubscriberTask: Task<Void, Never>?
+
+    /// guest 活性探测任务 —— 定期采 QEMU 进程 CPU time, 连续低于阈值
+    /// 判定 guest 已 halt/shutdown(Windows ARM64 关机不经 QEMU 时的兜底)。
+    private var livenessProbeTask: Task<Void, Never>?
+
     public var state: VMState {
         withStateLock { _state }
     }
@@ -107,12 +115,138 @@ public final class QEMUBackend: VMBackend, @unchecked Sendable {
             guard let self = self else { return }
             // QEMU 退出时连带杀掉 swtpm(swtpm 的 ,terminate 标志也会自退, 双保险)
             self.swtpm.terminate()
-            self.withStateLock { self.process = nil }
+            self.withStateLock {
+                self.process = nil
+                self.eventSubscriberTask?.cancel()
+                self.eventSubscriberTask = nil
+                self.livenessProbeTask?.cancel()
+                self.livenessProbeTask = nil
+            }
             self.setState(.stopped)
         }
 
         withStateLock { self.process = spawned }
         setState(.running)
+
+        // 启动 QMP 事件订阅, 监听 guest 发出的关机/重启等异步事件。
+        // 某些 guest(尤其是正常 Linux)关机时 QEMU 默认 action=shutdown=poweroff
+        // 会让进程直接退出, terminationHandler 搞定;但也有 guest(Windows ARM64)
+        // 的 ACPI shutdown 信号不一定能让 QEMU 进程退出 —— 这时 QMP SHUTDOWN 事件
+        // 仍然会发, 我们捕获后主动 stop 兜底。
+        startEventSubscriber()
+
+        // 启动 guest 活性探测 —— Windows ARM64 关机时 QEMU 既不退出、也不发
+        // SHUTDOWN 事件(ACPI shutdown 信号没到 QEMU), 是 event subscriber 覆盖
+        // 不到的盲区。通过定期采 QEMU 进程 CPU 时间, 连续低于阈值判为 guest halted
+        // 主动清理。阈值严到 idle guest 也不会误触发。
+        startLivenessProbe(pid: spawned.pid)
+    }
+
+    /// 连 qmp-event.sock, loop 读事件。识别到 SHUTDOWN / GUEST_PANICKED 等
+    /// "guest 结束运行"的事件时, 主动发起非强制 stop, 让 QEMU 优雅退出。
+    private func startEventSubscriber() {
+        let sockPath = bundle.qmpEventSocketURL.path
+        let task = Task.detached(priority: .utility) { [weak self] in
+            // QEMU 启动 → qmp-event.sock server 就绪 需要几百毫秒, 轮询等就绪
+            let connectDeadline = Date().addingTimeInterval(5)
+            let qmp = QMPClient()
+            while !Task.isCancelled {
+                do {
+                    try await qmp.connect(socketPath: sockPath)
+                    break
+                } catch {
+                    if Date() >= connectDeadline {
+                        log.warn(.backend, "qmp-event subscriber: 连接超时, 放弃监听事件")
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+            defer { Task { await qmp.close() } }
+
+            while !Task.isCancelled {
+                let event: (name: String, data: [String: Any], timestamp: Double?)
+                do {
+                    event = try await qmp.nextEvent()
+                } catch {
+                    // QEMU 退出 / socket 关闭时 readMessage 抛 "QMP 连接关闭" —— 正常终止
+                    return
+                }
+
+                log.info(.backend, "qmp event: \(event.name)")
+                switch event.name {
+                case "SHUTDOWN", "GUEST_PANICKED":
+                    // guest 请求关机或 panic, QEMU 未必自己退出(特别是 Windows ARM 的某些
+                    // ACPI 路径), 主动 stop 兜底。force=false 让 QEMU 优雅退,
+                    // 内部若已有 stop 进行中会无 op。
+                    guard let self = self else { return }
+                    Task.detached { [weak self] in
+                        try? await self?.stop(force: false)
+                    }
+                default:
+                    // RESET / STOP / RESUME 等不需要改 backend 状态
+                    break
+                }
+            }
+        }
+        withStateLock { self.eventSubscriberTask = task }
+    }
+
+    /// 每 5 秒采样 QEMU 进程累计 CPU 时间, 用 60 秒滑动窗口判定 guest 是否已 halt。
+    /// 阈值设得非常严 (60s 内 CPU 增长 < 100ms ≈ 0.17% CPU), 正常 idle 的 guest
+    /// 不会触发(Linux idle 一般 1-3%, Windows idle 一般 1-5%), 只有 vCPU 真正
+    /// 全部 WFI/halt 住 (guest 已关机但 QEMU 没收到 shutdown 信号) 才会触发。
+    private func startLivenessProbe(pid: pid_t) {
+        let task = Task.detached(priority: .background) { [weak self] in
+            // 采样 12 次 = 60 秒窗口
+            let sampleIntervalNs: UInt64 = 5_000_000_000
+            let windowSamples = 12
+            let haltThresholdNs: UInt64 = 100_000_000  // 60s 内 < 100ms CPU
+            var samples: [UInt64] = []
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: sampleIntervalNs)
+                if Task.isCancelled { return }
+
+                guard let cpu = Self.processCPUTimeNanos(pid: pid) else {
+                    // 进程已消失(可能正在退出) — 让 terminationHandler 处理
+                    return
+                }
+                samples.append(cpu)
+                if samples.count > windowSamples {
+                    let delta = samples.last! &- samples.first!
+                    samples.removeFirst()
+                    if delta < haltThresholdNs {
+                        log.warn(.backend,
+                            "liveness probe: QEMU pid=\(pid) 在 \(windowSamples * Int(sampleIntervalNs/1_000_000_000)) 秒内仅消耗 \(delta/1_000_000)ms CPU, 判定 guest 已 halt/shutdown, 强制清理")
+                        try? await self?.stop(force: true)
+                        return
+                    }
+                }
+            }
+        }
+        withStateLock { self.livenessProbeTask = task }
+    }
+
+    /// 通过 proc_pid_rusage 拿指定进程累计 (user + system) CPU 时间, 转换成纳秒。
+    /// 失败返回 nil(例如进程已退出)。
+    private static func processCPUTimeNanos(pid: pid_t) -> UInt64? {
+        // Swift 把 `rusage_info_t` 导入成 UnsafeMutableRawPointer(C 里 typedef 为 void*),
+        // 函数签名的 out-param 就变成 UnsafeMutablePointer<rusage_info_t?>。
+        // 需要把 &info 重绑到 rusage_info_t?.self 再传。
+        var info = rusage_info_current()
+        let rv = withUnsafeMutablePointer(to: &info) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { reboundPtr in
+                proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, reboundPtr)
+            }
+        }
+        guard rv == 0 else { return nil }
+        // rusage_info_v* 的 ri_user_time / ri_system_time 单位是 mach absolute time,
+        // 不是纳秒, 需要通过 timebase 换算。
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        let mach = info.ri_user_time &+ info.ri_system_time
+        return mach &* UInt64(tb.numer) / UInt64(tb.denom)
     }
 
     public func stop(force: Bool) async throws {

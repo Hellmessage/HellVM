@@ -14,9 +14,10 @@ import HVMBundle
 
 // MARK: - ① 运行时控制通道
 
-/// PID 文件 + 两个 QMP socket:
+/// PID 文件 + 三个 QMP socket:
 /// - qmp.sock       控制 (start/stop/pause/resume)
 /// - qmp-input.sock 键鼠注入 (InputForwarder 长连接, 与控制互不干扰)
+/// - qmp-event.sock 异步事件订阅 (SHUTDOWN/POWERDOWN/RESET...), 长连接只读
 struct ControlChannelArgsBuilder {
     let bundle: VMBundle
 
@@ -25,6 +26,7 @@ struct ControlChannelArgsBuilder {
             "-pidfile", bundle.pidFileURL.path,
             "-qmp", "unix:\(bundle.qmpSocketURL.path),server=on,wait=off",
             "-qmp", "unix:\(bundle.qmpInputSocketURL.path),server=on,wait=off",
+            "-qmp", "unix:\(bundle.qmpEventSocketURL.path),server=on,wait=off",
         ]
     }
 }
